@@ -29,6 +29,7 @@ import { useTwinStore } from '../store/useTwinStore';
 import { useTelemetryStore } from '../store/useTelemetryStore';
 import { useAuth } from '../context/AuthContext';
 import { MiniSparkline } from './TelemetryDashboard';
+import { UserAvatarMenu } from './UserAvatarMenu';
 import { METRIC_PRESETS, type SensorDefinition } from '../types/telemetry';
 import type { DigitalTwinScene } from '../types/twin';
 
@@ -410,24 +411,7 @@ export const ProjectHub: React.FC = () => {
             {theme === 'dark' ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-violet-600" />}
           </button>
 
-          {user ? (
-            <button
-              onClick={signOut}
-              className="flex items-center gap-1.5 h-9 px-3 text-xs font-medium rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#191922] hover:border-violet-500/50 whitespace-nowrap"
-              title={user.email ?? 'Signed in'}
-            >
-              <LogOut className="w-3.5 h-3.5 text-zinc-400" />
-              <span className="hidden md:inline max-w-[100px] truncate">{user.displayName || user.email}</span>
-            </button>
-          ) : (
-            <button
-              onClick={signInWithGoogle}
-              className="flex items-center gap-1.5 h-9 px-3.5 text-xs font-semibold rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 hover:opacity-90 transition-opacity whitespace-nowrap"
-            >
-              <LogIn className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Sign In</span>
-            </button>
-          )}
+          <UserAvatarMenu />
         </div>
       </header>
 

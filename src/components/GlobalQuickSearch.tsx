@@ -21,11 +21,13 @@ import {
   Radio,
   Search,
   Server,
+  Shield,
   ShieldCheck,
   Sparkles,
   Square,
   Tag,
   Thermometer,
+  Users,
   Wand2,
   Waypoints,
   Wrench,
@@ -34,6 +36,7 @@ import {
 import { useTwinStore } from '../store/useTwinStore';
 import { useTelemetryStore } from '../store/useTelemetryStore';
 import { useGmpStore } from '../store/useGmpStore';
+import { useAclStore } from '../store/useAclStore';
 import { OBJECT_LIBRARY } from '../data/objectLibrary';
 
 interface SearchResultItem {
@@ -80,6 +83,7 @@ export const GlobalQuickSearch: React.FC = () => {
   const openQrLabelModal = useGmpStore((s) => s.openQrLabelModal);
   const showMiniMap = useGmpStore((s) => s.showMiniMap);
   const setShowMiniMap = useGmpStore((s) => s.setShowMiniMap);
+  const openAclModal = useAclStore((s) => s.openAclModal);
 
   const [query, setQuery] = useState('');
   const [filterKind, setFilterKind] = useState<'all' | 'command' | 'asset' | 'sensor' | 'room' | 'layer'>('all');
@@ -320,6 +324,28 @@ export const GlobalQuickSearch: React.FC = () => {
           ensureWorkspace();
           setShowMiniMap(!showMiniMap);
           setShowQuickSearch(false);
+        },
+      },
+      {
+        id: 'cmd-acl-users',
+        kind: 'command',
+        title: 'Access Control (ACL), Roles & User Grouping',
+        subtitle: 'Manage user directory, online/offline presence, organizational groups & RBAC permissions',
+        code: 'ACL',
+        onJump: () => {
+          setShowQuickSearch(false);
+          openAclModal('users');
+        },
+      },
+      {
+        id: 'cmd-acl-groups',
+        kind: 'command',
+        title: 'Manage User Groups & Spatial Resource ACLs',
+        subtitle: 'Create department groups, configure Deny-overrides ACL rules & simulate effective access',
+        code: 'GROUPS',
+        onJump: () => {
+          setShowQuickSearch(false);
+          openAclModal('acls');
         },
       },
     ];
@@ -573,6 +599,8 @@ export const GlobalQuickSearch: React.FC = () => {
     if (item.id === 'cmd-qr-scanner') return <QrCode className="w-4 h-4 text-violet-400 shrink-0" />;
     if (item.id === 'cmd-label-designer') return <Tag className="w-4 h-4 text-amber-400 shrink-0" />;
     if (item.id === 'cmd-minimap') return <MapIcon className="w-4 h-4 text-emerald-400 shrink-0" />;
+    if (item.id === 'cmd-acl-users') return <Users className="w-4 h-4 text-violet-400 shrink-0" />;
+    if (item.id === 'cmd-acl-groups') return <Shield className="w-4 h-4 text-amber-400 shrink-0" />;
     switch (item.kind) {
       case 'sensor':
         return <Radio className="w-3.5 h-3.5 text-amber-400 shrink-0" />;

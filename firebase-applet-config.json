@@ -3,6 +3,7 @@
   "appId": "1:99798040477:web:eb179103b7d23a6e147974",
   "apiKey": "AIzaSyDjt6E8kDCiguQJTheiRa133PQ82BfkOyk",
   "authDomain": "focused-union-vnj8s.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-1dff5bf1-ed1f-4e2a-9312-b01076b2a52d",
   "storageBucket": "focused-union-vnj8s.firebasestorage.app",
   "messagingSenderId": "99798040477",
   "measurementId": "",

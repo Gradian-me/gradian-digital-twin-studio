@@ -30,6 +30,7 @@ import { AuditTrailModal } from './components/AuditTrailModal';
 import { MiniMapOverlay } from './components/MiniMapOverlay';
 import { QrLabelStudioModal } from './components/QrLabelStudioModal';
 import { GmpOperationsModal } from './components/GmpOperationsModal';
+import { AclGroupingModal } from './components/AclGroupingModal';
 import { useTelemetryStore } from './store/useTelemetryStore';
 import { useGmpStore } from './store/useGmpStore';
 
@@ -460,6 +461,7 @@ const WorkspaceShell: React.FC = () => {
       <AuditTrailModal />
       <QrLabelStudioModal />
       <GmpOperationsModal />
+      <AclGroupingModal />
 
       {/* Global Toast Notification with optional Undo */}
       {toast && (

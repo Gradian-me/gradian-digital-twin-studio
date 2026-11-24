@@ -49,6 +49,7 @@ import {
   GitBranch,
   Map as MapIcon,
   QrCode,
+  Shield,
   Wand2,
   Waypoints,
   Wrench,
@@ -56,7 +57,9 @@ import {
 import { useTwinStore } from '../store/useTwinStore';
 import { useTelemetryStore } from '../store/useTelemetryStore';
 import { useGmpStore } from '../store/useGmpStore';
+import { useAclStore } from '../store/useAclStore';
 import { useAuth } from '../context/AuthContext';
+import { UserAvatarMenu } from './UserAvatarMenu';
 import type { OrthoPreset, ToolMode } from '../types/twin';
 
 export const TopToolbar: React.FC = () => {
@@ -136,6 +139,7 @@ export const TopToolbar: React.FC = () => {
   const showMiniMap = useGmpStore((s) => s.showMiniMap);
   const setShowMiniMap = useGmpStore((s) => s.setShowMiniMap);
   const overdueWorkOrders = useGmpStore((s) => s.workOrders.filter((w) => w.status === 'overdue').length);
+  const openAclModal = useAclStore((s) => s.openAclModal);
 
   const { user, signInWithGoogle, getIdToken } = useAuth();
   const [savingCloud, setSavingCloud] = useState(false);
@@ -1032,8 +1036,18 @@ export const TopToolbar: React.FC = () => {
 
               <div className="my-1 border-t border-zinc-200 dark:border-zinc-800" />
               <div className="px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
-                Project &amp; Sync
+                Security, Project &amp; Sync
               </div>
+              <button
+                onClick={() => {
+                  openAclModal('users');
+                  setOpenMenu('none');
+                }}
+                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-violet-500/12 hover:text-violet-600 dark:hover:text-violet-300 transition-colors cursor-pointer"
+              >
+                <Shield className="w-4 h-4 text-violet-500" />
+                <span>ACL, Roles &amp; User Grouping</span>
+              </button>
               <button
                 onClick={() => setAutoSaveEnabled(!autoSaveEnabled)}
                 className="w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
@@ -1129,6 +1143,9 @@ export const TopToolbar: React.FC = () => {
             </div>
           )}
         </div>
+
+        {/* Logged-in User Avatar, Online/Offline Status Indicator & Profile/ACL Menu */}
+        <UserAvatarMenu onCloudSync={handleCloudSave} savingCloud={savingCloud} />
       </div>
     </header>
   );

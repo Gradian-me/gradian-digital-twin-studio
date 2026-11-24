@@ -18,6 +18,7 @@ import { useTwinStore } from '../store/useTwinStore';
 import { useGmpStore } from '../store/useGmpStore';
 import { Viewport3D } from './Viewport3D';
 import { Viewport2D } from './Viewport2D';
+import { UserAvatarMenu } from './UserAvatarMenu';
 import { formatArea } from '../utils/spatial';
 
 type MobileTab = 'view' | 'tree' | 'assets' | 'qr' | 'alerts';
@@ -210,6 +211,7 @@ export const MobileShell: React.FC = () => {
               <Moon className="w-3.5 h-3.5 text-violet-600" />
             )}
           </button>
+          <UserAvatarMenu compact />
         </div>
       </header>
 
