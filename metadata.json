@@ -1,0 +1,6 @@
+{
+  "name": "Gradian Digital Twin Studio",
+  "description": "Enterprise 2D/3D/5D spatial digital twin platform for biopharmaceutical, laboratory, warehouse, and industrial facilities.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
