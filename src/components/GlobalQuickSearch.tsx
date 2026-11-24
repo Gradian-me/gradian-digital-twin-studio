@@ -27,9 +27,11 @@ import {
   Square,
   Tag,
   Thermometer,
+  TrendingDown,
   Users,
   Wand2,
   Waypoints,
+  Workflow,
   Wrench,
   X,
 } from 'lucide-react';
@@ -252,6 +254,30 @@ export const GlobalQuickSearch: React.FC = () => {
           ensureWorkspace();
           setShowQuickSearch(false);
           openGmpModal({ tab: 'lines' });
+        },
+      },
+      {
+        id: 'cmd-predictive',
+        kind: 'command',
+        title: 'Predictive Maintenance Forecast Timeline (Weibull RUL)',
+        subtitle: 'Plot estimated equipment failure dates from lifecycle history relative to Production Line status',
+        code: 'FORECAST',
+        onJump: () => {
+          ensureWorkspace();
+          setShowQuickSearch(false);
+          openGmpModal({ tab: 'predictive' });
+        },
+      },
+      {
+        id: 'cmd-workflows',
+        kind: 'command',
+        title: 'GMP Approval & Preventive Intervention Workflows',
+        subtitle: 'Run multi-stage PdM, CAPA, Re-Qualification & Line Release pipelines with 21 CFR Part 11 e-sign',
+        code: 'WORKFLOW',
+        onJump: () => {
+          ensureWorkspace();
+          setShowQuickSearch(false);
+          openGmpModal({ tab: 'workflows' });
         },
       },
       {
@@ -593,6 +619,8 @@ export const GlobalQuickSearch: React.FC = () => {
     if (item.id === 'cmd-save-validate') return <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />;
     if (item.id === 'cmd-audit') return <History className="w-4 h-4 text-amber-400 shrink-0" />;
     if (item.id === 'cmd-prod-lines') return <GitBranch className="w-4 h-4 text-emerald-400 shrink-0" />;
+    if (item.id === 'cmd-predictive') return <TrendingDown className="w-4 h-4 text-rose-400 shrink-0" />;
+    if (item.id === 'cmd-workflows') return <Workflow className="w-4 h-4 text-violet-400 shrink-0" />;
     if (item.id === 'cmd-work-orders') return <Wrench className="w-4 h-4 text-violet-400 shrink-0" />;
     if (item.id === 'cmd-gmp-calendar') return <Calendar className="w-4 h-4 text-amber-400 shrink-0" />;
     if (item.id === 'cmd-sops-wiki') return <BookOpen className="w-4 h-4 text-cyan-400 shrink-0" />;

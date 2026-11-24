@@ -12,8 +12,6 @@ import {
   FolderOpen,
   Layers,
   LayoutGrid,
-  LogIn,
-  LogOut,
   Moon,
   Plus,
   Search,

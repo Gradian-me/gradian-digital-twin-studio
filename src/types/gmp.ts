@@ -194,5 +194,56 @@ export interface WikiArticle {
   markdown: string;
 }
 
-export type GmpModalTab = 'lines' | 'compliance' | 'workorders' | 'calendar' | 'sops' | 'wiki';
+export type GmpWorkflowType =
+  | 'preventive-intervention'
+  | 'deviation-capa'
+  | 'change-control'
+  | 'line-release'
+  | 're-qualification';
+
+export type GmpWorkflowStepStatus = 'pending' | 'in-progress' | 'completed' | 'rejected';
+
+export interface GmpWorkflowStep {
+  id: string;
+  title: string;
+  roleRequired: string;
+  assigneeName: string;
+  status: GmpWorkflowStepStatus;
+  slaHours: number;
+  completedAt?: string;
+  signedBy?: string;
+  signatureHash?: string;
+  notes?: string;
+}
+
+export interface GmpWorkflowInstance {
+  id: string;
+  code: string;
+  title: string;
+  description: string;
+  workflowType: GmpWorkflowType;
+  priority: WorkOrderPriority;
+  status: 'active' | 'waiting-approval' | 'completed' | 'blocked';
+  triggerSource: 'predictive-forecast' | 'eligibility-block' | 'telemetry-alarm' | 'manual';
+  linkedLineId?: string;
+  linkedLineName?: string;
+  linkedAssetId?: string;
+  linkedAssetCode?: string;
+  linkedAssetName?: string;
+  predictedFailureDate?: string;
+  createdAt: string;
+  updatedAt: string;
+  steps: GmpWorkflowStep[];
+}
+
+export type GmpModalTab =
+  | 'lines'
+  | 'compliance'
+  | 'predictive'
+  | 'workflows'
+  | 'workorders'
+  | 'calendar'
+  | 'sops'
+  | 'wiki';
 export type QrLabelModalTab = 'scanner' | 'designer';
+

@@ -315,7 +315,7 @@ export const AclGroupingModal: React.FC = () => {
                 {t.icon}
                 <span>{t.label}</span>
                 <span
-                  className={`font-mono text-[10px] px-1.5 py-0.2 rounded-md ${
+                  className={`font-mono text-[10px] px-1.5 py-0.5 rounded-md ${
                     aclTab === t.id
                       ? 'bg-white/20 text-white'
                       : isDark
@@ -519,12 +519,12 @@ export const AclGroupingModal: React.FC = () => {
                             <div className="flex items-center gap-1.5 flex-wrap">
                               <span className="text-xs font-bold truncate">{u.displayName}</span>
                               {u.isCurrentUser && (
-                                <span className="px-1.5 py-0.2 rounded-md text-[9.5px] font-bold bg-amber-500/20 text-amber-500">
+                                <span className="px-1.5 py-0.5 rounded-md text-[9.5px] font-bold bg-amber-500/20 text-amber-500">
                                   YOU
                                 </span>
                               )}
                               {u.status === 'suspended' && (
-                                <span className="px-1.5 py-0.2 rounded-md text-[9.5px] font-bold bg-rose-500/20 text-rose-500">
+                                <span className="px-1.5 py-0.5 rounded-md text-[9.5px] font-bold bg-rose-500/20 text-rose-500">
                                   SUSPENDED
                                 </span>
                               )}

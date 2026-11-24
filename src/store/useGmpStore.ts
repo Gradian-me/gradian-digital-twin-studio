@@ -6,6 +6,8 @@ import type {
   EquipmentComplianceRecord,
   EquipmentLifecycleEvent,
   GmpModalTab,
+  GmpWorkflowInstance,
+  GmpWorkflowStep,
   ProductionLine,
   ProductionLineEligibilityResult,
   QrLabelModalTab,
@@ -40,6 +42,7 @@ interface PersistedGmpState {
   personnel: EligibleTechnician[];
   sops: SopDocument[];
   wikiArticles: WikiArticle[];
+  workflows?: GmpWorkflowInstance[];
 }
 
 function loadPersistedGmp(): Partial<PersistedGmpState> | null {
@@ -78,6 +81,7 @@ interface GmpState {
   personnel: EligibleTechnician[];
   sops: SopDocument[];
   wikiArticles: WikiArticle[];
+  workflows: GmpWorkflowInstance[];
 
   // UI & Modal navigation
   showGmpModal: boolean;
@@ -136,6 +140,18 @@ interface GmpState {
   updateSopDocument: (id: string, patch: Partial<SopDocument>) => void;
   addWikiArticle: (article: Omit<WikiArticle, 'id'>) => WikiArticle;
 
+  // GMP Workflows
+  createWorkflow: (wf: Omit<GmpWorkflowInstance, 'id' | 'code' | 'createdAt' | 'updatedAt'>) => GmpWorkflowInstance;
+  advanceWorkflowStep: (
+    workflowId: string,
+    stepId: string,
+    action: 'start' | 'complete' | 'reject',
+    signedBy?: string,
+    notes?: string
+  ) => void;
+  addWorkflowStep: (workflowId: string, step: Omit<GmpWorkflowStep, 'id'>) => void;
+  deleteWorkflow: (workflowId: string) => void;
+
   // Navigation helpers
   openGmpModal: (opts?: {
     tab?: GmpModalTab;
@@ -163,7 +179,174 @@ function persist(state: GmpState) {
     personnel: state.personnel,
     sops: state.sops,
     wikiArticles: state.wikiArticles,
+    workflows: state.workflows,
   });
+}
+
+function buildSeedWorkflows(): GmpWorkflowInstance[] {
+  const today = todayIso();
+  return [
+    {
+      id: 'wf-pred-lyo',
+      code: 'WF-2026-104',
+      title: 'Predictive Pre-Failure Intervention — Lyophilizer Condenser & Vacuum Seal',
+      description:
+        'Triggered by historical lifecycle wear model + overdue vacuum sensor calibration. Replace condenser elastomer seal and execute OQ leak-rate verification prior to estimated failure window.',
+      workflowType: 'preventive-intervention',
+      priority: 'critical',
+      status: 'active',
+      triggerSource: 'predictive-forecast',
+      linkedLineId: 'line-fill-02',
+      linkedLineName: 'LINE-02 · Aseptic Fill-Finish & Lyo',
+      linkedAssetCode: 'LYO-401',
+      linkedAssetName: 'Production Lyophilizer LYO-401',
+      predictedFailureDate: addDaysToIso(today, 14),
+      createdAt: addDaysToIso(today, -2),
+      updatedAt: today,
+      steps: [
+        {
+          id: 'st-104-1',
+          title: 'Predictive Risk Triage & Line Hold Assessment',
+          roleRequired: 'Reliability Engineer',
+          assigneeName: 'Marcus Vance',
+          status: 'completed',
+          slaHours: 4,
+          completedAt: addDaysToIso(today, -1),
+          signedBy: 'Marcus Vance',
+          signatureHash: '21CFR-A8F4C91E',
+          notes: 'Confirmed accelerated vacuum pump cycling from historical lifecycle events.',
+        },
+        {
+          id: 'st-104-2',
+          title: 'Execute Seal Kit Replacement & Vacuum Calibration',
+          roleRequired: 'Certified Metrology Tech',
+          assigneeName: 'Sara Lindqvist',
+          status: 'in-progress',
+          slaHours: 16,
+          notes: 'Spare EPDM seal kit staged in Grade C airlock; calibration standard NIST-992 ready.',
+        },
+        {
+          id: 'st-104-3',
+          title: 'Leak-Rate OQ Verification (< 0.02 mbar·L/s)',
+          roleRequired: 'Validation Specialist',
+          assigneeName: 'Reza Tavakoli',
+          status: 'pending',
+          slaHours: 8,
+        },
+        {
+          id: 'st-104-4',
+          title: 'QA Batch Release & Production Line Re-Eligibility Sign-Off',
+          roleRequired: 'QA / GMP Compliance Lead',
+          assigneeName: 'Dr. Elena Rostova',
+          status: 'pending',
+          slaHours: 6,
+        },
+      ],
+    },
+    {
+      id: 'wf-capa-fill',
+      code: 'WF-2026-105',
+      title: 'Deviation & CAPA — Aseptic Vial Filler Isolator Re-Qualification',
+      description:
+        'Corrective workflow to clear blocked LINE-02 eligibility caused by overdue PQ smoke-study and particle counter calibration.',
+      workflowType: 'deviation-capa',
+      priority: 'high',
+      status: 'waiting-approval',
+      triggerSource: 'eligibility-block',
+      linkedLineId: 'line-fill-02',
+      linkedLineName: 'LINE-02 · Aseptic Fill-Finish & Lyo',
+      linkedAssetCode: 'FILL-402',
+      linkedAssetName: 'Aseptic Vial Filler Isolator FILL-402',
+      predictedFailureDate: addDaysToIso(today, 22),
+      createdAt: addDaysToIso(today, -4),
+      updatedAt: today,
+      steps: [
+        {
+          id: 'st-105-1',
+          title: 'Log Deviation DEV-2026-088 & Quarantine Batch Window',
+          roleRequired: 'QA Specialist',
+          assigneeName: 'Dr. Elena Rostova',
+          status: 'completed',
+          slaHours: 2,
+          completedAt: addDaysToIso(today, -3),
+          signedBy: 'Dr. Elena Rostova',
+          signatureHash: '21CFR-7D31E20B',
+        },
+        {
+          id: 'st-105-2',
+          title: 'ISO 5 Laminar Airflow & Particle Counter Re-Calibration',
+          roleRequired: 'Cleanroom Metrology',
+          assigneeName: 'Sara Lindqvist',
+          status: 'completed',
+          slaHours: 12,
+          completedAt: addDaysToIso(today, -1),
+          signedBy: 'Sara Lindqvist',
+          signatureHash: '21CFR-9B14F82A',
+          notes: '0.5μm & 5.0μm channels verified within ISO 14644-1 Grade A limits.',
+        },
+        {
+          id: 'st-105-3',
+          title: 'Final QA Director E-Signature & CAPA Closure',
+          roleRequired: 'QA Director',
+          assigneeName: 'Dr. Elena Rostova',
+          status: 'in-progress',
+          slaHours: 8,
+        },
+      ],
+    },
+    {
+      id: 'wf-rel-mab',
+      code: 'WF-2026-106',
+      title: 'Pre-Campaign Batch Release — LINE-01 mAb Drug Substance Suite',
+      description:
+        'Standard GMP line clearance, CIP/SIP verification, and digital twin eligibility attestation before 2000L bioreactor inoculation.',
+      workflowType: 'line-release',
+      priority: 'medium',
+      status: 'completed',
+      triggerSource: 'manual',
+      linkedLineId: 'line-mab-01',
+      linkedLineName: 'LINE-01 · mAb Drug Substance Suite',
+      linkedAssetCode: 'BR-2001',
+      linkedAssetName: '2000L Stainless Steel Bioreactor BR-2001',
+      createdAt: addDaysToIso(today, -6),
+      updatedAt: addDaysToIso(today, -2),
+      steps: [
+        {
+          id: 'st-106-1',
+          title: 'Automated Twin Eligibility Check (All Dates Valid)',
+          roleRequired: 'Production Supervisor',
+          assigneeName: 'Marcus Vance',
+          status: 'completed',
+          slaHours: 2,
+          completedAt: addDaysToIso(today, -5),
+          signedBy: 'Marcus Vance',
+          signatureHash: '21CFR-4C90B11F',
+        },
+        {
+          id: 'st-106-2',
+          title: 'SIP Sterilization Cycle Attestation (121.5°C / 30 min)',
+          roleRequired: 'Bioprocess Lead',
+          assigneeName: 'David Okafor',
+          status: 'completed',
+          slaHours: 6,
+          completedAt: addDaysToIso(today, -3),
+          signedBy: 'David Okafor',
+          signatureHash: '21CFR-6E22D40C',
+        },
+        {
+          id: 'st-106-3',
+          title: 'QA Final Line Release Sign-Off',
+          roleRequired: 'QA / GMP Compliance Lead',
+          assigneeName: 'Dr. Elena Rostova',
+          status: 'completed',
+          slaHours: 4,
+          completedAt: addDaysToIso(today, -2),
+          signedBy: 'Dr. Elena Rostova',
+          signatureHash: '21CFR-1F88A73D',
+        },
+      ],
+    },
+  ];
 }
 
 export function evaluateProductionLine(
@@ -403,6 +586,10 @@ export const useGmpStore = create<GmpState>((set, get) => {
       persisted?.wikiArticles && persisted.wikiArticles.length > 0
         ? persisted.wikiArticles
         : INITIAL_WIKI_ARTICLES,
+    workflows:
+      persisted?.workflows && persisted.workflows.length > 0
+        ? persisted.workflows
+        : buildSeedWorkflows(),
 
     showGmpModal: false,
     gmpTab: 'lines',
@@ -847,6 +1034,149 @@ export const useGmpStore = create<GmpState>((set, get) => {
       set((s) => ({ wikiArticles: [created, ...s.wikiArticles], focusedWikiId: created.id }));
       persist(get());
       return created;
+    },
+
+    createWorkflow: (input) => {
+      const today = todayIso();
+      const seq = 107 + get().workflows.length;
+      const created: GmpWorkflowInstance = {
+        ...input,
+        id: `wf-${Date.now().toString(36)}`,
+        code: `WF-${today.slice(0, 4)}-${seq}`,
+        createdAt: today,
+        updatedAt: today,
+      };
+      set((s) => ({ workflows: [created, ...s.workflows] }));
+      persist(get());
+      useTwinStore.getState().showToast(`Launched workflow ${created.code}`, 'success');
+      return created;
+    },
+
+    advanceWorkflowStep: (workflowId, stepId, action, signedBy = 'QA Operator', notes) => {
+      const today = todayIso();
+      const hash = `21CFR-${Math.abs(
+        (workflowId + stepId + Date.now()).split('').reduce((acc, ch) => (acc * 31 + ch.charCodeAt(0)) | 0, 7)
+      )
+        .toString(16)
+        .toUpperCase()
+        .slice(0, 8)}`;
+
+      let completedWf: GmpWorkflowInstance | null = null;
+
+      set((s) => {
+        const nextWorkflows = s.workflows.map((wf) => {
+          if (wf.id !== workflowId) return wf;
+          let autoStartNext = false;
+          const nextSteps = wf.steps.map((st) => {
+            if (st.id === stepId) {
+              if (action === 'complete') {
+                autoStartNext = true;
+                return {
+                  ...st,
+                  status: 'completed' as const,
+                  completedAt: today,
+                  signedBy,
+                  signatureHash: hash,
+                  notes: notes ? notes : st.notes,
+                };
+              }
+              if (action === 'reject') {
+                return {
+                  ...st,
+                  status: 'rejected' as const,
+                  completedAt: today,
+                  signedBy,
+                  signatureHash: hash,
+                  notes: notes ? notes : st.notes,
+                };
+              }
+              return { ...st, status: 'in-progress' as const };
+            }
+            if (autoStartNext && st.status === 'pending') {
+              autoStartNext = false;
+              return { ...st, status: 'in-progress' as const };
+            }
+            return st;
+          });
+
+          const allDone = nextSteps.every((st) => st.status === 'completed');
+          const hasReject = nextSteps.some((st) => st.status === 'rejected');
+          const lastPending =
+            !allDone &&
+            nextSteps.filter((st) => st.status !== 'completed').length === 1;
+
+          const nextStatus: GmpWorkflowInstance['status'] = hasReject
+            ? 'blocked'
+            : allDone
+              ? 'completed'
+              : lastPending
+                ? 'waiting-approval'
+                : 'active';
+
+          const updated: GmpWorkflowInstance = {
+            ...wf,
+            status: nextStatus,
+            updatedAt: today,
+            steps: nextSteps,
+          };
+          if (allDone && wf.status !== 'completed') {
+            completedWf = updated;
+          }
+          return updated;
+        });
+        return { workflows: nextWorkflows };
+      });
+
+      // Automatically record immutable lifecycle audit event when a workflow completes
+      if (completedWf && (completedWf as GmpWorkflowInstance).linkedAssetId) {
+        const wfRef = completedWf as GmpWorkflowInstance;
+        get().addLifecycleEvent(wfRef.linkedAssetId!, {
+          date: today,
+          stage:
+            wfRef.workflowType === 'deviation-capa'
+              ? 'deviation-capa'
+              : wfRef.workflowType === 're-qualification'
+                ? 'qualification-oq-pq'
+                : 'maintenance',
+          title: `Workflow Completed: ${wfRef.code} — ${wfRef.title}`,
+          performedBy: signedBy,
+          referenceDoc: wfRef.code,
+          outcome: 'pass',
+          notes: `All ${wfRef.steps.length} GMP workflow stages verified & electronically signed.`,
+        });
+        useTwinStore
+          .getState()
+          .showToast(`Workflow ${wfRef.code} completed & logged to equipment lifecycle history`, 'success');
+      }
+      persist(get());
+    },
+
+    addWorkflowStep: (workflowId, step) => {
+      const today = todayIso();
+      set((s) => ({
+        workflows: s.workflows.map((wf) =>
+          wf.id === workflowId
+            ? {
+                ...wf,
+                status: wf.status === 'completed' ? 'active' : wf.status,
+                updatedAt: today,
+                steps: [
+                  ...wf.steps,
+                  {
+                    ...step,
+                    id: `st-${Date.now().toString(36)}`,
+                  },
+                ],
+              }
+            : wf
+        ),
+      }));
+      persist(get());
+    },
+
+    deleteWorkflow: (workflowId) => {
+      set((s) => ({ workflows: s.workflows.filter((w) => w.id !== workflowId) }));
+      persist(get());
     },
 
     openGmpModal: (opts) => {

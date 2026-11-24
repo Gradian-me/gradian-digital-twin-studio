@@ -50,8 +50,10 @@ import {
   Map as MapIcon,
   QrCode,
   Shield,
+  TrendingDown,
   Wand2,
   Waypoints,
+  Workflow,
   Wrench,
 } from 'lucide-react';
 import { useTwinStore } from '../store/useTwinStore';
@@ -966,10 +968,30 @@ export const TopToolbar: React.FC = () => {
                   openGmpModal({ tab: 'lines' });
                   setOpenMenu('none');
                 }}
-                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-emerald-500/12 hover:text-emerald-600 dark:hover:text-emerald-300 transition-colors"
+                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-emerald-500/12 hover:text-emerald-600 dark:hover:text-emerald-300 transition-colors cursor-pointer"
               >
                 <GitBranch className="w-4 h-4 text-emerald-500" />
                 <span>Production Line Eligibility</span>
+              </button>
+              <button
+                onClick={() => {
+                  openGmpModal({ tab: 'predictive' });
+                  setOpenMenu('none');
+                }}
+                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-rose-500/12 hover:text-rose-500 transition-colors cursor-pointer"
+              >
+                <TrendingDown className="w-4 h-4 text-rose-500" />
+                <span>Predictive Failure Forecast</span>
+              </button>
+              <button
+                onClick={() => {
+                  openGmpModal({ tab: 'workflows' });
+                  setOpenMenu('none');
+                }}
+                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-violet-500/12 hover:text-violet-500 transition-colors cursor-pointer"
+              >
+                <Workflow className="w-4 h-4 text-violet-500" />
+                <span>GMP Workflows &amp; E-Sign</span>
               </button>
               <button
                 onClick={() => {

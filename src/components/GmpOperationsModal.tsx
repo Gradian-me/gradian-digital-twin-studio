@@ -26,12 +26,16 @@ import {
   ShieldCheck,
   Sparkles,
   Trash2,
+  TrendingDown,
   UserCheck,
+  Workflow,
   Wrench,
   X,
 } from 'lucide-react';
 import { useTwinStore } from '../store/useTwinStore';
 import { useGmpStore } from '../store/useGmpStore';
+import { PredictiveForecastPanel } from './PredictiveForecastPanel';
+import { GmpWorkflowsPanel } from './GmpWorkflowsPanel';
 import type {
   EquipmentLifecycleEvent,
   GmpModalTab,
@@ -257,6 +261,7 @@ export const GmpOperationsModal: React.FC = () => {
     updateSopDocument,
     wikiArticles,
     addWikiArticle,
+    workflows,
     openQrLabelModal,
   } = useGmpStore();
 
@@ -544,12 +549,20 @@ export const GmpOperationsModal: React.FC = () => {
   );
 
   const overdueWoCount = workOrders.filter((w) => w.status === 'overdue').length;
+  const activeWorkflowCount = workflows.filter((w) => w.status !== 'completed').length;
 
   if (!showGmpModal) return null;
 
   const tabs: { id: GmpModalTab; label: string; icon: React.ReactNode; badge?: number }[] = [
     { id: 'lines', label: 'Production Lines', icon: <GitBranch className="w-3.5 h-3.5" /> },
     { id: 'compliance', label: 'Cal / Qual & Audit', icon: <History className="w-3.5 h-3.5" /> },
+    { id: 'predictive', label: 'Predictive Forecast', icon: <TrendingDown className="w-3.5 h-3.5" /> },
+    {
+      id: 'workflows',
+      label: 'Workflows',
+      icon: <Workflow className="w-3.5 h-3.5" />,
+      badge: activeWorkflowCount > 0 ? activeWorkflowCount : undefined,
+    },
     {
       id: 'workorders',
       label: 'Work Orders & Cron',
@@ -696,7 +709,7 @@ export const GmpOperationsModal: React.FC = () => {
                 {t.icon}
                 <span>{t.label}</span>
                 {t.badge !== undefined && (
-                  <span className="ml-0.5 rounded-full bg-rose-500 text-white px-1.5 py-0.2 text-[9px] font-bold">
+                  <span className="ml-0.5 rounded-full bg-rose-500 text-white px-1.5 py-0.5 text-[9px] font-bold">
                     {t.badge}
                   </span>
                 )}
@@ -3057,6 +3070,20 @@ export const GmpOperationsModal: React.FC = () => {
               ) : null}
             </div>
           </div>
+        )}
+
+        {/* ==================== TAB 7: PREDICTIVE MAINTENANCE FORECAST ==================== */}
+        {gmpTab === 'predictive' && (
+          <PredictiveForecastPanel
+            isDark={isDark}
+            onFlyToAsset3D={flyToAssetIn3D}
+            onOpenWorkflowsTab={() => setGmpTab('workflows')}
+          />
+        )}
+
+        {/* ==================== TAB 8: GMP APPROVAL & PREVENTIVE WORKFLOWS ==================== */}
+        {gmpTab === 'workflows' && (
+          <GmpWorkflowsPanel isDark={isDark} onFlyToAsset3D={flyToAssetIn3D} />
         )}
       </div>
     </div>
