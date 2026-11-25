@@ -34,6 +34,7 @@ import {
 } from 'lucide-react';
 import { useTwinStore } from '../store/useTwinStore';
 import { useGmpStore } from '../store/useGmpStore';
+import { useTelemetryStore } from '../store/useTelemetryStore';
 import { PredictiveForecastPanel } from './PredictiveForecastPanel';
 import { GmpWorkflowsPanel } from './GmpWorkflowsPanel';
 import type {
@@ -225,6 +226,8 @@ const SERVICE_TYPES: { id: ServiceActionType; label: string }[] = [
 
 export const GmpOperationsModal: React.FC = () => {
   const { scene, theme, selectEntity, setActiveFloor, setViewMode, flyToCamera, showToast } = useTwinStore();
+  const telemetrySensors = useTelemetryStore((s) => s.sensors);
+  const telemetryReadings = useTelemetryStore((s) => s.readings);
   const {
     showGmpModal,
     gmpTab,
@@ -550,13 +553,26 @@ export const GmpOperationsModal: React.FC = () => {
 
   const overdueWoCount = workOrders.filter((w) => w.status === 'overdue').length;
   const activeWorkflowCount = workflows.filter((w) => w.status !== 'completed').length;
+  const gxpTelemetryAlertCount = useMemo(() => {
+    let count = 0;
+    for (const s of telemetrySensors) {
+      const st = telemetryReadings[s.id]?.status;
+      if (st === 'alarm' || st === 'warning') count++;
+    }
+    return count;
+  }, [telemetrySensors, telemetryReadings]);
 
   if (!showGmpModal) return null;
 
   const tabs: { id: GmpModalTab; label: string; icon: React.ReactNode; badge?: number }[] = [
     { id: 'lines', label: 'Production Lines', icon: <GitBranch className="w-3.5 h-3.5" /> },
     { id: 'compliance', label: 'Cal / Qual & Audit', icon: <History className="w-3.5 h-3.5" /> },
-    { id: 'predictive', label: 'Predictive Forecast', icon: <TrendingDown className="w-3.5 h-3.5" /> },
+    {
+      id: 'predictive',
+      label: 'Predictive & EMS AI',
+      icon: <TrendingDown className="w-3.5 h-3.5" />,
+      badge: gxpTelemetryAlertCount > 0 ? gxpTelemetryAlertCount : undefined,
+    },
     {
       id: 'workflows',
       label: 'Workflows',

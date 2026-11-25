@@ -1197,6 +1197,135 @@ Return a crisp executive summary (2-3 sentences) explaining the root causes and 
   }
 });
 
+// ============================================================
+// AI-First Enterprise Asset Management (EAM) & EMS GxP Triage
+// ============================================================
+app.post('/api/eam/ai-diagnose', async (req, res) => {
+  try {
+    const { mode = 'asset-triage', assetContext, fleetSummary } = req.body ?? {};
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(503).json({
+        error:
+          'Gemini API key is not configured on the server. Add GEMINI_API_KEY in Settings > Secrets.',
+      });
+    }
+    if (mode === 'asset-triage' && !assetContext) {
+      return res.status(400).json({ error: 'Asset diagnostic context is required.' });
+    }
+
+    const systemInstruction = `You are the Principal AI Reliability Engineer & Pharmaceutical GxP / EMS Compliance Architect inside an enterprise biopharma Digital Twin & EAM platform.
+Analyze live SCADA/EMS sensor telemetry, GxP compliance thresholds (FDA 21 CFR Part 11, 21 CFR 211.68, EU GMP Annex 1 & Annex 15, ICH Q7), historical lifecycle events, usage hours, MTBF, spare-part availability, and production line status.
+Provide concrete, engineering-grade root-cause diagnostics, batch-risk quantification, and an actionable preventive work order with step-by-step GMP verification checklist.
+Rules:
+1. Ground every finding strictly in the provided telemetry readings, threshold margins, usage history, and production line status.
+2. Keep prose crisp, quantitative, and free of fluff.
+3. For recommendedWorkOrder.serviceType, strictly return one of: "maintenance", "calibration", "qualification", "cleaning-cip-sip", "corrective-repair", "inspection".
+4. For recommendedWorkOrder.priority, strictly return one of: "critical", "high", "medium", "low".
+5. For severityVerdict, strictly return one of: "IMMEDIATE_HOLD", "EXPEDITED_PM", "SCHEDULED_WATCH".`;
+
+    const { text: raw, modelUsed } = await callGeminiResilient({
+      contents: JSON.stringify({
+        mode,
+        assetContext: assetContext ?? null,
+        fleetSummary: fleetSummary ?? null,
+      }),
+      config: {
+        systemInstruction,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            headline: { type: Type.STRING },
+            severityVerdict: { type: Type.STRING },
+            gxpComplianceAssessment: { type: Type.STRING },
+            rootCauseHypotheses: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  cause: { type: Type.STRING },
+                  confidencePct: { type: Type.NUMBER },
+                  telemetryEvidence: { type: Type.STRING },
+                },
+                required: ['cause', 'confidencePct', 'telemetryEvidence'],
+              },
+            },
+            recommendedWorkOrder: {
+              type: Type.OBJECT,
+              properties: {
+                title: { type: Type.STRING },
+                serviceType: { type: Type.STRING },
+                priority: { type: Type.STRING },
+                estimatedHours: { type: Type.NUMBER },
+                dueInDays: { type: Type.INTEGER },
+                sopReference: { type: Type.STRING },
+                requiredParts: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
+                checklist: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
+              },
+              required: [
+                'title',
+                'serviceType',
+                'priority',
+                'estimatedHours',
+                'dueInDays',
+                'sopReference',
+                'requiredParts',
+                'checklist',
+              ],
+            },
+            downtimeCostComparison: {
+              type: Type.OBJECT,
+              properties: {
+                unplannedCostUsd: { type: Type.NUMBER },
+                preventiveCostUsd: { type: Type.NUMBER },
+                downtimeHoursSaved: { type: Type.NUMBER },
+                batchRiskMitigated: { type: Type.STRING },
+              },
+              required: [
+                'unplannedCostUsd',
+                'preventiveCostUsd',
+                'downtimeHoursSaved',
+                'batchRiskMitigated',
+              ],
+            },
+            optimizationRecommendations: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+            },
+          },
+          required: [
+            'headline',
+            'severityVerdict',
+            'gxpComplianceAssessment',
+            'rootCauseHypotheses',
+            'recommendedWorkOrder',
+            'downtimeCostComparison',
+            'optimizationRecommendations',
+          ],
+        },
+      },
+    });
+
+    const parsed = safeParseModelJson(raw);
+    if (!parsed || !parsed.headline) {
+      return res.status(502).json({
+        error: 'AI returned an incomplete diagnostic response. Please retry.',
+      });
+    }
+    return res.json({ ...parsed, modelUsed });
+  } catch (error: any) {
+    console.error('AI EAM Diagnose error:', error);
+    const friendly = formatFriendlyGeminiError(error);
+    return res.status(friendly.status).json({ error: friendly.message });
+  }
+});
+
 // Ensure unknown /api/* routes ALWAYS return JSON (never fall through to Vite HTML index.html)
 app.use('/api', (_req, res) => {
   res.status(404).json({ error: 'API endpoint not found.' });
@@ -1234,4 +1363,7 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('Fatal server startup error:', err);
+  process.exit(1);
+});

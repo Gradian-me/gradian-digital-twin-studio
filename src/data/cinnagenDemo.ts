@@ -7,10 +7,10 @@ import type {
   SpatialAsset,
   SpatialMetadata,
   Wall,
-} from '../types/twin';
-import { DEFAULT_LAYERS, WALL_PRESETS } from './materialsLibrary';
-import { OBJECT_LIBRARY } from './objectLibrary';
-import { SPACE_TYPE_LIBRARY } from './spaceTypes';
+} from '../types/twin.ts';
+import { DEFAULT_LAYERS, WALL_PRESETS } from './materialsLibrary.ts';
+import { OBJECT_LIBRARY } from './objectLibrary.ts';
+import { SPACE_TYPE_LIBRARY } from './spaceTypes.ts';
 
 function makeMeta(
   code: string,

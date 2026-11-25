@@ -1,4 +1,4 @@
-import type { DigitalTwinScene, Room, SpatialAsset } from '../types/twin';
+import type { DigitalTwinScene, Room, SpatialAsset } from '../types/twin.ts';
 import {
   METRIC_PRESETS,
   type LiveSensorSnapshot,
@@ -6,8 +6,8 @@ import {
   type SensorReadingPoint,
   type SensorRelationship,
   type SensorStatus,
-} from '../types/telemetry';
-import { createCinnaGenCampusScene } from './cinnagenDemo';
+} from '../types/telemetry.ts';
+import { createCinnaGenCampusScene } from './cinnagenDemo.ts';
 
 export function evaluateSensorStatus(sensor: SensorDefinition, value: number): SensorStatus {
   if (value <= sensor.alarmLow || value >= sensor.alarmHigh) return 'alarm';
