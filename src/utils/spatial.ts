@@ -514,6 +514,102 @@ export function runSpatialValidation(scene: DigitalTwinScene): ValidationIssue[]
     }
   }
 
+  // 8. GMP Room Compliance, Critical Contamination Risk & Qualification Notices
+  for (const rm of scene.rooms) {
+    if (rm.complianceStatus === 'deviation') {
+      issues.push({
+        id: `val-gmp-dev-${rm.id}`,
+        severity: 'critical',
+        code: 'GMP-ROOM-DEV',
+        title: `Active GMP Deviation in ${rm.code} (${rm.name})`,
+        description: `Room ${rm.code} is flagged in active deviation status. CAPA review & QA release required before batch start.`,
+        floorId: rm.floorId,
+        entityIds: [rm.id],
+        entityType: 'room',
+        focusPoint: [rm.x + rm.width / 2, 1.5, rm.z + rm.depth / 2],
+        autoFixHint: 'Launch QA Deviation CAPA & verify room eligibility',
+      });
+    } else if (rm.complianceStatus === 'review-due') {
+      issues.push({
+        id: `val-gmp-rev-${rm.id}`,
+        severity: 'warning',
+        code: 'GMP-QUAL-REVIEW',
+        title: `Qualification Review Due: ${rm.code} · ${rm.name}`,
+        description: `Periodic EU GMP Annex 15 requalification & HEPA integrity review scheduled for ${rm.code}.`,
+        floorId: rm.floorId,
+        entityIds: [rm.id],
+        entityType: 'room',
+        focusPoint: [rm.x + rm.width / 2, 1.5, rm.z + rm.depth / 2],
+        autoFixHint: 'Schedule requalification inspection work order',
+      });
+    } else if (rm.riskLevel === 'critical') {
+      issues.push({
+        id: `val-gmp-risk-${rm.id}`,
+        severity: 'warning',
+        code: 'ANNEX1-CONTAM-RISK',
+        title: `Grade A/B Contamination Control Watch: ${rm.code}`,
+        description: `${rm.name} is classified Critical Contamination Risk (${rm.environmental.cleanroomGrade}, +${rm.environmental.pressurePa} Pa). Verify continuous viable/non-viable monitoring.`,
+        floorId: rm.floorId,
+        entityIds: [rm.id],
+        entityType: 'room',
+        focusPoint: [rm.x + rm.width / 2, 1.5, rm.z + rm.depth / 2],
+      });
+    }
+  }
+
+  // 9. Equipment Commissioning & High-Utilization Risk Notices
+  for (const a of scene.assets) {
+    if (a.operationalStatus === 'commissioning') {
+      issues.push({
+        id: `val-comm-${a.id}`,
+        severity: 'warning',
+        code: 'GMP-IQ-OQ-OPEN',
+        title: `Commissioning Pending PQ Sign-Off: ${a.assetId}`,
+        description: `${a.name} is currently in commissioning phase. Complete PQ protocol before assigning to commercial batches.`,
+        floorId: a.floorId,
+        entityIds: [a.id],
+        entityType: 'asset',
+        focusPoint: [a.x, 1.2, a.z],
+      });
+    }
+  }
+
+  // 10. IT / OT Network Uplink Degradation & Switch Port CRC Alerts
+  if (scene.networkArchitecture) {
+    for (const node of scene.networkArchitecture.userNodes) {
+      if (node.status === 'error' || node.status === 'degraded' || (node.crcErrors ?? 0) > 5) {
+        issues.push({
+          id: `val-net-node-${node.id}`,
+          severity: node.status === 'error' ? 'error' : 'warning',
+          code: 'OT-NET-PORT-ERR',
+          title: `IT/OT Port CRC Burst on ${node.code} (${node.crcErrors} errors)`,
+          description: node.notes || `${node.name} (${node.ipAddress}) experiencing packet loss (${node.packetLossPct}%) on wall jack ${node.wallJackId}.`,
+          floorId: node.floorId,
+          entityIds: [node.connectedRackId],
+          entityType: 'asset',
+          focusPoint: [node.x, 1.2, node.z],
+          autoFixHint: 'Inspect RJ45/OM4 patch termination in Rack Designer',
+        });
+      }
+    }
+    for (const link of scene.networkArchitecture.interRackLinks) {
+      if (link.status === 'degraded' || link.status === 'down') {
+        const fromRack = scene.assets.find((a) => a.id === link.fromRackId);
+        issues.push({
+          id: `val-net-link-${link.id}`,
+          severity: link.status === 'down' ? 'critical' : 'warning',
+          code: 'OT-FIBER-DEGRADED',
+          title: `Degraded Fiber Trunk: ${link.label}`,
+          description: `Optical Rx ${link.opticalRxDbm} dBm · ${link.crcErrors} CRC errors (${link.speedGbps}G ${link.media}). Clean LC/MPO transceivers.`,
+          floorId: fromRack?.floorId ?? scene.floors[0]?.id ?? 'fl-a0',
+          entityIds: [link.fromRackId, link.toRackId],
+          entityType: 'asset',
+          focusPoint: fromRack ? [fromRack.x, 1.4, fromRack.z] : [10, 1.4, 10],
+        });
+      }
+    }
+  }
+
   return issues;
 }
 

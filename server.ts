@@ -436,19 +436,21 @@ app.post('/api/maya-chat', async (req, res) => {
       });
     }
 
-    const systemInstruction = `You are Maya, the Principal AI Digital Twin Architect & Biopharma Facility Designer inside Gradian Digital Twin Studio.
-You help users design, optimize, and iteratively modify 2D/3D industrial & pharmaceutical GMP facility maps through natural conversation, while also analyzing live telemetry, risks, and spatial compliance.
+    const systemInstruction = `You are Maya, the Principal AI Digital Twin Architect, GMP Quality Engineer & Biopharma Facility Designer inside Gradian Digital Twin Studio.
+You help users design, audit, optimize, and iteratively modify 2D/3D pharmaceutical GMP facility maps through natural conversation, while analyzing live telemetry, FMEA risks (S×O×D RPN), GMP compliance, HVAC cascades, and equipment/room health.
 
 Formatting & Response Rules:
-1. Write \`markdown\` in clean, structured Markdown using headings (##, ###), concise bullet points, bold metrics, and Markdown tables when comparing rooms, equipment, or telemetry.
-2. Whenever quantitative comparisons, room areas, risk scores, equipment counts, or sensor readings are discussed, ALSO populate the \`charts\` array with 1-2 structured chart definitions (\`bar\`, \`line\`, or \`kpi\`) so the UI renders interactive visual charts right inside your message!
-3. Whenever the user asks to design, add, modify, rearrange, paint, add flows, optimize the map, check production line eligibility, or create GMP work orders, populate \`proposedActions\` with exact, non-overlapping, safe actions the user can preview and apply with 1 click:
+1. Write \`markdown\` in clean, structured Markdown using headings (##, ###), concise bullet points, bold metrics, and Markdown tables when comparing rooms, equipment, HVAC, GMP compliance, FMEA risks, or telemetry.
+2. ALWAYS cite exact room codes (e.g. \`A0-101\`), asset IDs/tags (e.g. \`BIO-2000-01\`), and floor codes (e.g. \`A-L0\`) inside backticks so the UI turns them into interactive 3D jump links!
+3. Whenever you discuss or recommend inspecting any specific room, equipment asset, floor, or building, populate \`navigationTargets\` with exact matching \`type\` ('room' | 'asset' | 'floor' | 'building'), \`id\`, \`code\`, \`name\`, and a short \`reason\` from \`facilitySummary\` so users can fly directly to each object in the 3D digital twin with 1 click.
+4. Whenever quantitative comparisons, room areas, FMEA RPN scores, equipment power/condition, HVAC ACH/pressure, or sensor readings are discussed, ALSO populate \`charts\` with 1-2 structured chart definitions (\`bar\`, \`line\`, or \`kpi\`).
+5. Whenever the user asks to design, add, modify, rearrange, paint, add flows, optimize the map, check production line eligibility, or create GMP/CAPA work orders, populate \`proposedActions\` with exact, non-overlapping, safe actions:
    - Supported action types: create_room, place_equipment, update_wall_height, apply_floor_material, add_door, create_camera, create_flow, set_analytics_mode, select_entities, run_validation, highlight_production_line, create_work_order.
-   - For \`highlight_production_line\`: pass \`lineId\` using the real Production Line \`id\` or \`code\` from \`facilitySummary.gmpCompliance.productionLines\`. This highlights the production line's rooms & equipment Emerald Green (eligible) or Crimson Red (blocked) directly on the 2D/3D map!
+   - For \`highlight_production_line\`: pass \`lineId\` using the real Production Line \`id\` or \`code\` from \`facilitySummary.gmpCompliance.productionLines\`.
    - For \`create_work_order\`: pass \`entityIds\` (array with the target asset \`id\` or \`assetId\`), \`serviceType\` ('Calibration' | 'Qualification' | 'Preventive Maintenance' | 'Corrective Maintenance' | 'Sanitization / CIP-SIP'), \`priority\` ('low' | 'medium' | 'high' | 'critical'), and \`dueDate\` (YYYY-MM-DD).
-   - Use real IDs from facilitySummary for existing rooms, materials, production lines, and equipment templates (e.g., eq-bioreactor-ss, eq-bioreactor-su, eq-hplc, eq-chrom-skid, eq-biosafety-cab, eq-autoclave, eq-lyophilizer, eq-vial-filler, eq-pallet-rack, eq-ahu).
-   - Keep coordinates within the active floor bounds (typically X in [0..44], Z in [0..26]) and avoid overlapping existing rooms.
-4. Always include 2-3 helpful short \`followUpSuggestions\` prompts for the user's next design or GMP compliance step.`;
+   - Use real IDs from \`facilitySummary\` for existing rooms, materials, production lines, FMEA incidents, and equipment templates (e.g., eq-bioreactor-ss, eq-bioreactor-su, eq-hplc, eq-chrom-skid, eq-biosafety-cab, eq-autoclave, eq-lyophilizer, eq-vial-filler, eq-pallet-rack, eq-ahu).
+   - Keep new room coordinates within the active floor bounds (typically X in [0..44], Z in [0..26]) and avoid overlapping existing rooms.
+6. Always include 2-3 helpful short \`followUpSuggestions\` prompts for the user's next GMP, FMEA, room, or asset action.`;
 
     const recentHistory = Array.isArray(history)
       ? history.slice(-6).map((h: any) => ({
@@ -472,7 +474,7 @@ Formatting & Response Rules:
           properties: {
             markdown: {
               type: Type.STRING,
-              description: 'Rich Markdown response with headings, lists, bold metrics, and optional markdown tables.',
+              description: 'Rich Markdown response with headings, lists, bold metrics, backtick entity codes, and optional markdown tables.',
             },
             highlightTitle: {
               type: Type.STRING,
@@ -503,6 +505,21 @@ Formatting & Response Rules:
                   },
                 },
                 required: ['title', 'kind', 'data'],
+              },
+            },
+            navigationTargets: {
+              type: Type.ARRAY,
+              description: 'Exact rooms, assets, floors, or buildings referenced in this answer for direct 1-click 3D model navigation.',
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  type: { type: Type.STRING, description: 'room, asset, floor, or building' },
+                  id: { type: Type.STRING },
+                  code: { type: Type.STRING },
+                  name: { type: Type.STRING },
+                  reason: { type: Type.STRING, description: 'Short 3-6 word context e.g. RPN 280 · Overdue OQ' },
+                },
+                required: ['type', 'code', 'name'],
               },
             },
             proposedActions: {
@@ -1321,6 +1338,272 @@ Rules:
     return res.json({ ...parsed, modelUsed });
   } catch (error: any) {
     console.error('AI EAM Diagnose error:', error);
+    const friendly = formatFriendlyGeminiError(error);
+    return res.status(friendly.status).json({ error: friendly.message });
+  }
+});
+
+// CAD / DWG / SVG / Blueprint Vision OCR -> Architectural Plan Walls, Glass Walls, Rooms & Openings
+app.post('/api/cad/ocr-plan-walls', async (req, res) => {
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(503).json({
+        error: 'GEMINI_API_KEY is not configured on the server. Add it in AI Studio secrets to run Vision OCR.',
+      });
+    }
+
+    const {
+      fileName = 'architectural-plan',
+      imageBase64,
+      mimeType = 'image/png',
+      vectorHint = '',
+      targetWidthM = 28,
+      targetDepthM = 18,
+      wallHeightM = 3.6,
+    } = req.body ?? {};
+
+    if (!imageBase64 && !vectorHint) {
+      return res.status(400).json({
+        error: 'Provide either a rasterized drawing image (imageBase64) or vector SVG/DXF content (vectorHint).',
+      });
+    }
+
+    const cleanWidth = Math.max(8, Math.min(160, Number(targetWidthM) || 28));
+    const cleanDepth = Math.max(8, Math.min(160, Number(targetDepthM) || 18));
+    const cleanHeight = Math.max(2.4, Math.min(8.5, Number(wallHeightM) || 3.6));
+
+    const promptText = `You are an expert architectural CAD/BIM surveyor and floorplan OCR engine.
+Analyze the provided architectural drawing (${String(fileName).slice(0, 120)}) and extract a clean, buildable 2D/3D architectural wall plan with OCR room labels, doors, windows, and full glass curtain walls.
+
+TARGET FLOOR FOOTPRINT:
+- Width (X axis): 0 to ${cleanWidth} meters (leave ~1.0m margin if helpful, keep coordinates inside [0.5, ${cleanWidth - 0.5}])
+- Depth (Z axis): 0 to ${cleanDepth} meters (keep coordinates inside [0.5, ${cleanDepth - 0.5}])
+- Wall height: ${cleanHeight} meters
+
+STRICT EXTRACTION RULES:
+1. Perform OCR on every visible room number (e.g., 403, 404, RM-101), room name (e.g., Studio Loft, Cleanroom, Lab, Lobby), and dimension text. List all OCR text in "detectedLabels".
+2. Trace straight architectural wall segments as clean connected lines (x1, z1, x2, z2) in meters. Snap near-horizontal/vertical walls cleanly. Avoid duplicate overlapping walls.
+3. Classify each wall presetId accurately:
+   - "exterior-structural" for outer building shell walls
+   - "full-glass-wall" for full-height glass curtain walls, storefronts, glazed facades, or cyan/blue double-line glass walls
+   - "glass-partition" for interior glass observation partitions
+   - "cleanroom-panel" for pharmaceutical / lab cleanroom walls
+   - "interior-standard" for standard interior partitions
+4. Extract bounding rectangles for every named/numbered room inside "rooms" with accurate OCR "code" (room number) and "name".
+5. Detect doors and windows along the walls and reference them by 0-based "wallIndex" (referencing your "walls" array) and "offsetRatio" (0.15 to 0.85). Use subtype "glass-door", "cleanroom-door", "double-door", "single-door" for doors and "double-glazing", "observation-window", "standard-window" for windows.
+${vectorHint ? `\nPRE-PARSED VECTOR/TEXT HINTS FROM CAD/SVG:\n${String(vectorHint).slice(0, 9000)}` : ''}`;
+
+    const parts: any[] = [];
+    if (typeof imageBase64 === 'string' && imageBase64.length > 32) {
+      const stripped = imageBase64.replace(/^data:[^;]+;base64,/, '');
+      parts.push({
+        inlineData: {
+          mimeType: typeof mimeType === 'string' && mimeType.startsWith('image/') ? mimeType : 'image/png',
+          data: stripped,
+        },
+      });
+    }
+    parts.push({ text: promptText });
+
+    const { text: raw, modelUsed } = await callGeminiResilient({
+      contents: [{ role: 'user', parts }],
+      config: {
+        temperature: 0.15,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            ocrSummary: { type: Type.STRING },
+            detectedLabels: { type: Type.ARRAY, items: { type: Type.STRING } },
+            footprintWidthM: { type: Type.NUMBER },
+            footprintDepthM: { type: Type.NUMBER },
+            walls: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  name: { type: Type.STRING },
+                  x1: { type: Type.NUMBER },
+                  z1: { type: Type.NUMBER },
+                  x2: { type: Type.NUMBER },
+                  z2: { type: Type.NUMBER },
+                  presetId: {
+                    type: Type.STRING,
+                    enum: [
+                      'exterior-structural',
+                      'interior-standard',
+                      'full-glass-wall',
+                      'glass-partition',
+                      'cleanroom-panel',
+                      'concrete',
+                      'fire-rated',
+                    ],
+                  },
+                  isExterior: { type: Type.BOOLEAN },
+                },
+                required: ['x1', 'z1', 'x2', 'z2', 'presetId'],
+              },
+            },
+            rooms: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  code: { type: Type.STRING },
+                  name: { type: Type.STRING },
+                  x: { type: Type.NUMBER },
+                  z: { type: Type.NUMBER },
+                  width: { type: Type.NUMBER },
+                  depth: { type: Type.NUMBER },
+                },
+                required: ['code', 'name', 'x', 'z', 'width', 'depth'],
+              },
+            },
+            openings: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  wallIndex: { type: Type.INTEGER },
+                  offsetRatio: { type: Type.NUMBER },
+                  kind: { type: Type.STRING, enum: ['door', 'window'] },
+                  subtype: { type: Type.STRING },
+                  width: { type: Type.NUMBER },
+                  height: { type: Type.NUMBER },
+                  sillHeight: { type: Type.NUMBER },
+                  name: { type: Type.STRING },
+                },
+                required: ['wallIndex', 'offsetRatio', 'kind'],
+              },
+            },
+          },
+          required: ['ocrSummary', 'detectedLabels', 'footprintWidthM', 'footprintDepthM', 'walls', 'rooms'],
+        },
+      },
+    });
+
+    const parsed = safeParseModelJson(raw);
+    if (!parsed || !Array.isArray(parsed.walls) || parsed.walls.length === 0) {
+      return res.status(502).json({
+        error: 'OCR Vision could not detect clear wall lines from this file. Try higher contrast or calibrate an SVG/DXF drawing.',
+      });
+    }
+
+    return res.json({ ...parsed, modelUsed });
+  } catch (error: any) {
+    console.error('CAD/SVG OCR Wall Plan error:', error);
+    const friendly = formatFriendlyGeminiError(error);
+    return res.status(friendly.status).json({ error: friendly.message });
+  }
+});
+
+// AI Incident Resolution & FMEA CAPA Generator (Gemini)
+app.post('/api/incidents/ai-resolve', async (req, res) => {
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(503).json({
+        error: 'Gemini API key is not configured on the server. Please check Settings > Secrets.',
+      });
+    }
+    const { incident, facilityName } = req.body ?? {};
+    if (!incident || typeof incident !== 'object') {
+      return res.status(400).json({ error: 'Incident details are required.' });
+    }
+
+    const prompt = [
+      `Facility: ${String(facilityName || 'CinnaGen Biopharmaceutical Campus')}`,
+      `Incident Code: ${String(incident.code || 'INC-AUTO')}`,
+      `Type: ${String(incident.kind || 'alarm')}`,
+      `Target: [${String(incident.targetKind || 'asset').toUpperCase()}] ${String(incident.targetCode || '')} - ${String(incident.targetName || '')}`,
+      incident.sensorTag ? `Live Sensor Tag: ${String(incident.sensorTag)} (${String(incident.currentValueLabel || '')})` : '',
+      `Title: ${String(incident.title || '')}`,
+      `Failure Mode: ${String(incident.failureMode || '')}`,
+      `Effect: ${String(incident.effect || '')}`,
+      `Probable Cause: ${String(incident.cause || '')}`,
+      `Current Controls: ${String(incident.currentControls || '')}`,
+      `Current FMEA Scores: Severity=${Number(incident.severity) || 7}, Occurrence=${Number(incident.occurrence) || 5}, Detection=${Number(incident.detection) || 5}, RPN=${Number(incident.rpn) || 175}`,
+      'Produce an actionable EU GMP Annex 1 / ISO 14644 / ISA-95 engineering root-cause analysis, immediate containment steps, CAPA recommendations, SOP references, residual FMEA S/O/D scores after mitigation (1-10 integers strictly lower or equal to current), and a concrete work order title.',
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    const { text: raw, modelUsed } = await callGeminiResilient({
+      contents: prompt,
+      config: {
+        systemInstruction:
+          'You are a Principal GMP Quality Assurance, Reliability (FMEA), and Biopharma/IT Facilities Engineer. Return concise, practical, audit-ready JSON strictly matching the schema.',
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            summary: { type: Type.STRING },
+            rootCause: { type: Type.STRING },
+            immediateContainment: { type: Type.ARRAY, items: { type: Type.STRING } },
+            capaActions: { type: Type.ARRAY, items: { type: Type.STRING } },
+            sopReferences: { type: Type.ARRAY, items: { type: Type.STRING } },
+            residualSeverity: { type: Type.INTEGER },
+            residualOccurrence: { type: Type.INTEGER },
+            residualDetection: { type: Type.INTEGER },
+            recommendedWorkOrderTitle: { type: Type.STRING },
+            recommendedPriority: {
+              type: Type.STRING,
+              enum: ['critical', 'high', 'medium'],
+            },
+          },
+          required: [
+            'summary',
+            'rootCause',
+            'immediateContainment',
+            'capaActions',
+            'sopReferences',
+            'residualSeverity',
+            'residualOccurrence',
+            'residualDetection',
+            'recommendedWorkOrderTitle',
+            'recommendedPriority',
+          ],
+        },
+      },
+    });
+
+    const parsed = safeParseModelJson(raw);
+    if (!parsed || !parsed.summary || !parsed.rootCause) {
+      return res.status(502).json({ error: 'AI could not produce a structured resolution plan. Please retry.' });
+    }
+
+    const clamp10 = (v: any, fallback: number) => Math.max(1, Math.min(10, Math.round(Number(v) || fallback)));
+    const rS = clamp10(parsed.residualSeverity, Math.max(2, (Number(incident.severity) || 6) - 1));
+    const rO = clamp10(parsed.residualOccurrence, Math.max(1, (Number(incident.occurrence) || 5) - 2));
+    const rD = clamp10(parsed.residualDetection, Math.max(1, (Number(incident.detection) || 5) - 2));
+
+    return res.json({
+      resolution: {
+        summary: String(parsed.summary),
+        rootCause: String(parsed.rootCause),
+        immediateContainment: Array.isArray(parsed.immediateContainment)
+          ? parsed.immediateContainment.map(String).slice(0, 5)
+          : [],
+        capaActions: Array.isArray(parsed.capaActions)
+          ? parsed.capaActions.map(String).slice(0, 5)
+          : [],
+        sopReferences: Array.isArray(parsed.sopReferences)
+          ? parsed.sopReferences.map(String).slice(0, 4)
+          : [],
+        residualSeverity: rS,
+        residualOccurrence: rO,
+        residualDetection: rD,
+        residualRpn: rS * rO * rD,
+        recommendedWorkOrderTitle: String(parsed.recommendedWorkOrderTitle || `CAPA: ${incident.title}`),
+        recommendedPriority:
+          parsed.recommendedPriority === 'critical' || parsed.recommendedPriority === 'medium'
+            ? parsed.recommendedPriority
+            : 'high',
+        generatedAt: new Date().toISOString(),
+        modelUsed,
+      },
+    });
+  } catch (error: any) {
+    console.error('AI Incident Resolution error:', error);
     const friendly = formatFriendlyGeminiError(error);
     return res.status(friendly.status).json({ error: friendly.message });
   }

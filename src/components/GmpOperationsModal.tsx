@@ -35,6 +35,8 @@ import {
 import { useTwinStore } from '../store/useTwinStore';
 import { useGmpStore } from '../store/useGmpStore';
 import { useTelemetryStore } from '../store/useTelemetryStore';
+import { getRpnPriority, useRiskIncidentStore } from '../store/useRiskIncidentStore';
+import { EntityRisksSection } from './RiskFmeaCenter';
 import { PredictiveForecastPanel } from './PredictiveForecastPanel';
 import { GmpWorkflowsPanel } from './GmpWorkflowsPanel';
 import type {
@@ -288,6 +290,7 @@ export const GmpOperationsModal: React.FC = () => {
 
   // Compliance / Lifecycle tab state
   const [assetSearch, setAssetSearch] = useState('');
+  const riskIncidents = useRiskIncidentStore((s) => s.incidents);
   const [selectedAssetId, setSelectedAssetId] = useState<string>(
     focusedAssetId ?? scene.assets[0]?.id ?? ''
   );
@@ -381,6 +384,9 @@ export const GmpOperationsModal: React.FC = () => {
     markdown: '# Troubleshooting Guide\n\n## Symptom\n\n## Root Cause\n\n## Corrective Action\n',
   });
 
+  // Mobile master/detail navigation pane so mobile never crushes 2 panes vertically
+  const [mobilePane, setMobilePane] = useState<'list' | 'detail'>('list');
+
   // Sync focus when modal opens with targeted IDs
   React.useEffect(() => {
     if (!showGmpModal) return;
@@ -388,7 +394,16 @@ export const GmpOperationsModal: React.FC = () => {
     if (focusedLineId) setSelectedLineId(focusedLineId);
     if (focusedSopId) setSelectedSopId(focusedSopId);
     if (focusedWikiId) setSelectedWikiId(focusedWikiId);
+    if (focusedAssetId || focusedLineId || focusedSopId || focusedWikiId) {
+      setMobilePane('detail');
+    } else {
+      setMobilePane('list');
+    }
   }, [showGmpModal, focusedAssetId, focusedLineId, focusedSopId, focusedWikiId]);
+
+  React.useEffect(() => {
+    setMobilePane('list');
+  }, [gmpTab]);
 
   const activeLine = useMemo(
     () => productionLines.find((l) => l.id === selectedLineId) ?? productionLines[0] ?? null,
@@ -649,25 +664,25 @@ export const GmpOperationsModal: React.FC = () => {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-2 sm:p-4">
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/80 p-0 sm:p-4">
       <div
-        className={`w-full max-w-7xl h-[91vh] flex flex-col rounded-3xl border shadow-2xl overflow-hidden ${
+        className={`w-full max-w-7xl h-[100dvh] sm:h-[91vh] flex flex-col rounded-none sm:rounded-3xl border-0 sm:border shadow-2xl overflow-hidden ${
           isDark
             ? 'bg-[#111116] border-zinc-800 text-zinc-100'
             : 'bg-white border-slate-200 text-slate-900'
         }`}
       >
-        {/* Header Bar with Explicit Back Button */}
+        {/* Header Bar with Explicit Back Button — single non-wrapping row */}
         <div
-          className={`flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b ${
+          className={`flex items-center justify-between gap-2 px-3 sm:px-4 py-2.5 sm:py-3 border-b shrink-0 ${
             isDark ? 'bg-[#17171F] border-zinc-800' : 'bg-slate-50 border-slate-200'
           }`}
         >
-          <div className="flex items-center gap-2.5 min-w-0">
+          <div className="flex items-center gap-2 sm:gap-2.5 min-w-0 flex-1">
             <button
               type="button"
               onClick={closeGmpModal}
-              className={`flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold border transition cursor-pointer ${
+              className={`flex items-center gap-1.5 rounded-xl px-2.5 sm:px-3 py-1.5 text-xs font-semibold border transition cursor-pointer shrink-0 ${
                 isDark
                   ? 'bg-zinc-900 border-zinc-700 text-zinc-200 hover:bg-zinc-800'
                   : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-100'
@@ -679,12 +694,12 @@ export const GmpOperationsModal: React.FC = () => {
             <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-violet-600 to-amber-500 flex items-center justify-center text-white shadow-md shrink-0">
               <ShieldCheck className="w-4 h-4" />
             </div>
-            <div className="min-w-0">
-              <h2 className="text-sm font-bold truncate">
-                GMP Lifecycle, Production Line Eligibility, Work Orders & SOP Repository
+            <div className="min-w-0 flex-1">
+              <h2 className="text-xs sm:text-sm font-bold truncate">
+                GMP Lifecycle, Production Lines &amp; EAM
               </h2>
-              <p className={`text-[11px] truncate ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>
-                21 CFR Part 11 Equipment Audit · Automated Eligibility Highlighting · Cron Scheduler · Markdown SOPs & Wiki
+              <p className={`hidden sm:block text-[11px] truncate ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>
+                21 CFR Part 11 Equipment Audit · Automated Eligibility Highlighting · Cron Scheduler · Markdown SOPs &amp; Wiki
               </p>
             </div>
           </div>
@@ -693,7 +708,7 @@ export const GmpOperationsModal: React.FC = () => {
             type="button"
             onClick={closeGmpModal}
             aria-label="Close"
-            className={`p-1.5 rounded-xl transition cursor-pointer ${
+            className={`p-1.5 rounded-xl transition cursor-pointer shrink-0 ${
               isDark ? 'hover:bg-zinc-800 text-zinc-400' : 'hover:bg-slate-200 text-slate-500'
             }`}
           >
@@ -701,9 +716,9 @@ export const GmpOperationsModal: React.FC = () => {
           </button>
         </div>
 
-        {/* Navigation Tabs */}
+        {/* Navigation Tabs — crisp horizontal scroll */}
         <div
-          className={`px-4 py-2 border-b flex items-center gap-1.5 overflow-x-auto ${
+          className={`px-3 sm:px-4 py-2 border-b flex items-center gap-1.5 overflow-x-auto shrink-0 ${
             isDark ? 'bg-[#13131A] border-zinc-800' : 'bg-white border-slate-200'
           }`}
         >
@@ -714,7 +729,7 @@ export const GmpOperationsModal: React.FC = () => {
                 key={t.id}
                 type="button"
                 onClick={() => setGmpTab(t.id)}
-                className={`flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold whitespace-nowrap transition cursor-pointer ${
+                className={`flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold whitespace-nowrap shrink-0 transition cursor-pointer ${
                   active
                     ? 'bg-gradient-to-r from-violet-600 to-violet-500 text-white shadow-md shadow-violet-600/20'
                     : isDark
@@ -725,7 +740,7 @@ export const GmpOperationsModal: React.FC = () => {
                 {t.icon}
                 <span>{t.label}</span>
                 {t.badge !== undefined && (
-                  <span className="ml-0.5 rounded-full bg-rose-500 text-white px-1.5 py-0.5 text-[9px] font-bold">
+                  <span className="ml-0.5 rounded-full bg-rose-500 text-white px-1.5 py-0.5 text-[9px] font-bold tabular-nums">
                     {t.badge}
                   </span>
                 )}
@@ -736,14 +751,16 @@ export const GmpOperationsModal: React.FC = () => {
 
         {/* ==================== TAB 1: PRODUCTION LINES & ELIGIBILITY ==================== */}
         {gmpTab === 'lines' && (
-          <div className="flex-1 overflow-hidden grid grid-cols-1 lg:grid-cols-12">
+          <div className="flex-1 min-h-0 overflow-hidden flex flex-col lg:grid lg:grid-cols-12">
             {/* Left List of Production Lines */}
             <div
-              className={`lg:col-span-4 border-r flex flex-col overflow-hidden ${
+              className={`${
+                mobilePane === 'detail' ? 'hidden lg:flex' : 'flex'
+              } flex-1 lg:flex-none min-h-0 lg:col-span-4 lg:border-r flex-col overflow-hidden ${
                 isDark ? 'border-zinc-800 bg-[#14141A]' : 'border-slate-200 bg-slate-50'
               }`}
             >
-              <div className="p-3 border-b border-zinc-800/60 flex items-center justify-between">
+              <div className="p-3 border-b border-zinc-800/60 flex items-center justify-between shrink-0">
                 <span className="text-xs font-bold uppercase tracking-wider text-violet-400">
                   Production Lines ({productionLines.length})
                 </span>
@@ -751,6 +768,7 @@ export const GmpOperationsModal: React.FC = () => {
                   type="button"
                   onClick={() => {
                     setCreatingNewLine(true);
+                    setMobilePane('detail');
                     setLineForm({
                       code: `LINE-0${productionLines.length + 1}`,
                       name: '',
@@ -764,13 +782,13 @@ export const GmpOperationsModal: React.FC = () => {
                       assetIds: [],
                     });
                   }}
-                  className="flex items-center gap-1 rounded-xl bg-violet-600 hover:bg-violet-500 text-white px-2.5 py-1 text-[11px] font-bold cursor-pointer"
+                  className="flex items-center gap-1 rounded-xl bg-violet-600 hover:bg-violet-500 text-white px-2.5 py-1 text-[11px] font-bold cursor-pointer shrink-0"
                 >
                   <Plus className="w-3.5 h-3.5" />
                   New Line
                 </button>
               </div>
-              <div className="flex-1 overflow-y-auto p-2.5 space-y-2">
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-2.5 space-y-2">
                 {productionLines.map((line) => {
                   const res = eligibilityByLineId[line.id];
                   const isSel = !creatingNewLine && activeLine?.id === line.id;
@@ -780,6 +798,7 @@ export const GmpOperationsModal: React.FC = () => {
                       onClick={() => {
                         setCreatingNewLine(false);
                         setSelectedLineId(line.id);
+                        setMobilePane('detail');
                       }}
                       className={`rounded-2xl p-3 border transition cursor-pointer ${
                         isSel
@@ -819,6 +838,25 @@ export const GmpOperationsModal: React.FC = () => {
                       <div className={`text-[10.5px] mt-1 ${isDark ? 'text-zinc-400' : 'text-slate-500'}`}>
                         {line.roomIds.length} Rooms · {line.assetIds.length} Equipment · {line.owner}
                       </div>
+                      {(() => {
+                        const lineRisks = riskIncidents.filter(
+                          (inc) =>
+                            inc.targetId === line.id ||
+                            line.assetIds.includes(inc.targetId) ||
+                            line.roomIds.includes(inc.targetId) ||
+                            (inc.roomId && line.roomIds.includes(inc.roomId))
+                        );
+                        if (lineRisks.length === 0) return null;
+                        const maxRpn = lineRisks.reduce((m, r) => Math.max(m, r.rpn), 0);
+                        return (
+                          <div className="mt-1.5 text-[10.5px] font-mono tabular-nums flex items-center gap-1.5">
+                            <ShieldAlert className="w-3 h-3 text-amber-500 shrink-0" />
+                            <span className={getRpnPriority(maxRpn).textClass}>
+                              {lineRisks.length} Risk{lineRisks.length > 1 ? 's' : ''} / Drift · Max RPN {maxRpn}
+                            </span>
+                          </div>
+                        );
+                      })()}
                       <div className="mt-2.5 flex items-center gap-1.5">
                         <button
                           type="button"
@@ -848,7 +886,34 @@ export const GmpOperationsModal: React.FC = () => {
             </div>
 
             {/* Right Graphical Line Master Data & Eligibility Detail */}
-            <div className="lg:col-span-8 overflow-y-auto p-4 space-y-4">
+            <div
+              className={`${
+                mobilePane === 'list' ? 'hidden lg:block' : 'block'
+              } flex-1 lg:flex-none min-h-0 lg:col-span-8 overflow-y-auto overscroll-contain touch-pan-y p-3.5 sm:p-4 space-y-4`}
+            >
+              <div
+                className={`lg:hidden sticky -top-3.5 z-10 -mx-3.5 px-3.5 py-2.5 flex items-center justify-between border-b ${
+                  isDark ? 'bg-[#111116] border-zinc-800/80' : 'bg-white border-slate-200'
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={() => setMobilePane('list')}
+                  className={`inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-semibold border cursor-pointer ${
+                    isDark
+                      ? 'bg-zinc-900 border-zinc-700 text-zinc-200'
+                      : 'bg-slate-50 border-slate-200 text-slate-700'
+                  }`}
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                  All Production Lines
+                </button>
+                {activeLine && !creatingNewLine && (
+                  <span className="font-mono text-[11px] font-bold text-amber-400">
+                    {activeLine.code}
+                  </span>
+                )}
+              </div>
               {creatingNewLine ? (
                 <div
                   className={`rounded-2xl border p-4 space-y-3 ${
@@ -994,6 +1059,24 @@ export const GmpOperationsModal: React.FC = () => {
                     </div>
                   </div>
 
+                  {/* Production Line Risks, Drifts & FMEA Register (Line + Constituent Rooms & Equipment) */}
+                  <div
+                    className={`rounded-2xl border p-4 ${
+                      isDark ? 'bg-[#17171F] border-zinc-800' : 'bg-slate-50 border-slate-200'
+                    }`}
+                  >
+                    <EntityRisksSection
+                      targetKind="line"
+                      targetId={activeLine.id}
+                      targetCode={activeLine.code}
+                      targetName={activeLine.name}
+                      floorId={scene.rooms.find((r) => r.id === activeLine.roomIds[0])?.floorId}
+                      roomId={activeLine.roomIds[0]}
+                      extraAssetIds={activeLine.assetIds}
+                      extraRoomIds={activeLine.roomIds}
+                    />
+                  </div>
+
                   {/* Eligibility Verdict Banner */}
                   {activeLineEligibility && (
                     <div
@@ -1099,7 +1182,7 @@ export const GmpOperationsModal: React.FC = () => {
                         {(creatingNewLine ? lineForm.roomIds : activeLine?.roomIds ?? []).length})
                       </span>
                     </div>
-                    <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+                    <div className="space-y-1.5 lg:max-h-64 lg:overflow-y-auto pr-1">
                       {scene.rooms.map((rm) => {
                         const selected = (
                           creatingNewLine ? lineForm.roomIds : activeLine?.roomIds ?? []
@@ -1156,7 +1239,7 @@ export const GmpOperationsModal: React.FC = () => {
                         {(creatingNewLine ? lineForm.assetIds : activeLine?.assetIds ?? []).length})
                       </span>
                     </div>
-                    <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+                    <div className="space-y-1.5 lg:max-h-64 lg:overflow-y-auto pr-1">
                       {scene.assets.map((a) => {
                         const selected = (
                           creatingNewLine ? lineForm.assetIds : activeLine?.assetIds ?? []
@@ -1224,14 +1307,16 @@ export const GmpOperationsModal: React.FC = () => {
 
         {/* ==================== TAB 2: EQUIPMENT COMPLIANCE & LIFECYCLE AUDIT HISTORY ==================== */}
         {gmpTab === 'compliance' && (
-          <div className="flex-1 overflow-hidden grid grid-cols-1 lg:grid-cols-12">
+          <div className="flex-1 min-h-0 overflow-hidden flex flex-col lg:grid lg:grid-cols-12">
             {/* Left Equipment List */}
             <div
-              className={`lg:col-span-4 border-r flex flex-col overflow-hidden ${
+              className={`${
+                mobilePane === 'detail' ? 'hidden lg:flex' : 'flex'
+              } flex-1 lg:flex-none min-h-0 lg:col-span-4 lg:border-r flex-col overflow-hidden ${
                 isDark ? 'border-zinc-800 bg-[#14141A]' : 'border-slate-200 bg-slate-50'
               }`}
             >
-              <div className="p-3 border-b border-zinc-800/60">
+              <div className="p-3 border-b border-zinc-800/60 shrink-0">
                 <div className="relative">
                   <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
                   <input
@@ -1244,7 +1329,7 @@ export const GmpOperationsModal: React.FC = () => {
                   />
                 </div>
               </div>
-              <div className="flex-1 overflow-y-auto p-2 space-y-1">
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-2 space-y-1">
                 {scene.assets
                   .filter(
                     (a) =>
@@ -1268,7 +1353,10 @@ export const GmpOperationsModal: React.FC = () => {
                       <button
                         key={a.id}
                         type="button"
-                        onClick={() => setSelectedAssetId(a.id)}
+                        onClick={() => {
+                          setSelectedAssetId(a.id);
+                          setMobilePane('detail');
+                        }}
                         className={`w-full text-left rounded-xl p-2.5 border transition cursor-pointer ${
                           active
                             ? 'bg-violet-600/15 border-violet-500/70'
@@ -1302,7 +1390,34 @@ export const GmpOperationsModal: React.FC = () => {
             </div>
 
             {/* Right Compliance Dates Editor + Full Audit Lifecycle Timeline */}
-            <div className="lg:col-span-8 overflow-y-auto p-4 space-y-4">
+            <div
+              className={`${
+                mobilePane === 'list' ? 'hidden lg:block' : 'block'
+              } flex-1 lg:flex-none min-h-0 lg:col-span-8 overflow-y-auto overscroll-contain touch-pan-y p-3.5 sm:p-4 space-y-4`}
+            >
+              <div
+                className={`lg:hidden sticky -top-3.5 z-10 -mx-3.5 px-3.5 py-2.5 flex items-center justify-between border-b ${
+                  isDark ? 'bg-[#111116] border-zinc-800/80' : 'bg-white border-slate-200'
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={() => setMobilePane('list')}
+                  className={`inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-semibold border cursor-pointer ${
+                    isDark
+                      ? 'bg-zinc-900 border-zinc-700 text-zinc-200'
+                      : 'bg-slate-50 border-slate-200 text-slate-700'
+                  }`}
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                  All Equipment
+                </button>
+                {activeAsset && (
+                  <span className="font-mono text-[11px] font-bold text-amber-400">
+                    {activeAsset.assetId}
+                  </span>
+                )}
+              </div>
               {activeAsset && activeCompliance && (
                 <>
                   {/* Equipment Header */}
@@ -1714,14 +1829,14 @@ export const GmpOperationsModal: React.FC = () => {
 
         {/* ==================== TAB 3: WORK ORDERS, TASK INBOX, CRON JOBS & ELIGIBLE PERSONNEL ==================== */}
         {gmpTab === 'workorders' && (
-          <div className="flex-1 flex flex-col overflow-hidden">
+          <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
             {/* Sub-Tab Bar */}
             <div
-              className={`px-4 py-2 border-b flex flex-wrap items-center justify-between gap-2 ${
+              className={`px-3 sm:px-4 py-2 border-b flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 shrink-0 ${
                 isDark ? 'bg-[#14141A] border-zinc-800' : 'bg-slate-50 border-slate-200'
               }`}
             >
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5 sm:pb-0">
                 {(
                   [
                     { id: 'inbox', label: `Task Inbox (${workOrders.length})` },
@@ -1734,7 +1849,7 @@ export const GmpOperationsModal: React.FC = () => {
                     key={st.id}
                     type="button"
                     onClick={() => setWoSubTab(st.id)}
-                    className={`rounded-xl px-3 py-1.5 text-xs font-bold transition cursor-pointer ${
+                    className={`rounded-xl px-3 py-1.5 text-xs font-bold whitespace-nowrap shrink-0 transition cursor-pointer ${
                       woSubTab === st.id
                         ? 'bg-amber-500 text-zinc-950'
                         : isDark
@@ -1747,14 +1862,14 @@ export const GmpOperationsModal: React.FC = () => {
                 ))}
               </div>
               {woSubTab === 'inbox' && (
-                <div className="flex items-center gap-1">
+                <div className="flex items-center gap-1 overflow-x-auto pb-0.5 sm:pb-0">
                   {(['all', 'overdue', 'open', 'in-progress', 'waiting-qa', 'completed'] as const).map(
                     (st) => (
                       <button
                         key={st}
                         type="button"
                         onClick={() => setWoStatusFilter(st)}
-                        className={`rounded-lg px-2 py-1 text-[10px] font-bold uppercase cursor-pointer ${
+                        className={`rounded-lg px-2 py-1 text-[10px] font-bold uppercase whitespace-nowrap shrink-0 cursor-pointer ${
                           woStatusFilter === st
                             ? 'bg-violet-600 text-white'
                             : isDark
@@ -1770,7 +1885,7 @@ export const GmpOperationsModal: React.FC = () => {
               )}
             </div>
 
-            <div className="flex-1 overflow-y-auto p-4">
+            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-3 sm:p-4">
               {/* SUB-TAB: TASK INBOX */}
               {woSubTab === 'inbox' && (
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
@@ -2412,8 +2527,8 @@ export const GmpOperationsModal: React.FC = () => {
 
         {/* ==================== TAB 4: COMPLIANCE & PRODUCTION LINE CALENDAR ==================== */}
         {gmpTab === 'calendar' && (
-          <div className="flex-1 overflow-hidden grid grid-cols-1 lg:grid-cols-12">
-            <div className="lg:col-span-8 flex flex-col overflow-hidden p-4">
+          <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y lg:overflow-hidden grid grid-cols-1 lg:grid-cols-12">
+            <div className="lg:col-span-8 flex flex-col lg:min-h-0 lg:overflow-hidden p-3 sm:p-4">
               {/* Calendar Controls */}
               <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                 <div className="flex items-center gap-2">
@@ -2527,7 +2642,7 @@ export const GmpOperationsModal: React.FC = () => {
               </div>
 
               {/* Month Grid */}
-              <div className="flex-1 grid grid-cols-7 gap-1 overflow-y-auto">
+              <div className="lg:flex-1 grid grid-cols-7 gap-1 lg:overflow-y-auto">
                 {calendarGrid.map((cell, idx) => {
                   if (!cell.iso) {
                     return <div key={`empty-${idx}`} className="rounded-xl opacity-20" />;
@@ -2586,7 +2701,7 @@ export const GmpOperationsModal: React.FC = () => {
 
             {/* Right Day Detail + Upcoming Feed */}
             <div
-              className={`lg:col-span-4 border-l p-4 overflow-y-auto space-y-3 ${
+              className={`lg:col-span-4 border-t lg:border-t-0 lg:border-l p-3.5 sm:p-4 lg:overflow-y-auto space-y-3 ${
                 isDark ? 'border-zinc-800 bg-[#14141A]' : 'border-slate-200 bg-slate-50'
               }`}
             >
@@ -2671,14 +2786,16 @@ export const GmpOperationsModal: React.FC = () => {
 
         {/* ==================== TAB 5: SOP & RECORDS MARKDOWN REPOSITORY ==================== */}
         {gmpTab === 'sops' && (
-          <div className="flex-1 overflow-hidden grid grid-cols-1 lg:grid-cols-12">
+          <div className="flex-1 min-h-0 overflow-hidden flex flex-col lg:grid lg:grid-cols-12">
             {/* Left SOP List */}
             <div
-              className={`lg:col-span-4 border-r flex flex-col overflow-hidden ${
+              className={`${
+                mobilePane === 'detail' ? 'hidden lg:flex' : 'flex'
+              } flex-1 lg:flex-none min-h-0 lg:col-span-4 lg:border-r flex-col overflow-hidden ${
                 isDark ? 'border-zinc-800 bg-[#14141A]' : 'border-slate-200 bg-slate-50'
               }`}
             >
-              <div className="p-3 border-b border-zinc-800/60 space-y-2">
+              <div className="p-3 border-b border-zinc-800/60 space-y-2 shrink-0">
                 <div className="flex items-center gap-1.5">
                   <div className="relative flex-1">
                     <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400" />
@@ -2696,8 +2813,9 @@ export const GmpOperationsModal: React.FC = () => {
                     onClick={() => {
                       setCreatingSop(true);
                       setEditingSop(false);
+                      setMobilePane('detail');
                     }}
-                    className="rounded-xl bg-violet-600 hover:bg-violet-500 text-white px-2.5 py-1.5 text-xs font-bold cursor-pointer"
+                    className="rounded-xl bg-violet-600 hover:bg-violet-500 text-white px-2.5 py-1.5 text-xs font-bold cursor-pointer shrink-0"
                   >
                     <Plus className="w-3.5 h-3.5" />
                   </button>
@@ -2734,7 +2852,7 @@ export const GmpOperationsModal: React.FC = () => {
                   </select>
                 </div>
               </div>
-              <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-2 space-y-1.5">
                 {filteredSops.map((doc) => (
                   <button
                     key={doc.id}
@@ -2743,6 +2861,7 @@ export const GmpOperationsModal: React.FC = () => {
                       setCreatingSop(false);
                       setEditingSop(false);
                       setSelectedSopId(doc.id);
+                      setMobilePane('detail');
                     }}
                     className={`w-full text-left rounded-xl p-2.5 border transition cursor-pointer ${
                       !creatingSop && activeSop?.id === doc.id
@@ -2770,7 +2889,34 @@ export const GmpOperationsModal: React.FC = () => {
             </div>
 
             {/* Right Markdown Viewer / Editor */}
-            <div className="lg:col-span-8 overflow-y-auto p-5">
+            <div
+              className={`${
+                mobilePane === 'list' ? 'hidden lg:block' : 'block'
+              } flex-1 lg:flex-none min-h-0 lg:col-span-8 overflow-y-auto overscroll-contain touch-pan-y p-3.5 sm:p-5`}
+            >
+              <div
+                className={`lg:hidden sticky -top-3.5 z-10 -mx-3.5 px-3.5 py-2.5 mb-3 flex items-center justify-between border-b ${
+                  isDark ? 'bg-[#111116] border-zinc-800/80' : 'bg-white border-slate-200'
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={() => setMobilePane('list')}
+                  className={`inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-semibold border cursor-pointer ${
+                    isDark
+                      ? 'bg-zinc-900 border-zinc-700 text-zinc-200'
+                      : 'bg-slate-50 border-slate-200 text-slate-700'
+                  }`}
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                  All SOPs &amp; Records
+                </button>
+                {activeSop && !creatingSop && (
+                  <span className="font-mono text-[11px] font-bold text-amber-400">
+                    {activeSop.docNumber}
+                  </span>
+                )}
+              </div>
               {creatingSop ? (
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
@@ -2904,13 +3050,15 @@ export const GmpOperationsModal: React.FC = () => {
 
         {/* ==================== TAB 6: TROUBLESHOOTING KNOWLEDGE BASE & WIKI ==================== */}
         {gmpTab === 'wiki' && (
-          <div className="flex-1 overflow-hidden grid grid-cols-1 lg:grid-cols-12">
+          <div className="flex-1 min-h-0 overflow-hidden flex flex-col lg:grid lg:grid-cols-12">
             <div
-              className={`lg:col-span-4 border-r flex flex-col overflow-hidden ${
+              className={`${
+                mobilePane === 'detail' ? 'hidden lg:flex' : 'flex'
+              } flex-1 lg:flex-none min-h-0 lg:col-span-4 lg:border-r flex-col overflow-hidden ${
                 isDark ? 'border-zinc-800 bg-[#14141A]' : 'border-slate-200 bg-slate-50'
               }`}
             >
-              <div className="p-3 border-b border-zinc-800/60 space-y-2">
+              <div className="p-3 border-b border-zinc-800/60 space-y-2 shrink-0">
                 <div className="flex items-center gap-1.5">
                   <div className="relative flex-1">
                     <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400" />
@@ -2925,8 +3073,11 @@ export const GmpOperationsModal: React.FC = () => {
                   </div>
                   <button
                     type="button"
-                    onClick={() => setCreatingWiki(true)}
-                    className="rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 px-2.5 py-1.5 text-xs font-bold cursor-pointer"
+                    onClick={() => {
+                      setCreatingWiki(true);
+                      setMobilePane('detail');
+                    }}
+                    className="rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 px-2.5 py-1.5 text-xs font-bold cursor-pointer shrink-0"
                   >
                     <Plus className="w-3.5 h-3.5" />
                   </button>
@@ -2946,7 +3097,7 @@ export const GmpOperationsModal: React.FC = () => {
                   <option value="Instrumentation">Instrumentation</option>
                 </select>
               </div>
-              <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-2 space-y-1.5">
                 {filteredWiki.map((w) => (
                   <button
                     key={w.id}
@@ -2954,6 +3105,7 @@ export const GmpOperationsModal: React.FC = () => {
                     onClick={() => {
                       setCreatingWiki(false);
                       setSelectedWikiId(w.id);
+                      setMobilePane('detail');
                     }}
                     className={`w-full text-left rounded-xl p-2.5 border transition cursor-pointer ${
                       !creatingWiki && activeWiki?.id === w.id
@@ -2989,7 +3141,30 @@ export const GmpOperationsModal: React.FC = () => {
               </div>
             </div>
 
-            <div className="lg:col-span-8 overflow-y-auto p-5">
+            <div
+              className={`${
+                mobilePane === 'list' ? 'hidden lg:block' : 'block'
+              } flex-1 lg:flex-none min-h-0 lg:col-span-8 overflow-y-auto overscroll-contain touch-pan-y p-3.5 sm:p-5`}
+            >
+              <div className="lg:hidden flex items-center justify-between pb-3 mb-3 border-b border-zinc-800/70">
+                <button
+                  type="button"
+                  onClick={() => setMobilePane('list')}
+                  className={`inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-semibold border cursor-pointer ${
+                    isDark
+                      ? 'bg-zinc-900 border-zinc-700 text-zinc-200'
+                      : 'bg-slate-50 border-slate-200 text-slate-700'
+                  }`}
+                >
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                  All Wiki Articles
+                </button>
+                {activeWiki && !creatingWiki && (
+                  <span className="text-[10px] font-bold uppercase text-amber-400 truncate max-w-[160px]">
+                    {activeWiki.category}
+                  </span>
+                )}
+              </div>
               {creatingWiki ? (
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">

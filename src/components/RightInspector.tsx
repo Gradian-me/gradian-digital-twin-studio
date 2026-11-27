@@ -6,13 +6,20 @@ import {
   BookOpen,
   Camera,
   Check,
+  ChevronDown,
+  ChevronRight,
   Compass,
   Copy,
   Database,
   ExternalLink,
+  Eye,
+  EyeOff,
+  FileText,
   Focus,
   History,
+  Info,
   Link2,
+  Lock,
   PaintBucket,
   Pause,
   Play,
@@ -28,14 +35,26 @@ import {
   Upload,
   Video,
   Waypoints,
+  Wind,
   Wrench,
 } from 'lucide-react';
 import { useTwinStore, type RightPanelTab } from '../store/useTwinStore';
 import { useTelemetryStore } from '../store/useTelemetryStore';
 import { useGmpStore } from '../store/useGmpStore';
+import { useAclStore, computeEffectivePermissions } from '../store/useAclStore';
+import { useRiskIncidentStore, getTargetFmeaSummary } from '../store/useRiskIncidentStore';
 import { METRIC_PRESETS } from '../types/telemetry';
 import { MiniSparkline } from './TelemetryDashboard';
 import { SchemaVisualizerD3 } from './SchemaVisualizerD3';
+import { EntityRisksSection } from './RiskFmeaCenter';
+import {
+  AHU_CATALOG,
+  AIRFLOW_MODES,
+  HEPA_CLASSES,
+  computeRoomSupplyM3h,
+  getAhuColor,
+  getEffectiveRoomHvac,
+} from '../utils/hvac';
 import { DEFAULT_MATERIALS, WALL_PRESETS } from '../data/materialsLibrary';
 import { OBJECT_LIBRARY } from '../data/objectLibrary';
 import {
@@ -46,6 +65,7 @@ import {
   getAnalyticsLegend,
 } from '../utils/spatial';
 import { fetchApiJson } from '../utils/safeJson';
+import { computeFlowRoomSequence } from '../utils/flowAnalytics';
 import type {
   AnalyticsMetric,
   CleanroomGrade,
@@ -134,11 +154,39 @@ export const RightInspector: React.FC = () => {
   const setShowAuditTrailModal = useTwinStore((s) => s.setShowAuditTrailModal);
   const animateFlows = useTwinStore((s) => s.animateFlows);
   const setAnimateFlows = useTwinStore((s) => s.setAnimateFlows);
+  const showFlows = useTwinStore((s) => s.showFlows);
+  const setShowFlows = useTwinStore((s) => s.setShowFlows);
+  const isolatedFlowId = useTwinStore((s) => s.isolatedFlowId);
+  const isolateFlow = useTwinStore((s) => s.isolateFlow);
+  const hiddenFlowIds = useTwinStore((s) => s.hiddenFlowIds);
+  const toggleFlowVisibility = useTwinStore((s) => s.toggleFlowVisibility);
+  const setActiveFlowInfoId = useTwinStore((s) => s.setActiveFlowInfoId);
   const showFlowLegend = useTwinStore((s) => s.showFlowLegend);
   const setShowFlowLegend = useTwinStore((s) => s.setShowFlowLegend);
   const editingFlowId = useTwinStore((s) => s.editingFlowId);
   const setEditingFlowId = useTwinStore((s) => s.setEditingFlowId);
   const showToast = useTwinStore((s) => s.showToast);
+  const openEntityInfo = useTwinStore((s) => s.openEntityInfo);
+  const workspaceMode = useTwinStore((s) => s.workspaceMode);
+  const showHvacOverlay = useTwinStore((s) => s.showHvacOverlay);
+  const setShowHvacOverlay = useTwinStore((s) => s.setShowHvacOverlay);
+  const updateRoomHvac = useTwinStore((s) => s.updateRoomHvac);
+
+  const riskIncidents = useRiskIncidentStore((s) => s.incidents);
+  const openRiskModal = useRiskIncidentStore((s) => s.openRiskModal);
+  const openAssetPdfModal = useRiskIncidentStore((s) => s.openAssetPdfModal);
+
+  const aclUsers = useAclStore((s) => s.users);
+  const aclRoles = useAclStore((s) => s.roles);
+  const aclGroups = useAclStore((s) => s.groups);
+  const activeAclUserId = useAclStore((s) => s.activeAclUserId);
+
+  const isReadOnly = useMemo(() => {
+    if (workspaceMode === 'view') return true;
+    const u = aclUsers.find((x) => x.id === activeAclUserId) ?? aclUsers[0];
+    if (!u) return false;
+    return !computeEffectivePermissions(u, aclRoles, aclGroups).includes('spatial.edit');
+  }, [workspaceMode, aclUsers, aclRoles, aclGroups, activeAclUserId]);
 
   const telemetrySensors = useTelemetryStore((s) => s.sensors);
   const telemetryReadings = useTelemetryStore((s) => s.readings);
@@ -153,6 +201,8 @@ export const RightInspector: React.FC = () => {
   };
 
   const [assetSubTab, setAssetSubTab] = useState<'general' | 'spatial' | 'ops' | 'iot' | 'docs'>('general');
+  const [openRoomSection, setOpenRoomSection] = useState<'specs' | 'hvac' | 'sensors' | 'fmea'>('specs');
+  const [openAssetSection, setOpenAssetSection] = useState<'specs' | 'gmp' | 'fmea'>('specs');
   const [aiInput, setAiInput] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
@@ -352,8 +402,19 @@ export const RightInspector: React.FC = () => {
       {/* TAB 1: CONTEXTUAL PROPERTIES INSPECTOR */}
       {rightTab === 'properties' && (
         <div className="flex-1 overflow-y-auto p-3 space-y-4 text-xs">
+          {isReadOnly && (
+            <div className="flex items-center gap-2 px-2.5 py-2 rounded-xl border border-amber-500/35 bg-amber-500/10 text-amber-600 dark:text-amber-300 text-[11px] font-medium">
+              <Lock className="w-3.5 h-3.5 shrink-0" />
+              <span>
+                {workspaceMode === 'view'
+                  ? 'View Mode active — spatial & property editing locked.'
+                  : 'ACL Read-Only role — editing & deletion disabled.'}
+              </span>
+            </div>
+          )}
+
           {/* Multi-Selection Align & Distribute Bar */}
-          {multiAssetCount >= 2 && (
+          {multiAssetCount >= 2 && !isReadOnly && (
             <div className="p-2.5 rounded-lg border border-violet-500/30 bg-violet-500/5 space-y-2">
               <div className="font-semibold text-violet-600 dark:text-violet-400">
                 {multiAssetCount} Assets Selected — Align &amp; Distribute
@@ -374,233 +435,538 @@ export const RightInspector: React.FC = () => {
             </div>
           )}
 
-          {/* Selected ROOM Properties */}
-          {selRoom && (
-            <div className="space-y-3">
-              <div className="flex items-center justify-between gap-2 pb-2 border-b border-zinc-200 dark:border-zinc-800">
-                <div className="min-w-0">
-                  <div className="text-[10px] text-emerald-600 dark:text-emerald-400 font-mono font-medium">Room · {selRoom.code}</div>
-                  <input
-                    value={selRoom.name}
-                    onChange={(e) => updateRoom(selRoom.id, { name: e.target.value })}
-                    className="font-semibold text-sm bg-transparent w-full focus:outline-none text-zinc-900 dark:text-zinc-100"
-                  />
-                </div>
-                <div className="flex gap-1 shrink-0">
-                  <button
-                    onClick={() => drillInto('room', selRoom.id)}
-                    className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300"
-                    title="Drill 3D into Room"
-                  >
-                    <Compass className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    onClick={() =>
-                      copyDirectLink(
-                        { roomId: selRoom.id, floorId: selRoom.floorId, drillLevel: 'room' },
-                        selRoom.name
-                      )
-                    }
-                    className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300"
-                    title="Copy Direct Room URL"
-                  >
-                    <Link2 className="w-3.5 h-3.5" />
-                  </button>
-                  <button onClick={duplicateSelected} className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Duplicate">
-                    <Copy className="w-3.5 h-3.5" />
-                  </button>
-                  <button onClick={deleteSelected} className="p-1.5 rounded text-red-500 hover:bg-red-500/10" title="Delete">
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </div>
+          {/* Selected ROOM Properties (Exclusive Single-Subject Accordion) */}
+          {selRoom && (() => {
+            const roomHvac = getEffectiveRoomHvac(selRoom);
+            const supplyM3h = computeRoomSupplyM3h(selRoom);
+            const ahuColor = getAhuColor(roomHvac.ahuId);
+            const roomFmea = getTargetFmeaSummary(riskIncidents, 'room', selRoom.id, true);
+            const roomSensors = telemetrySensors.filter(
+              (s) => s.targetKind === 'room' && s.targetId === selRoom.id
+            );
+            const fmeaToneClass =
+              roomFmea.level === 'critical'
+                ? 'bg-rose-500/15 text-rose-500 border-rose-500/40'
+                : roomFmea.level === 'high'
+                  ? 'bg-amber-500/15 text-amber-500 border-amber-500/40'
+                  : roomFmea.level === 'medium'
+                    ? 'bg-violet-500/15 text-violet-400 border-violet-500/40'
+                    : roomFmea.level === 'mitigated'
+                      ? 'bg-emerald-500/15 text-emerald-500 border-emerald-500/40'
+                      : 'bg-zinc-500/10 text-zinc-400 border-zinc-500/25';
 
-              <div className="grid grid-cols-3 gap-2 font-mono tabular-nums">
-                <label className="space-y-1">
-                  <span className="text-[10px] text-slate-400">Width (m)</span>
-                  <input
-                    type="number"
-                    step={0.5}
-                    value={selRoom.width}
-                    onChange={(e) => updateRoom(selRoom.id, { width: Math.max(2, Number(e.target.value)) })}
-                    className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                  />
-                </label>
-                <label className="space-y-1">
-                  <span className="text-[10px] text-slate-400">Depth (m)</span>
-                  <input
-                    type="number"
-                    step={0.5}
-                    value={selRoom.depth}
-                    onChange={(e) => updateRoom(selRoom.id, { depth: Math.max(2, Number(e.target.value)) })}
-                    className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                  />
-                </label>
-                <label className="space-y-1">
-                  <span className="text-[10px] text-slate-400">Height (m)</span>
-                  <input
-                    type="number"
-                    step={0.2}
-                    value={selRoom.height}
-                    onChange={(e) => updateRoom(selRoom.id, { height: Math.max(2.4, Number(e.target.value)) })}
-                    className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                  />
-                </label>
-              </div>
-
-              <div className="flex justify-between py-2 border-y border-slate-200 dark:border-zinc-800 font-mono text-[11px] text-slate-500">
-                <span>Area: {formatArea(selRoom.width * selRoom.depth, scene.unitSystem)}</span>
-                <span>Vol: {formatVolume(selRoom.width * selRoom.depth * selRoom.height, scene.unitSystem)}</span>
-              </div>
-
-              <div className="space-y-2">
-                <div className="font-semibold text-slate-800 dark:text-slate-200">GMP Environmental Specs</div>
-                <label className="block space-y-1">
-                  <span className="text-[10px] text-slate-400">Cleanroom Classification</span>
-                  <select
-                    value={selRoom.environmental.cleanroomGrade}
-                    onChange={(e) =>
-                      updateRoom(selRoom.id, {
-                        environmental: { ...selRoom.environmental, cleanroomGrade: e.target.value as CleanroomGrade },
-                      })
-                    }
-                    className="w-full px-2 py-1.5 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                  >
-                    {CLEANROOM_GRADES.map((g) => (
-                      <option key={g} value={g}>{g}</option>
-                    ))}
-                  </select>
-                </label>
-                <div className="grid grid-cols-2 gap-2 font-mono tabular-nums">
-                  <label className="space-y-1">
-                    <span className="text-[10px] text-slate-400">Pressure ΔP (Pa)</span>
-                    <input
-                      type="number"
-                      value={selRoom.environmental.pressurePa}
-                      onChange={(e) =>
-                        updateRoom(selRoom.id, {
-                          environmental: { ...selRoom.environmental, pressurePa: Number(e.target.value) },
-                        })
-                      }
-                      className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                    />
-                  </label>
-                  <label className="space-y-1">
-                    <span className="text-[10px] text-slate-400">Air Changes (ACH)</span>
-                    <input
-                      type="number"
-                      value={selRoom.environmental.airChangesPerHour}
-                      onChange={(e) =>
-                        updateRoom(selRoom.id, {
-                          environmental: { ...selRoom.environmental, airChangesPerHour: Number(e.target.value) },
-                        })
-                      }
-                      className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                    />
-                  </label>
-                  <label className="space-y-1">
-                    <span className="text-[10px] text-slate-400">Temp (°C)</span>
-                    <input
-                      type="number"
-                      value={selRoom.environmental.temperatureC}
-                      onChange={(e) =>
-                        updateRoom(selRoom.id, {
-                          environmental: { ...selRoom.environmental, temperatureC: Number(e.target.value) },
-                        })
-                      }
-                      className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                    />
-                  </label>
-                  <label className="space-y-1">
-                    <span className="text-[10px] text-slate-400">Humidity (% RH)</span>
-                    <input
-                      type="number"
-                      value={selRoom.environmental.humidityPct}
-                      onChange={(e) =>
-                        updateRoom(selRoom.id, {
-                          environmental: { ...selRoom.environmental, humidityPct: Number(e.target.value) },
-                        })
-                      }
-                      className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                    />
-                  </label>
-                </div>
-                <label className="block space-y-1">
-                  <span className="text-[10px] text-slate-400">Compliance Status</span>
-                  <select
-                    value={selRoom.complianceStatus}
-                    onChange={(e) => updateRoom(selRoom.id, { complianceStatus: e.target.value as any })}
-                    className="w-full px-2 py-1.5 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                  >
-                    <option value="compliant">GMP Compliant</option>
-                    <option value="review-due">Qualification Review Due</option>
-                    <option value="deviation">Active Deviation</option>
-                  </select>
-                </label>
-
-                {/* Live Environmental Sensors for Selected Room */}
-                <div className="pt-2 border-t border-zinc-200 dark:border-zinc-800 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-200">
-                      Live Room Sensors
-                    </span>
-                    <div className="flex items-center gap-1.5">
+            return (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-2 pb-2 border-b border-zinc-200 dark:border-zinc-800">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-mono font-medium">
+                        Room · {selRoom.code}
+                      </span>
                       <button
-                        onClick={() => setHeatmapMetric('temperature')}
-                        className="text-[10px] text-emerald-600 dark:text-emerald-400 hover:underline"
-                      >
-                        Show 3D Heatmap
-                      </button>
-                      <a
-                        href={buildTelemetryTabUrl({ tab: 'trends', roomId: selRoom.id })}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-zinc-400 hover:text-emerald-500"
-                        title="Open Room Telemetry in New Tab"
-                      >
-                        <ExternalLink className="w-3 h-3" />
-                      </a>
-                    </div>
-                  </div>
-                  {telemetrySensors
-                    .filter((s) => s.targetKind === 'room' && s.targetId === selRoom.id)
-                    .map((s) => {
-                      const snap = telemetryReadings[s.id];
-                      const col = METRIC_PRESETS[s.metric]?.color ?? '#10B981';
-                      return (
-                        <button
-                          key={s.id}
-                          onClick={() =>
-                            openTelemetryDashboard({ tab: 'trends', roomId: selRoom.id, sensorId: s.id })
+                        type="button"
+                        onClick={() => {
+                          if (roomFmea.worstIncident) {
+                            openRiskModal({ mode: 'resolve', incidentId: roomFmea.worstIncident.id });
+                          } else {
+                            setOpenRoomSection('fmea');
                           }
-                          className="w-full flex items-center justify-between gap-2 p-2 rounded-md bg-zinc-50 dark:bg-[#16161A] border border-zinc-200 dark:border-zinc-800 hover:border-emerald-500 text-left"
-                        >
-                          <div className="min-w-0">
-                            <div className="font-mono text-[10.5px] font-semibold truncate">{s.tag}</div>
-                            <div className="font-mono tabular-nums text-xs text-zinc-900 dark:text-white">
-                              {(snap?.value ?? s.nominal).toFixed(s.precision)} {s.unit}
+                        }}
+                        className={`px-1.5 py-0.5 rounded border font-mono text-[9.5px] font-bold tabular-nums cursor-pointer ${fmeaToneClass}`}
+                        title={
+                          roomFmea.worstIncident
+                            ? `FMEA Status: ${roomFmea.worstIncident.title}`
+                            : 'No open FMEA risks on this room'
+                        }
+                      >
+                        {roomFmea.shortLabel || 'FMEA OK'}
+                      </button>
+                    </div>
+                    <input
+                      value={selRoom.name}
+                      disabled={isReadOnly}
+                      onChange={(e) => updateRoom(selRoom.id, { name: e.target.value })}
+                      className="font-semibold text-sm bg-transparent w-full focus:outline-none text-zinc-900 dark:text-zinc-100 disabled:opacity-90"
+                    />
+                  </div>
+                  <div className="flex gap-1 shrink-0">
+                    <button
+                      onClick={() => drillInto('room', selRoom.id)}
+                      className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300"
+                      title="Drill 3D into Room"
+                    >
+                      <Compass className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      onClick={() =>
+                        copyDirectLink(
+                          { roomId: selRoom.id, floorId: selRoom.floorId, drillLevel: 'room' },
+                          selRoom.name
+                        )
+                      }
+                      className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300"
+                      title="Copy Direct Room URL"
+                    >
+                      <Link2 className="w-3.5 h-3.5" />
+                    </button>
+                    {!isReadOnly && (
+                      <>
+                        <button onClick={duplicateSelected} className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Duplicate">
+                          <Copy className="w-3.5 h-3.5" />
+                        </button>
+                        <button onClick={deleteSelected} className="p-1.5 rounded text-red-500 hover:bg-red-500/10" title="Delete">
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Room Quick Actions: Full Info & GMP Eligibility Check */}
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => openEntityInfo({ type: 'room', id: selRoom.id })}
+                    className="flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-lg bg-violet-600/15 hover:bg-violet-600 text-violet-600 dark:text-violet-300 hover:text-white border border-violet-500/35 text-[11px] font-semibold transition-colors cursor-pointer"
+                  >
+                    <Info className="w-3.5 h-3.5" />
+                    Room Info &amp; SOPs
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openEntityInfo({ type: 'room', id: selRoom.id }, { autoEligibility: true })}
+                    className="flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-zinc-950 text-[11px] font-bold transition-colors cursor-pointer"
+                  >
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    Check Eligibility
+                  </button>
+                </div>
+
+                {/* Exclusive Single-Subject Accordion Stack */}
+                <div className="space-y-1.5">
+                  {/* SECTION 1: Dimensions & GMP Specs */}
+                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#14141A] overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setOpenRoomSection('specs')}
+                      className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-1.5 font-semibold text-[11.5px] text-zinc-800 dark:text-zinc-100">
+                        {openRoomSection === 'specs' ? (
+                          <ChevronDown className="w-3.5 h-3.5 text-violet-500" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5 text-zinc-400" />
+                        )}
+                        Dimensions &amp; GMP Specs
+                      </span>
+                      <span className="font-mono text-[10px] text-zinc-400 tabular-nums">
+                        {formatArea(selRoom.width * selRoom.depth, scene.unitSystem)}
+                      </span>
+                    </button>
+                    {openRoomSection === 'specs' && (
+                      <fieldset disabled={isReadOnly} className="px-3 pb-3 pt-1 space-y-3 min-w-0 border-t border-zinc-200/70 dark:border-zinc-800 disabled:opacity-80">
+                        <div className="grid grid-cols-3 gap-2 font-mono tabular-nums">
+                          <label className="space-y-1">
+                            <span className="text-[10px] text-slate-400">Width (m)</span>
+                            <input
+                              type="number"
+                              step={0.5}
+                              value={selRoom.width}
+                              onChange={(e) => updateRoom(selRoom.id, { width: Math.max(2, Number(e.target.value)) })}
+                              className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                            />
+                          </label>
+                          <label className="space-y-1">
+                            <span className="text-[10px] text-slate-400">Depth (m)</span>
+                            <input
+                              type="number"
+                              step={0.5}
+                              value={selRoom.depth}
+                              onChange={(e) => updateRoom(selRoom.id, { depth: Math.max(2, Number(e.target.value)) })}
+                              className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                            />
+                          </label>
+                          <label className="space-y-1">
+                            <span className="text-[10px] text-slate-400">Height (m)</span>
+                            <input
+                              type="number"
+                              step={0.2}
+                              value={selRoom.height}
+                              onChange={(e) => updateRoom(selRoom.id, { height: Math.max(2.4, Number(e.target.value)) })}
+                              className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                            />
+                          </label>
+                        </div>
+
+                        <div className="flex justify-between py-1.5 border-y border-slate-200 dark:border-zinc-800 font-mono text-[10.5px] text-slate-500 tabular-nums">
+                          <span>Area: {formatArea(selRoom.width * selRoom.depth, scene.unitSystem)}</span>
+                          <span>Vol: {formatVolume(selRoom.width * selRoom.depth * selRoom.height, scene.unitSystem)}</span>
+                        </div>
+
+                        <label className="block space-y-1">
+                          <span className="text-[10px] text-slate-400">Cleanroom Classification</span>
+                          <select
+                            value={selRoom.environmental.cleanroomGrade}
+                            onChange={(e) =>
+                              updateRoom(selRoom.id, {
+                                environmental: { ...selRoom.environmental, cleanroomGrade: e.target.value as CleanroomGrade },
+                              })
+                            }
+                            className="w-full px-2 py-1.5 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                          >
+                            {CLEANROOM_GRADES.map((g) => (
+                              <option key={g} value={g}>{g}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <div className="grid grid-cols-2 gap-2 font-mono tabular-nums">
+                          <label className="space-y-1">
+                            <span className="text-[10px] text-slate-400">Temp (°C)</span>
+                            <input
+                              type="number"
+                              value={selRoom.environmental.temperatureC}
+                              onChange={(e) =>
+                                updateRoom(selRoom.id, {
+                                  environmental: { ...selRoom.environmental, temperatureC: Number(e.target.value) },
+                                })
+                              }
+                              className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                            />
+                          </label>
+                          <label className="space-y-1">
+                            <span className="text-[10px] text-slate-400">Humidity (% RH)</span>
+                            <input
+                              type="number"
+                              value={selRoom.environmental.humidityPct}
+                              onChange={(e) =>
+                                updateRoom(selRoom.id, {
+                                  environmental: { ...selRoom.environmental, humidityPct: Number(e.target.value) },
+                                })
+                              }
+                              className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                            />
+                          </label>
+                        </div>
+                        <label className="block space-y-1">
+                          <span className="text-[10px] text-slate-400">Compliance Status</span>
+                          <select
+                            value={selRoom.complianceStatus}
+                            onChange={(e) => updateRoom(selRoom.id, { complianceStatus: e.target.value as any })}
+                            className="w-full px-2 py-1.5 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                          >
+                            <option value="compliant">GMP Compliant</option>
+                            <option value="review-due">Qualification Review Due</option>
+                            <option value="deviation">Active Deviation</option>
+                          </select>
+                        </label>
+                      </fieldset>
+                    )}
+                  </div>
+
+                  {/* SECTION 2: HVAC & Air Handling */}
+                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#14141A] overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setOpenRoomSection('hvac')}
+                      className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-1.5 font-semibold text-[11.5px] text-zinc-800 dark:text-zinc-100">
+                        {openRoomSection === 'hvac' ? (
+                          <ChevronDown className="w-3.5 h-3.5 text-sky-400" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5 text-zinc-400" />
+                        )}
+                        <Wind className="w-3.5 h-3.5 text-sky-400" />
+                        HVAC &amp; Air Handling
+                      </span>
+                      <span className="flex items-center gap-1 font-mono text-[10px] tabular-nums text-sky-500">
+                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: ahuColor }} />
+                        {roomHvac.ahuId} · {roomHvac.hepaClass}
+                      </span>
+                    </button>
+                    {openRoomSection === 'hvac' && (
+                      <div className="px-3 pb-3 pt-2 space-y-2.5 border-t border-zinc-200/70 dark:border-zinc-800">
+                        {/* Live Airflow Readout + 3D Duct Toggle */}
+                        <div className="flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg bg-sky-500/10 border border-sky-500/25">
+                          <div>
+                            <div className="text-[9.5px] uppercase tracking-wider text-sky-500 font-semibold">
+                              Calculated Supply Airflow
+                            </div>
+                            <div className="font-mono text-sm font-bold tabular-nums text-zinc-900 dark:text-white">
+                              {supplyM3h.toLocaleString()} m³/h
                             </div>
                           </div>
-                          <MiniSparkline points={snap?.history ?? []} color={col} width={62} height={20} />
-                        </button>
-                      );
-                    })}
+                          <button
+                            type="button"
+                            onClick={() => setShowHvacOverlay(!showHvacOverlay)}
+                            className={`px-2 py-1 rounded-lg text-[10.5px] font-semibold transition-colors cursor-pointer ${
+                              showHvacOverlay
+                                ? 'bg-sky-500 text-white'
+                                : 'bg-white dark:bg-[#1B1B24] border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-200'
+                            }`}
+                          >
+                            {showHvacOverlay ? '3D Ducts On' : 'Show 3D Ducts'}
+                          </button>
+                        </div>
+
+                        <fieldset disabled={isReadOnly} className="space-y-2.5 min-w-0 disabled:opacity-80">
+                          <label className="block space-y-1">
+                            <span className="text-[10px] text-slate-400">Assigned Air Handling Unit (AHU)</span>
+                            <select
+                              value={roomHvac.ahuId}
+                              onChange={(e) => {
+                                const picked = AHU_CATALOG.find((a) => a.id === e.target.value);
+                                updateRoomHvac(selRoom.id, {
+                                  ahuId: e.target.value,
+                                  ahuName: picked?.name ?? e.target.value,
+                                });
+                              }}
+                              className="w-full px-2 py-1.5 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700 text-[11px]"
+                            >
+                              {AHU_CATALOG.map((ahu) => (
+                                <option key={ahu.id} value={ahu.id}>
+                                  {ahu.id} — {ahu.name}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+
+                          <div className="grid grid-cols-2 gap-2">
+                            <label className="space-y-1">
+                              <span className="text-[10px] text-slate-400">HEPA / ULPA Class</span>
+                              <select
+                                value={roomHvac.hepaClass}
+                                onChange={(e) => updateRoomHvac(selRoom.id, { hepaClass: e.target.value as any })}
+                                className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700 text-[11px]"
+                              >
+                                {HEPA_CLASSES.map((hc) => (
+                                  <option key={hc} value={hc}>{hc}</option>
+                                ))}
+                              </select>
+                            </label>
+                            <label className="space-y-1">
+                              <span className="text-[10px] text-slate-400">System Status</span>
+                              <select
+                                value={roomHvac.status}
+                                onChange={(e) => updateRoomHvac(selRoom.id, { status: e.target.value as any })}
+                                className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700 text-[11px] capitalize"
+                              >
+                                <option value="online">Online · Nominal</option>
+                                <option value="alarm">Alarm / ΔP Drift</option>
+                                <option value="maintenance">Maintenance</option>
+                                <option value="standby">Standby</option>
+                              </select>
+                            </label>
+                          </div>
+
+                          <label className="block space-y-1">
+                            <span className="text-[10px] text-slate-400">Airflow Pattern</span>
+                            <select
+                              value={roomHvac.airflowMode}
+                              onChange={(e) => updateRoomHvac(selRoom.id, { airflowMode: e.target.value as any })}
+                              className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700 text-[11px]"
+                            >
+                              {AIRFLOW_MODES.map((m) => (
+                                <option key={m.id} value={m.id}>{m.label}</option>
+                              ))}
+                            </select>
+                          </label>
+
+                          <div className="grid grid-cols-2 gap-2 font-mono tabular-nums">
+                            <label className="space-y-1">
+                              <span className="text-[10px] text-slate-400">Pressure ΔP (Pa)</span>
+                              <input
+                                type="number"
+                                value={selRoom.environmental.pressurePa}
+                                onChange={(e) =>
+                                  updateRoomHvac(selRoom.id, { targetPressurePa: Number(e.target.value) })
+                                }
+                                className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                              />
+                            </label>
+                            <label className="space-y-1">
+                              <span className="text-[10px] text-slate-400">Air Changes (ACH)</span>
+                              <input
+                                type="number"
+                                min={1}
+                                max={120}
+                                value={selRoom.environmental.airChangesPerHour}
+                                onChange={(e) =>
+                                  updateRoomHvac(selRoom.id, { airChangesPerHour: Math.max(1, Number(e.target.value)) })
+                                }
+                                className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                              />
+                            </label>
+                            <label className="space-y-1">
+                              <span className="text-[10px] text-slate-400">Supply Temp (°C)</span>
+                              <input
+                                type="number"
+                                step={0.5}
+                                value={roomHvac.supplyTempC}
+                                onChange={(e) =>
+                                  updateRoomHvac(selRoom.id, { supplyTempC: Number(e.target.value) })
+                                }
+                                className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                              />
+                            </label>
+                            <label className="space-y-1">
+                              <span className="text-[10px] text-slate-400">HEPA Diffusers</span>
+                              <input
+                                type="number"
+                                min={1}
+                                max={12}
+                                value={roomHvac.diffuserCount}
+                                onChange={(e) =>
+                                  updateRoomHvac(selRoom.id, {
+                                    diffuserCount: Math.max(1, Math.min(12, Math.round(Number(e.target.value)))),
+                                  })
+                                }
+                                className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                              />
+                            </label>
+                          </div>
+
+                          <label className="block space-y-1">
+                            <div className="flex justify-between text-[10px] text-slate-400 font-mono tabular-nums">
+                              <span>VAV Damper Opening</span>
+                              <span className="font-semibold text-sky-500">{roomHvac.damperPct}%</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={100}
+                              step={5}
+                              value={roomHvac.damperPct}
+                              onChange={(e) =>
+                                updateRoomHvac(selRoom.id, { damperPct: Number(e.target.value) })
+                              }
+                              className="w-full accent-sky-500"
+                            />
+                          </label>
+                        </fieldset>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* SECTION 3: Live Room Sensors */}
+                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#14141A] overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setOpenRoomSection('sensors')}
+                      className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-1.5 font-semibold text-[11.5px] text-zinc-800 dark:text-zinc-100">
+                        {openRoomSection === 'sensors' ? (
+                          <ChevronDown className="w-3.5 h-3.5 text-emerald-500" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5 text-zinc-400" />
+                        )}
+                        <Activity className="w-3.5 h-3.5 text-emerald-500" />
+                        Live Room Sensors
+                      </span>
+                      <span className="font-mono text-[10px] text-zinc-400 tabular-nums">
+                        {roomSensors.length} tags
+                      </span>
+                    </button>
+                    {openRoomSection === 'sensors' && (
+                      <div className="px-3 pb-3 pt-2 space-y-2 border-t border-zinc-200/70 dark:border-zinc-800">
+                        <div className="flex items-center justify-between">
+                          <button
+                            onClick={() => setHeatmapMetric('temperature')}
+                            className="text-[10.5px] text-emerald-600 dark:text-emerald-400 hover:underline font-medium"
+                          >
+                            Show 3D Thermal Heatmap
+                          </button>
+                          <a
+                            href={buildTelemetryTabUrl({ tab: 'trends', roomId: selRoom.id })}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-[10.5px] text-zinc-400 hover:text-emerald-500"
+                            title="Open Room Telemetry in New Tab"
+                          >
+                            Console <ExternalLink className="w-3 h-3" />
+                          </a>
+                        </div>
+                        {roomSensors.map((s) => {
+                          const snap = telemetryReadings[s.id];
+                          const col = METRIC_PRESETS[s.metric]?.color ?? '#10B981';
+                          return (
+                            <button
+                              key={s.id}
+                              onClick={() =>
+                                openTelemetryDashboard({ tab: 'trends', roomId: selRoom.id, sensorId: s.id })
+                              }
+                              className="w-full flex items-center justify-between gap-2 p-2 rounded-md bg-white dark:bg-[#101015] border border-zinc-200 dark:border-zinc-800 hover:border-emerald-500 text-left"
+                            >
+                              <div className="min-w-0">
+                                <div className="font-mono text-[10.5px] font-semibold truncate">{s.tag}</div>
+                                <div className="font-mono tabular-nums text-xs text-zinc-900 dark:text-white">
+                                  {(snap?.value ?? s.nominal).toFixed(s.precision)} {s.unit}
+                                </div>
+                              </div>
+                              <MiniSparkline points={snap?.history ?? []} color={col} width={62} height={20} />
+                            </button>
+                          );
+                        })}
+                        {roomSensors.length === 0 && (
+                          <div className="text-[11px] text-zinc-500 py-1">No live room sensors bound yet.</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* SECTION 4: FMEA Risks & Drifts */}
+                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#14141A] overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setOpenRoomSection('fmea')}
+                      className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-1.5 font-semibold text-[11.5px] text-zinc-800 dark:text-zinc-100">
+                        {openRoomSection === 'fmea' ? (
+                          <ChevronDown className="w-3.5 h-3.5 text-rose-500" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5 text-zinc-400" />
+                        )}
+                        <ShieldAlert className="w-3.5 h-3.5 text-rose-500" />
+                        FMEA Risks &amp; Drifts
+                      </span>
+                      <span className={`px-1.5 py-0.5 rounded border font-mono text-[9.5px] font-bold tabular-nums ${fmeaToneClass}`}>
+                        {roomFmea.shortLabel || 'CLEAR'}
+                      </span>
+                    </button>
+                    {openRoomSection === 'fmea' && (
+                      <div className="p-2.5 border-t border-zinc-200/70 dark:border-zinc-800">
+                        <EntityRisksSection
+                          compact
+                          targetKind="room"
+                          targetId={selRoom.id}
+                          targetCode={selRoom.code}
+                          targetName={selRoom.name}
+                          floorId={selRoom.floorId}
+                          roomId={selRoom.id}
+                        />
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {/* Selected WALL Properties */}
           {selWall && (
-            <div className="space-y-3">
+            <fieldset disabled={isReadOnly} className="space-y-3 min-w-0 disabled:opacity-80">
               <div className="flex items-center justify-between pb-2 border-b border-slate-200 dark:border-zinc-800">
                 <div>
                   <div className="text-[10px] text-violet-500 font-medium">Architectural Wall</div>
                   <div className="font-semibold text-sm">{selWall.name}</div>
                 </div>
-                <button onClick={deleteSelected} className="p-1.5 rounded text-red-500 hover:bg-red-500/10">
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
+                {!isReadOnly && (
+                  <button onClick={deleteSelected} className="p-1.5 rounded text-red-500 hover:bg-red-500/10">
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
 
               <label className="block space-y-1">
@@ -664,26 +1030,30 @@ export const RightInspector: React.FC = () => {
                 <div>Acoustic: {selWall.acousticRatingDb} dB</div>
               </div>
 
-              <button
-                onClick={() => splitWall(selWall.id)}
-                className="w-full py-1.5 rounded border border-slate-300 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-[#22222C] font-medium"
-              >
-                Split Wall at Midpoint
-              </button>
-            </div>
+              {!isReadOnly && (
+                <button
+                  onClick={() => splitWall(selWall.id)}
+                  className="w-full py-1.5 rounded border border-slate-300 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-[#22222C] font-medium"
+                >
+                  Split Wall at Midpoint
+                </button>
+              )}
+            </fieldset>
           )}
 
           {/* Selected OPENING (Door/Window) Properties */}
           {selOpening && (
-            <div className="space-y-3">
+            <fieldset disabled={isReadOnly} className="space-y-3 min-w-0 disabled:opacity-80">
               <div className="flex items-center justify-between pb-2 border-b border-slate-200 dark:border-zinc-800">
                 <div>
                   <div className="text-[10px] text-violet-500 font-medium capitalize">{selOpening.kind} Opening</div>
                   <div className="font-semibold text-sm">{selOpening.name}</div>
                 </div>
-                <button onClick={deleteSelected} className="p-1.5 rounded text-red-500 hover:bg-red-500/10">
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
+                {!isReadOnly && (
+                  <button onClick={deleteSelected} className="p-1.5 rounded text-red-500 hover:bg-red-500/10">
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
               <div className="grid grid-cols-2 gap-2 font-mono">
                 <label className="space-y-1">
@@ -732,178 +1102,304 @@ export const RightInspector: React.FC = () => {
                   <option value="alarm">Door Held Open Alarm</option>
                 </select>
               </label>
-            </div>
+            </fieldset>
           )}
 
-          {/* Selected INTELLIGENT ASSET Properties */}
-          {selAsset && (
-            <div className="space-y-3">
-              <div className="flex items-start justify-between gap-2 pb-2 border-b border-zinc-200 dark:border-zinc-800">
-                <div className="min-w-0">
-                  <div className="text-[10px] font-mono text-emerald-600 dark:text-emerald-400">
-                    {selAsset.assetId} · {selAsset.category}
-                  </div>
-                  <input
-                    value={selAsset.name}
-                    onChange={(e) => updateAsset(selAsset.id, { name: e.target.value })}
-                    className="font-semibold text-sm bg-transparent w-full focus:outline-none text-zinc-900 dark:text-zinc-100"
-                  />
-                </div>
-                <div className="flex gap-1 shrink-0">
-                  <button
-                    onClick={() =>
-                      copyDirectLink(
-                        { assetId: selAsset.id, floorId: selAsset.floorId, drillLevel: 'asset' },
-                        selAsset.assetId
-                      )
-                    }
-                    className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300"
-                    title="Copy Direct Asset URL"
-                  >
-                    <Link2 className="w-3.5 h-3.5" />
-                  </button>
-                  <button onClick={duplicateSelected} className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Duplicate">
-                    <Copy className="w-3.5 h-3.5" />
-                  </button>
-                  <button onClick={deleteSelected} className="p-1.5 rounded text-red-500 hover:bg-red-500/10" title="Delete">
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              </div>
+          {/* Selected INTELLIGENT ASSET Properties (Exclusive Single-Subject Accordion) */}
+          {selAsset && (() => {
+            const assetFmea = getTargetFmeaSummary(riskIncidents, 'asset', selAsset.id);
+            const assetFmeaTone =
+              assetFmea.level === 'critical'
+                ? 'bg-rose-500/15 text-rose-500 border-rose-500/40'
+                : assetFmea.level === 'high'
+                  ? 'bg-amber-500/15 text-amber-500 border-amber-500/40'
+                  : assetFmea.level === 'medium'
+                    ? 'bg-violet-500/15 text-violet-400 border-violet-500/40'
+                    : assetFmea.level === 'mitigated'
+                      ? 'bg-emerald-500/15 text-emerald-500 border-emerald-500/40'
+                      : 'bg-zinc-500/10 text-zinc-400 border-zinc-500/25';
+            const gmpRec = gmpComplianceByAssetId[selAsset.id];
+            const pillTone = (st?: string) =>
+              st === 'overdue'
+                ? 'bg-rose-500/15 text-rose-500 border-rose-500/30'
+                : st === 'due-soon'
+                  ? 'bg-amber-500/15 text-amber-500 border-amber-500/30'
+                  : 'bg-emerald-500/15 text-emerald-500 border-emerald-500/30';
 
-              {/* Org-Wide Same-Type Isolation Action */}
-              <div className="flex items-center gap-1.5">
-                {isolatedAssetType?.templateId === selAsset.templateId ? (
+            return (
+              <div className="space-y-3">
+                <div className="flex items-start justify-between gap-2 pb-2 border-b border-zinc-200 dark:border-zinc-800">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-[10px] font-mono text-emerald-600 dark:text-emerald-400">
+                        {selAsset.assetId} · {selAsset.category}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (assetFmea.worstIncident) {
+                            openRiskModal({ mode: 'resolve', incidentId: assetFmea.worstIncident.id });
+                          } else {
+                            setOpenAssetSection('fmea');
+                          }
+                        }}
+                        className={`px-1.5 py-0.5 rounded border font-mono text-[9.5px] font-bold tabular-nums cursor-pointer ${assetFmeaTone}`}
+                        title={
+                          assetFmea.worstIncident
+                            ? `FMEA Status: ${assetFmea.worstIncident.title}`
+                            : 'No open FMEA risks on this equipment'
+                        }
+                      >
+                        {assetFmea.shortLabel || 'FMEA OK'}
+                      </button>
+                    </div>
+                    <input
+                      value={selAsset.name}
+                      disabled={isReadOnly}
+                      onChange={(e) => updateAsset(selAsset.id, { name: e.target.value })}
+                      className="font-semibold text-sm bg-transparent w-full focus:outline-none text-zinc-900 dark:text-zinc-100 disabled:opacity-90"
+                    />
+                  </div>
+                  <div className="flex gap-1 shrink-0">
+                    <button
+                      onClick={() =>
+                        copyDirectLink(
+                          { assetId: selAsset.id, floorId: selAsset.floorId, drillLevel: 'asset' },
+                          selAsset.assetId
+                        )
+                      }
+                      className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300"
+                      title="Copy Direct Asset URL"
+                    >
+                      <Link2 className="w-3.5 h-3.5" />
+                    </button>
+                    {!isReadOnly && (
+                      <>
+                        <button onClick={duplicateSelected} className="p-1.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Duplicate">
+                          <Copy className="w-3.5 h-3.5" />
+                        </button>
+                        <button onClick={deleteSelected} className="p-1.5 rounded text-red-500 hover:bg-red-500/10" title="Delete">
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Org-Wide Same-Type Isolation Action */}
+                <div className="flex items-center gap-1.5">
+                  {isolatedAssetType?.templateId === selAsset.templateId ? (
+                    <button
+                      onClick={clearIsolation}
+                      className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-medium transition-colors"
+                    >
+                      <Focus className="w-3.5 h-3.5" />
+                      Exit Org Isolation ({isolatedAssetType.count} shown)
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => isolateSameTypeOrgWide(selAsset.id)}
+                      className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-md bg-zinc-100 dark:bg-[#18181C] border border-zinc-200 dark:border-zinc-700 hover:border-emerald-500 hover:text-emerald-600 dark:hover:text-emerald-400 text-[11px] font-medium transition-colors"
+                      title="Isolate every instance of this equipment type across all buildings & floors in the organization"
+                    >
+                      <Focus className="w-3.5 h-3.5 text-emerald-500" />
+                      Isolate Same Type Org-Wide ({orgWideMatchCount})
+                    </button>
+                  )}
                   <button
-                    onClick={clearIsolation}
-                    className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-medium transition-colors"
+                    onClick={() => drillInto('asset', selAsset.id)}
+                    className="p-1.5 rounded-md border border-zinc-200 dark:border-zinc-700 bg-zinc-100 dark:bg-[#18181C] hover:border-violet-500 text-zinc-700 dark:text-zinc-200"
+                    title="Focus 3D Camera on Asset"
                   >
-                    <Focus className="w-3.5 h-3.5" />
-                    Exit Org Isolation ({isolatedAssetType.count} shown)
+                    <Compass className="w-3.5 h-3.5" />
                   </button>
-                ) : (
+                </div>
+
+                {/* Full Device Identification & FMEA/GMP Compliance PDF */}
+                <div className="grid grid-cols-2 gap-1.5">
                   <button
-                    onClick={() => isolateSameTypeOrgWide(selAsset.id)}
-                    className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-md bg-zinc-100 dark:bg-[#18181C] border border-zinc-200 dark:border-zinc-700 hover:border-emerald-500 hover:text-emerald-600 dark:hover:text-emerald-400 text-[11px] font-medium transition-colors"
-                    title="Isolate every instance of this equipment type across all buildings & floors in the organization"
+                    type="button"
+                    onClick={() => openEntityInfo({ type: 'asset', id: selAsset.id })}
+                    className="flex items-center justify-center gap-1.5 py-2 px-2.5 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-[11.5px] font-semibold shadow-xs transition-colors cursor-pointer"
                   >
-                    <Focus className="w-3.5 h-3.5 text-emerald-500" />
-                    Isolate Same Type Org-Wide ({orgWideMatchCount})
+                    <Info className="w-3.5 h-3.5 shrink-0" />
+                    <span className="truncate">Full Device Info</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openAssetPdfModal(selAsset.id)}
+                    className="flex items-center justify-center gap-1.5 py-2 px-2.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#181820] hover:border-amber-500 text-zinc-800 dark:text-zinc-100 text-[11.5px] font-semibold transition-colors cursor-pointer"
+                    title="Generate FMEA Risk & GMP Compliance PDF Report"
+                  >
+                    <FileText className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                    <span className="truncate">FMEA/GMP PDF</span>
+                  </button>
+                </div>
+
+                {/* Contextual IT / Network 42U Rack Designer Launcher */}
+                {(selAsset.category === 'IT & Data Center' || selAsset.rackConfig) && (
+                  <button
+                    onClick={() => openRackDesigner(selAsset.id)}
+                    className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-xl gradian-violet-amber text-white text-xs font-semibold shadow-sm hover:opacity-95 transition-opacity cursor-pointer"
+                  >
+                    <Server className="w-3.5 h-3.5" />
+                    Open 42U Rack, Ports &amp; Patch Designer
                   </button>
                 )}
-                <button
-                  onClick={() => drillInto('asset', selAsset.id)}
-                  className="p-1.5 rounded-md border border-zinc-200 dark:border-zinc-700 bg-zinc-100 dark:bg-[#18181C] hover:border-violet-500 text-zinc-700 dark:text-zinc-200"
-                  title="Focus 3D Camera on Asset"
-                >
-                  <Compass className="w-3.5 h-3.5" />
-                </button>
-              </div>
 
-              {/* Contextual IT / Network 42U Rack Designer Launcher */}
-              {(selAsset.category === 'IT & Data Center' || selAsset.rackConfig) && (
-                <button
-                  onClick={() => openRackDesigner(selAsset.id)}
-                  className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-xl gradian-violet-amber text-white text-xs font-semibold shadow-sm hover:opacity-95 transition-opacity cursor-pointer"
-                >
-                  <Server className="w-3.5 h-3.5" />
-                  Open 42U Rack, Ports &amp; Patch Designer
-                </button>
-              )}
+                {/* Exclusive Single-Subject Accordion for Equipment */}
+                <div className="space-y-1.5">
+                  {/* ACCORDION 1: FMEA Risks & Drifts */}
+                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#14141A] overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setOpenAssetSection('fmea')}
+                      className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-1.5 font-semibold text-[11.5px] text-zinc-800 dark:text-zinc-100">
+                        {openAssetSection === 'fmea' ? (
+                          <ChevronDown className="w-3.5 h-3.5 text-rose-500" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5 text-zinc-400" />
+                        )}
+                        <ShieldAlert className="w-3.5 h-3.5 text-rose-500" />
+                        FMEA Risks &amp; Drifts
+                      </span>
+                      <span className={`px-1.5 py-0.5 rounded border font-mono text-[9.5px] font-bold tabular-nums ${assetFmeaTone}`}>
+                        {assetFmea.shortLabel || 'CLEAR'}
+                      </span>
+                    </button>
+                    {openAssetSection === 'fmea' && (
+                      <div className="p-2.5 border-t border-zinc-200/70 dark:border-zinc-800">
+                        <EntityRisksSection
+                          compact
+                          targetKind={selAsset.category === 'IT & Data Center' ? 'network' : 'asset'}
+                          targetId={selAsset.id}
+                          targetCode={selAsset.assetId}
+                          targetName={selAsset.name}
+                          floorId={selAsset.floorId}
+                          roomId={selAsset.roomId}
+                        />
+                      </div>
+                    )}
+                  </div>
 
-              {/* GMP Compliance, Cal/Qual/PM Dates, SOPs & Industrial Labels Card */}
-              {(() => {
-                const gmpRec = gmpComplianceByAssetId[selAsset.id];
-                const pillTone = (st?: string) =>
-                  st === 'overdue'
-                    ? 'bg-rose-500/15 text-rose-500 border-rose-500/30'
-                    : st === 'due-soon'
-                      ? 'bg-amber-500/15 text-amber-500 border-amber-500/30'
-                      : 'bg-emerald-500/15 text-emerald-500 border-emerald-500/30';
-                return (
-                  <div className="rounded-xl p-2.5 border border-zinc-200 dark:border-zinc-800 bg-zinc-50/80 dark:bg-[#14141B] space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] font-bold uppercase tracking-wider text-violet-600 dark:text-violet-400 flex items-center gap-1">
-                        <ShieldCheck className="w-3 h-3" />
+                  {/* ACCORDION 2: GMP Compliance, Cal/Qual/PM Dates, SOPs & Labels */}
+                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#14141A] overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setOpenAssetSection('gmp')}
+                      className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-1.5 font-semibold text-[11.5px] text-zinc-800 dark:text-zinc-100">
+                        {openAssetSection === 'gmp' ? (
+                          <ChevronDown className="w-3.5 h-3.5 text-violet-500" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5 text-zinc-400" />
+                        )}
+                        <ShieldCheck className="w-3.5 h-3.5 text-violet-500" />
                         GMP Compliance &amp; SOPs
                       </span>
-                      <span className="text-[10px] font-mono text-zinc-400">
-                        {gmpRec?.lifecycleEvents.length ?? 0} audit events
+                      <span className="font-mono text-[10px] text-zinc-400 tabular-nums">
+                        {gmpRec?.lifecycleEvents.length ?? 0} events
                       </span>
-                    </div>
-
-                    {gmpRec && (
-                      <div className="grid grid-cols-3 gap-1.5 text-[10px]">
-                        <div className={`px-2 py-1 rounded-lg border ${pillTone(gmpRec.calibration.status)}`}>
-                          <div className="text-[9px] opacity-80">Cal Due</div>
-                          <div className="font-mono font-semibold truncate">{gmpRec.calibration.nextDueDate}</div>
-                        </div>
-                        <div className={`px-2 py-1 rounded-lg border ${pillTone(gmpRec.qualification.status)}`}>
-                          <div className="text-[9px] opacity-80">{gmpRec.qualification.stage} Due</div>
-                          <div className="font-mono font-semibold truncate">{gmpRec.qualification.nextDueDate}</div>
-                        </div>
-                        <div className={`px-2 py-1 rounded-lg border ${pillTone(gmpRec.maintenance.status)}`}>
-                          <div className="text-[9px] opacity-80">PM Due</div>
-                          <div className="font-mono font-semibold truncate">{gmpRec.maintenance.nextDueDate}</div>
+                    </button>
+                    {openAssetSection === 'gmp' && (
+                      <div className="p-2.5 space-y-2 border-t border-zinc-200/70 dark:border-zinc-800">
+                        {gmpRec && (
+                          <div className="grid grid-cols-3 gap-1.5 text-[10px]">
+                            <div className={`px-2 py-1 rounded-lg border ${pillTone(gmpRec.calibration.status)}`}>
+                              <div className="text-[9px] opacity-80">Cal Due</div>
+                              <div className="font-mono font-semibold truncate">{gmpRec.calibration.nextDueDate}</div>
+                            </div>
+                            <div className={`px-2 py-1 rounded-lg border ${pillTone(gmpRec.qualification.status)}`}>
+                              <div className="text-[9px] opacity-80">{gmpRec.qualification.stage} Due</div>
+                              <div className="font-mono font-semibold truncate">{gmpRec.qualification.nextDueDate}</div>
+                            </div>
+                            <div className={`px-2 py-1 rounded-lg border ${pillTone(gmpRec.maintenance.status)}`}>
+                              <div className="text-[9px] opacity-80">PM Due</div>
+                              <div className="font-mono font-semibold truncate">{gmpRec.maintenance.nextDueDate}</div>
+                            </div>
+                          </div>
+                        )}
+                        <div className="grid grid-cols-2 gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => openGmpModal({ tab: 'compliance', assetId: selAsset.id })}
+                            className="flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#1B1B24] hover:border-violet-500 text-[10.5px] font-semibold text-zinc-700 dark:text-zinc-200 transition-colors cursor-pointer"
+                          >
+                            <History className="w-3 h-3 text-violet-500" />
+                            Lifecycle &amp; Dates
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => openGmpModal({ tab: 'sops', assetId: selAsset.id })}
+                            className="flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#1B1B24] hover:border-violet-500 text-[10.5px] font-semibold text-zinc-700 dark:text-zinc-200 transition-colors cursor-pointer"
+                          >
+                            <BookOpen className="w-3 h-3 text-amber-500" />
+                            SOPs &amp; Records
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => openGmpModal({ tab: 'workorders', assetId: selAsset.id })}
+                            className="flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#1B1B24] hover:border-emerald-500 text-[10.5px] font-semibold text-zinc-700 dark:text-zinc-200 transition-colors cursor-pointer"
+                          >
+                            <Wrench className="w-3 h-3 text-emerald-500" />
+                            Work Order
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => openQrLabelModal('designer', [`asset:${selAsset.id}`])}
+                            className="flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#1B1B24] hover:border-amber-500 text-[10.5px] font-semibold text-zinc-700 dark:text-zinc-200 transition-colors cursor-pointer"
+                          >
+                            <QrCode className="w-3 h-3 text-amber-500" />
+                            QR Label
+                          </button>
                         </div>
                       </div>
                     )}
-
-                    <div className="grid grid-cols-2 gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => openGmpModal({ tab: 'compliance', assetId: selAsset.id })}
-                        className="flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#1B1B24] hover:border-violet-500 text-[10.5px] font-semibold text-zinc-700 dark:text-zinc-200 transition-colors cursor-pointer"
-                      >
-                        <History className="w-3 h-3 text-violet-500" />
-                        Lifecycle &amp; Dates
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => openGmpModal({ tab: 'sops', assetId: selAsset.id })}
-                        className="flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#1B1B24] hover:border-violet-500 text-[10.5px] font-semibold text-zinc-700 dark:text-zinc-200 transition-colors cursor-pointer"
-                      >
-                        <BookOpen className="w-3 h-3 text-amber-500" />
-                        SOPs &amp; Records
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => openGmpModal({ tab: 'workorders', assetId: selAsset.id })}
-                        className="flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#1B1B24] hover:border-emerald-500 text-[10.5px] font-semibold text-zinc-700 dark:text-zinc-200 transition-colors cursor-pointer"
-                      >
-                        <Wrench className="w-3 h-3 text-emerald-500" />
-                        Work Order
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => openQrLabelModal('designer', [`asset:${selAsset.id}`])}
-                        className="flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#1B1B24] hover:border-amber-500 text-[10.5px] font-semibold text-zinc-700 dark:text-zinc-200 transition-colors cursor-pointer"
-                      >
-                        <QrCode className="w-3 h-3 text-amber-500" />
-                        QR Label
-                      </button>
-                    </div>
                   </div>
-                );
-              })()}
 
-              {/* Sub-tabs for Intelligent Object Data */}
-              <div className="grid grid-cols-5 gap-1 p-0.5 rounded-md bg-zinc-100 dark:bg-[#0D0D10] border border-zinc-200/70 dark:border-zinc-800">
-                {(['general', 'spatial', 'ops', 'iot', 'docs'] as const).map((st) => (
-                  <button
-                    key={st}
-                    onClick={() => setAssetSubTab(st)}
-                    className={`py-1 rounded text-[10px] font-medium capitalize ${
-                      assetSubTab === st ? 'bg-white dark:bg-[#1C1C21] text-emerald-600 dark:text-emerald-400 shadow-xs' : 'text-zinc-500'
-                    }`}
-                  >
-                    {st}
-                  </button>
-                ))}
-              </div>
+                  {/* ACCORDION 3: Asset Specs, Spatial, Ops, IoT & Docs */}
+                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#14141A] overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setOpenAssetSection('specs')}
+                      className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-1.5 font-semibold text-[11.5px] text-zinc-800 dark:text-zinc-100">
+                        {openAssetSection === 'specs' ? (
+                          <ChevronDown className="w-3.5 h-3.5 text-emerald-500" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5 text-zinc-400" />
+                        )}
+                        <Sliders className="w-3.5 h-3.5 text-emerald-500" />
+                        Engineering Specs &amp; Telemetry
+                      </span>
+                      <span className="font-mono text-[10px] text-zinc-400 uppercase">
+                        {assetSubTab}
+                      </span>
+                    </button>
+
+                    {openAssetSection === 'specs' && (
+                      <div className="p-2.5 space-y-3 border-t border-zinc-200/70 dark:border-zinc-800">
+                        {/* Sub-tabs for Intelligent Object Data */}
+                        <div className="grid grid-cols-5 gap-1 p-0.5 rounded-md bg-zinc-100 dark:bg-[#0D0D10] border border-zinc-200/70 dark:border-zinc-800">
+                          {(['general', 'spatial', 'ops', 'iot', 'docs'] as const).map((st) => (
+                            <button
+                              key={st}
+                              onClick={() => setAssetSubTab(st)}
+                              className={`py-1 rounded text-[10px] font-medium capitalize ${
+                                assetSubTab === st ? 'bg-white dark:bg-[#1C1C21] text-emerald-600 dark:text-emerald-400 shadow-xs' : 'text-zinc-500'
+                              }`}
+                            >
+                              {st}
+                            </button>
+                          ))}
+                        </div>
 
               {assetSubTab === 'general' && (
-                <div className="space-y-2">
+                <fieldset disabled={isReadOnly} className="space-y-2 min-w-0 disabled:opacity-80">
                   <div className="grid grid-cols-2 gap-2">
                     <label className="space-y-1">
                       <span className="text-[10px] text-slate-400">Asset Tag</span>
@@ -936,11 +1432,11 @@ export const RightInspector: React.FC = () => {
                   <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed pt-1 border-t border-slate-200 dark:border-zinc-800">
                     {selAsset.description}
                   </p>
-                </div>
+                </fieldset>
               )}
 
               {assetSubTab === 'spatial' && (
-                <div className="space-y-3 font-mono tabular-nums">
+                <fieldset disabled={isReadOnly} className="space-y-3 font-mono tabular-nums min-w-0 disabled:opacity-80">
                   <div className="grid grid-cols-3 gap-2">
                     <label className="space-y-1">
                       <span className="text-[10px] text-slate-400">Pos X (m)</span>
@@ -1022,11 +1518,11 @@ export const RightInspector: React.FC = () => {
                       />
                     </label>
                   </div>
-                </div>
+                </fieldset>
               )}
 
               {assetSubTab === 'ops' && (
-                <div className="space-y-2">
+                <fieldset disabled={isReadOnly} className="space-y-2 min-w-0 disabled:opacity-80">
                   <label className="block space-y-1">
                     <span className="text-[10px] text-slate-400">Operational Status</span>
                     <select
@@ -1049,7 +1545,7 @@ export const RightInspector: React.FC = () => {
                     <div><span className="text-slate-400 block text-[10px]">Next PM</span>{selAsset.nextMaintenance}</div>
                     <div><span className="text-slate-400 block text-[10px]">Condition</span>{selAsset.conditionScore}/100</div>
                   </div>
-                </div>
+                </fieldset>
               )}
 
               {assetSubTab === 'iot' && (
@@ -1164,8 +1660,13 @@ export const RightInspector: React.FC = () => {
                   </div>
                 </div>
               )}
-            </div>
-          )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Selected CAMERA Properties (Direction Yaw/Pitch, FOV, LiveCam & Argon2 Credentials) */}
           {selCamera && (() => {
@@ -1193,17 +1694,20 @@ export const RightInspector: React.FC = () => {
                     </div>
                     <input
                       value={selCamera.name}
+                      disabled={isReadOnly}
                       onChange={(e) => updateCamera(selCamera.id, { name: e.target.value })}
-                      className="font-semibold text-sm bg-transparent w-full focus:outline-none text-zinc-900 dark:text-zinc-100"
+                      className="font-semibold text-sm bg-transparent w-full focus:outline-none text-zinc-900 dark:text-zinc-100 disabled:opacity-90"
                     />
                   </div>
-                  <button
-                    onClick={() => deleteCamera(selCamera.id)}
-                    className="p-1.5 rounded text-rose-500 hover:bg-rose-500/10"
-                    title="Delete Camera"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
+                  {!isReadOnly && (
+                    <button
+                      onClick={() => deleteCamera(selCamera.id)}
+                      className="p-1.5 rounded text-rose-500 hover:bg-rose-500/10"
+                      title="Delete Camera"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-2 gap-1.5">
@@ -1220,6 +1724,8 @@ export const RightInspector: React.FC = () => {
                     <Compass className="w-3.5 h-3.5 text-violet-500" /> Go to 3D
                   </button>
                 </div>
+
+                <fieldset disabled={isReadOnly} className="space-y-3 min-w-0 disabled:opacity-80">
 
                 <div className="grid grid-cols-3 gap-1.5 font-mono">
                   {(['X', 'Y', 'Z'] as const).map((axis, idx) => (
@@ -1284,6 +1790,7 @@ export const RightInspector: React.FC = () => {
                     />
                   </label>
                 </div>
+                </fieldset>
 
                 <div className="p-2.5 rounded-xl bg-zinc-50 dark:bg-[#16161E] border border-zinc-200 dark:border-zinc-800 space-y-1 font-mono text-[10.5px]">
                   <div className="flex justify-between">
@@ -1313,35 +1820,40 @@ export const RightInspector: React.FC = () => {
                   </div>
                   <input
                     value={selFlow.name}
+                    disabled={isReadOnly}
                     onChange={(e) => updateFlowRoute(selFlow.id, { name: e.target.value })}
-                    className="font-semibold text-sm bg-transparent w-full focus:outline-none text-zinc-900 dark:text-zinc-100"
+                    className="font-semibold text-sm bg-transparent w-full focus:outline-none text-zinc-900 dark:text-zinc-100 disabled:opacity-90"
                   />
                 </div>
-                <button
-                  onClick={() => deleteFlowRoute(selFlow.id)}
-                  className="p-1.5 rounded text-rose-500 hover:bg-rose-500/10"
-                  title="Delete Flow"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
+                {!isReadOnly && (
+                  <button
+                    onClick={() => deleteFlowRoute(selFlow.id)}
+                    className="p-1.5 rounded text-rose-500 hover:bg-rose-500/10"
+                    title="Delete Flow"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
 
-              <button
-                onClick={() => {
-                  setEditingFlowId(editingFlowId === selFlow.id ? null : selFlow.id);
-                  setViewMode('split');
-                }}
-                className={`w-full flex items-center justify-center gap-1.5 py-2 rounded-xl text-xs font-semibold transition-colors ${
-                  editingFlowId === selFlow.id
-                    ? 'bg-amber-500 text-zinc-950'
-                    : 'bg-violet-600 hover:bg-violet-500 text-white'
-                }`}
-              >
-                <Waypoints className="w-3.5 h-3.5" />
-                {editingFlowId === selFlow.id ? 'Exit Node Modify Mode' : 'Modify Flow Nodes in 2D'}
-              </button>
+              {!isReadOnly && (
+                <button
+                  onClick={() => {
+                    setEditingFlowId(editingFlowId === selFlow.id ? null : selFlow.id);
+                    setViewMode('split');
+                  }}
+                  className={`w-full flex items-center justify-center gap-1.5 py-2 rounded-xl text-xs font-semibold transition-colors ${
+                    editingFlowId === selFlow.id
+                      ? 'bg-amber-500 text-zinc-950'
+                      : 'bg-violet-600 hover:bg-violet-500 text-white'
+                  }`}
+                >
+                  <Waypoints className="w-3.5 h-3.5" />
+                  {editingFlowId === selFlow.id ? 'Exit Node Modify Mode' : 'Modify Flow Nodes in 2D'}
+                </button>
+              )}
 
-              <div className="grid grid-cols-2 gap-2">
+              <fieldset disabled={isReadOnly} className="grid grid-cols-2 gap-2 min-w-0 disabled:opacity-80">
                 <label className="space-y-1">
                   <span className="text-[10px] text-zinc-400">Flow Type</span>
                   <select
@@ -1365,7 +1877,7 @@ export const RightInspector: React.FC = () => {
                     className="w-full h-8 rounded bg-zinc-100 dark:bg-[#14141A] border border-zinc-200 dark:border-zinc-700 p-0.5"
                   />
                 </label>
-              </div>
+              </fieldset>
 
               <div className="flex items-center justify-between gap-2 pt-1">
                 <label className="flex items-center gap-1.5 text-[11px] cursor-pointer">
@@ -1669,7 +2181,7 @@ export const RightInspector: React.FC = () => {
               </button>
               <button
                 onClick={() => setShowFlowLegend(!showFlowLegend)}
-                className={`py-1.5 rounded-xl text-[11px] font-medium ${
+                className={`py-1.5 rounded-xl text-[11px] font-medium cursor-pointer ${
                   showFlowLegend
                     ? 'bg-amber-500/15 text-amber-500 border border-amber-500/40'
                     : 'bg-zinc-100 dark:bg-[#1B1B24] text-zinc-500'
@@ -1678,39 +2190,106 @@ export const RightInspector: React.FC = () => {
                 Legend: {showFlowLegend ? 'Visible' : 'Hidden'}
               </button>
             </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setShowFlows(!showFlows)}
+                className={`flex-1 py-1.5 rounded-xl text-[11px] font-semibold flex items-center justify-center gap-1.5 cursor-pointer ${
+                  showFlows
+                    ? 'bg-emerald-500/15 text-emerald-500 border border-emerald-500/35'
+                    : 'bg-zinc-100 dark:bg-[#1B1B24] text-zinc-400 border border-zinc-700/40'
+                }`}
+              >
+                {showFlows ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+                {showFlows ? 'All Flows Visible' : 'All Flows Turned Off'}
+              </button>
+              {isolatedFlowId && (
+                <button
+                  onClick={() => isolateFlow(null)}
+                  className="px-2.5 py-1.5 rounded-xl bg-amber-500 text-zinc-950 text-[11px] font-bold cursor-pointer"
+                >
+                  Clear Isolation
+                </button>
+              )}
+            </div>
           </div>
           <div className="flex-1 overflow-y-auto p-2.5 space-y-2">
             {scene.flows
               .filter((f) => f.floorId === activeFloorId)
-              .map((fl) => (
-                <div key={fl.id} className="p-2.5 rounded-xl border border-slate-200 dark:border-zinc-800 space-y-1.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 min-w-0">
-                      <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: fl.color }} />
-                      <span className="font-medium truncate">{fl.name}</span>
-                    </div>
-                    <button onClick={() => deleteFlowRoute(fl.id)} className="text-slate-400 hover:text-red-500">
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                  <div className="text-[11px] font-mono text-slate-500">
-                    {fl.flowType} · {fl.points.length} nodes · {fl.cleanlinessClass}
-                  </div>
-                  <button
-                    onClick={() => {
-                      setEditingFlowId(editingFlowId === fl.id ? null : fl.id);
-                      setViewMode('split');
-                    }}
-                    className={`w-full py-1 rounded-lg text-[11px] font-semibold transition-colors ${
-                      editingFlowId === fl.id
-                        ? 'bg-amber-500 text-zinc-950'
-                        : 'bg-zinc-100 dark:bg-[#1C1C26] hover:bg-violet-600 hover:text-white'
+              .map((fl) => {
+                const isIso = isolatedFlowId === fl.id;
+                const isHidden = hiddenFlowIds.includes(fl.id);
+                const seq = computeFlowRoomSequence(fl, scene.rooms);
+                return (
+                  <div
+                    key={fl.id}
+                    className={`p-2.5 rounded-xl border space-y-1.5 transition-colors ${
+                      isIso
+                        ? 'border-amber-500/70 bg-amber-500/5'
+                        : 'border-slate-200 dark:border-zinc-800'
                     }`}
                   >
-                    {editingFlowId === fl.id ? 'Done Modifying Nodes' : 'Modify Flow Nodes'}
-                  </button>
-                </div>
-              ))}
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: fl.color }} />
+                        <span className="font-medium truncate">{fl.name}</span>
+                      </div>
+                      <button
+                        onClick={() => deleteFlowRoute(fl.id)}
+                        className="text-slate-400 hover:text-red-500 cursor-pointer"
+                        title="Delete Flow Route"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                    <div className="text-[11px] font-mono text-slate-500">
+                      {fl.flowType} · {seq.steps.length} rooms · {seq.totalLengthM}m · {seq.totalTraversedAreaSqm} m²
+                    </div>
+                    <div className="grid grid-cols-3 gap-1">
+                      <button
+                        onClick={() => setActiveFlowInfoId(fl.id)}
+                        className="py-1 rounded-lg text-[10.5px] font-semibold bg-violet-600 hover:bg-violet-500 text-white flex items-center justify-center gap-1 cursor-pointer"
+                        title="View Ordered Room Numbers & Areas"
+                      >
+                        <Info className="w-3 h-3" /> Info
+                      </button>
+                      <button
+                        onClick={() => isolateFlow(fl.id)}
+                        className={`py-1 rounded-lg text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer ${
+                          isIso
+                            ? 'bg-amber-500 text-zinc-950'
+                            : 'bg-zinc-100 dark:bg-[#1C1C26] hover:bg-amber-500 hover:text-zinc-950'
+                        }`}
+                      >
+                        <Focus className="w-3 h-3" /> {isIso ? 'Isolated' : 'Isolate'}
+                      </button>
+                      <button
+                        onClick={() => toggleFlowVisibility(fl.id)}
+                        className={`py-1 rounded-lg text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer ${
+                          isHidden
+                            ? 'bg-zinc-200 dark:bg-zinc-900 text-zinc-400'
+                            : 'bg-zinc-100 dark:bg-[#1C1C26] hover:bg-zinc-700'
+                        }`}
+                      >
+                        {isHidden ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+                        {isHidden ? 'Off' : 'On'}
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => {
+                        setEditingFlowId(editingFlowId === fl.id ? null : fl.id);
+                        setViewMode('split');
+                      }}
+                      className={`w-full py-1 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer ${
+                        editingFlowId === fl.id
+                          ? 'bg-amber-500 text-zinc-950'
+                          : 'bg-zinc-100 dark:bg-[#1C1C26] hover:bg-violet-600 hover:text-white'
+                      }`}
+                    >
+                      {editingFlowId === fl.id ? 'Done Modifying Nodes' : 'Modify Flow Nodes'}
+                    </button>
+                  </div>
+                );
+              })}
           </div>
         </div>
       )}
@@ -1872,7 +2451,7 @@ export const RightInspector: React.FC = () => {
                 </div>
                 <div className="flex gap-1.5">
                   <button
-                    onClick={applyPendingAIActions}
+                    onClick={() => applyPendingAIActions()}
                     className="flex-1 py-1.5 rounded bg-violet-600 hover:bg-violet-500 text-white font-semibold"
                   >
                     Confirm &amp; Apply

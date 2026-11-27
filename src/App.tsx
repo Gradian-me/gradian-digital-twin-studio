@@ -24,15 +24,22 @@ import { GlobalQuickSearch } from './components/GlobalQuickSearch';
 import { TelemetryDashboard } from './components/TelemetryDashboard';
 import { MayaChatDrawer } from './components/MayaChatDrawer';
 import { CameraManagerModal } from './components/CameraManagerModal';
-import { NetworkRackDesignerModal } from './components/NetworkRackDesignerModal';
+import { DataCenterDesignerPage, NetworkRackDesignerModal } from './components/NetworkRackDesignerModal';
 import { SaveValidationModal } from './components/SaveValidationModal';
 import { AuditTrailModal } from './components/AuditTrailModal';
 import { MiniMapOverlay } from './components/MiniMapOverlay';
 import { QrLabelStudioModal } from './components/QrLabelStudioModal';
 import { GmpOperationsModal } from './components/GmpOperationsModal';
 import { AclGroupingModal } from './components/AclGroupingModal';
+import { FlowInfoDialog } from './components/FlowInfoDialog';
+import { CadOcrWallModal } from './components/CadOcrWallModal';
+import { ResourceSchedulingModal } from './components/ResourceSchedulingModal';
+import { EntityInfoModal } from './components/EntityInfoModal';
+import { RiskFmeaModal } from './components/RiskFmeaCenter';
+import { AssetCompliancePdfModal } from './components/AssetCompliancePdfModal';
 import { useTelemetryStore } from './store/useTelemetryStore';
 import { useGmpStore } from './store/useGmpStore';
+import { useRiskIncidentStore } from './store/useRiskIncidentStore';
 
 const WorkspaceShell: React.FC = () => {
   const screen = useTwinStore((s) => s.screen);
@@ -51,6 +58,7 @@ const WorkspaceShell: React.FC = () => {
   const sceneAssetCount = useTwinStore((s) => s.scene.assets.length);
   const autoSaveEnabled = useTwinStore((s) => s.autoSaveEnabled);
   const streamRunning = useTelemetryStore((s) => s.streamRunning);
+  const telemetryLastUpdated = useTelemetryStore((s) => s.serverTime);
 
   // Detect dedicated new-tab Telemetry Dashboard mode (?mode=telemetry)
   const isStandaloneTelemetry = (() => {
@@ -72,7 +80,7 @@ const WorkspaceShell: React.FC = () => {
     if (params.get('mode') === 'telemetry') {
       const tab = params.get('tab') as any;
       useTelemetryStore.getState().openDashboard({
-        tab: tab && ['trends', 'equipment', 'define', 'relationships'].includes(tab) ? tab : 'trends',
+        tab: tab && ['trends', 'equipment', 'predictive', 'define', 'relationships'].includes(tab) ? tab : 'trends',
         assetId: params.get('assetId'),
         roomId: params.get('roomId'),
         sensorId: params.get('sensorId'),
@@ -95,8 +103,18 @@ const WorkspaceShell: React.FC = () => {
 
   // Keep GMP Compliance, Production Lines & Work Order store synced with scene assets
   useEffect(() => {
-    useGmpStore.getState().syncWithScene(useTwinStore.getState().scene);
+    const scene = useTwinStore.getState().scene;
+    useGmpStore.getState().syncWithScene(scene);
+    useRiskIncidentStore.getState().reconcileWithScene(scene, useGmpStore.getState().productionLines);
   }, [sceneId, sceneAssetCount]);
+
+  // Automatic telemetry alarm & drift incident logging into FMEA Risk Register
+  useEffect(() => {
+    if (!telemetryLastUpdated) return;
+    const tel = useTelemetryStore.getState();
+    const scene = useTwinStore.getState().scene;
+    useRiskIncidentStore.getState().syncTelemetryAnomalies(tel.sensors, tel.readings, scene);
+  }, [telemetryLastUpdated]);
 
   // Global Ctrl+K / Cmd+K Quick Search Shortcut (works from Hub and Workspace)
   useEffect(() => {
@@ -310,6 +328,8 @@ const WorkspaceShell: React.FC = () => {
     <>
       {screen === 'hub' ? (
         <ProjectHub />
+      ) : screen === 'datacenter' ? (
+        <DataCenterDesignerPage />
       ) : (
         <>
           {/* Dedicated Mobile Viewer-First Shell (< md) */}
@@ -462,6 +482,12 @@ const WorkspaceShell: React.FC = () => {
       <QrLabelStudioModal />
       <GmpOperationsModal />
       <AclGroupingModal />
+      <FlowInfoDialog />
+      <CadOcrWallModal />
+      <ResourceSchedulingModal />
+      <EntityInfoModal />
+      <RiskFmeaModal />
+      <AssetCompliancePdfModal />
 
       {/* Global Toast Notification with optional Undo */}
       {toast && (

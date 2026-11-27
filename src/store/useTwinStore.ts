@@ -5,12 +5,18 @@ import type {
   Building,
   DigitalTwinScene,
   EnterpriseNode,
+  EntityInfoTarget,
+  FacilityCategoryFilter,
   Floor,
   FlowRoute,
   FlowType,
   LayerDef,
   LocalSnapshot,
   MaterialDef,
+  MonitoringApiConnector,
+  NetworkInterRackLink,
+  NetworkTraceOverlay,
+  NetworkUserNode,
   ObjectLibraryItem,
   Opening,
   OpeningSubtype,
@@ -18,23 +24,31 @@ import type {
   ProposedAIAction,
   ReferencePlan,
   Room,
+  RoomHvacConfig,
   SceneCamera,
   SnapConfig,
   SpaceTypeTemplate,
   SpatialAsset,
   ToolMode,
+  TopologyMapState,
   TransformMode,
   UnitSystem,
   ValidationIssue,
   ViewMode,
   Wall,
   WallPresetId,
+  WorkspaceMode,
 } from '../types/twin';
+import { getEffectiveRoomHvac } from '../utils/hvac';
 import {
   createCinnaGenCampusScene,
   createTemplateScene,
+  enrichAssetHistory,
+  ensureDoorsForAllRooms,
+  ensureRoomsHaveCodesAndModels,
   generateWallsForRoom,
 } from '../data/cinnagenDemo';
+import { canCurrentUserEditSpatial } from './useAclStore';
 import { DEFAULT_MATERIALS, OPENING_PRESETS, WALL_PRESETS } from '../data/materialsLibrary';
 import { OBJECT_LIBRARY } from '../data/objectLibrary';
 import { SPACE_TYPE_LIBRARY } from '../data/spaceTypes';
@@ -142,12 +156,150 @@ function saveLocalAudit(projectId: string, entries: AuditLogEntry[]) {
   }
 }
 
+export function migrateSceneIntegrity(rawScene: DigitalTwinScene): DigitalTwinScene {
+  const scene = structuredClone(rawScene);
+
+  // 1. Guarantee every designed room has at least one door for Walk Mode NavMesh egress
+  scene.openings = ensureDoorsForAllRooms(scene.rooms, scene.walls, scene.openings);
+
+  // 2. Ensure all cameras are anchored to valid rooms (eliminate void/floating cameras)
+  const freshDemo = scene.id === 'proj-cinnagen-campus' ? createCinnaGenCampusScene() : null;
+  const hasOrphanedCameras = scene.cameras.some((c) => {
+    if (!c.roomId) return true;
+    return !scene.rooms.some((r) => r.id === c.roomId);
+  });
+
+  if (freshDemo && hasOrphanedCameras && scene.cameras.length <= 5) {
+    scene.cameras = freshDemo.cameras;
+  } else {
+    scene.cameras = scene.cameras.map((cam, idx) => {
+      const existingRoom = cam.roomId ? scene.rooms.find((r) => r.id === cam.roomId) : undefined;
+      if (existingRoom) return cam;
+
+      const floorRooms = scene.rooms.filter((r) => r.floorId === cam.floorId);
+      const containingRoom = floorRooms.find(
+        (r) =>
+          cam.target[0] >= r.x &&
+          cam.target[0] <= r.x + r.width &&
+          cam.target[2] >= r.z &&
+          cam.target[2] <= r.z + r.depth
+      );
+      if (containingRoom) {
+        return { ...cam, roomId: containingRoom.id };
+      }
+      const fallbackRoom = floorRooms[idx % Math.max(1, floorRooms.length)] ?? scene.rooms[0];
+      if (!fallbackRoom) return cam;
+      const fl = scene.floors.find((f) => f.id === fallbackRoom.floorId);
+      const elev = fl?.elevation ?? 0;
+      const cx = Number((fallbackRoom.x + fallbackRoom.width * 0.5).toFixed(2));
+      const cz = Number((fallbackRoom.z + fallbackRoom.depth * 0.5).toFixed(2));
+      const px = Number((fallbackRoom.x + Math.min(0.8, fallbackRoom.width * 0.14)).toFixed(2));
+      const pz = Number((fallbackRoom.z + Math.min(0.8, fallbackRoom.depth * 0.14)).toFixed(2));
+      return {
+        ...cam,
+        floorId: fallbackRoom.floorId,
+        roomId: fallbackRoom.id,
+        position: [px, Number((elev + Math.min(2.9, fallbackRoom.height - 0.5)).toFixed(2)), pz],
+        target: [cx, Number((elev + 1.2).toFixed(2)), cz],
+      };
+    });
+  }
+
+  // 3. Ensure IT Network Architecture & Floor IDF Distribution Racks are seeded
+  if (freshDemo) {
+    for (const idfId of ['ast-idf-a0', 'ast-idf-b1']) {
+      if (!scene.assets.some((a) => a.id === idfId)) {
+        const seedAsset = freshDemo.assets.find((a) => a.id === idfId);
+        if (seedAsset) scene.assets.push(seedAsset);
+      }
+    }
+    // Upgrade legacy DC/NET racks if missing rackRole, NAS storage bays, or hypervisor workloads
+    for (const demoRack of freshDemo.assets.filter((a) => a.rackConfig)) {
+      const existing = scene.assets.find((a) => a.id === demoRack.id);
+      if (existing && existing.rackConfig) {
+        if (!existing.rackConfig.rackRole) {
+          existing.rackConfig = structuredClone(demoRack.rackConfig);
+        } else if (demoRack.id === 'ast-it-rack-1' && demoRack.rackConfig) {
+          const demoNas = demoRack.rackConfig.devices.find((d) => d.id === 'dev-nas-1');
+          if (demoNas && !existing.rackConfig.devices.some((d) => d.id === 'dev-nas-1')) {
+            existing.rackConfig.devices.push(structuredClone(demoNas));
+            const demoCab = demoRack.rackConfig.cables.find((c) => c.id === 'cab-4');
+            if (demoCab && !existing.rackConfig.cables.some((c) => c.id === 'cab-4')) {
+              existing.rackConfig.cables.push(structuredClone(demoCab));
+            }
+          }
+          const demoSrv1 = demoRack.rackConfig.devices.find((d) => d.id === 'dev-srv-1');
+          const exSrv1 = existing.rackConfig.devices.find((d) => d.id === 'dev-srv-1');
+          if (demoSrv1 && exSrv1 && !exSrv1.workloads) {
+            exSrv1.workloads = structuredClone(demoSrv1.workloads);
+            exSrv1.hypervisorVersion = demoSrv1.hypervisorVersion;
+            exSrv1.memPct = demoSrv1.memPct;
+            exSrv1.uptimeLabel = demoSrv1.uptimeLabel;
+          }
+          const demoSw1 = demoRack.rackConfig.devices.find((d) => d.id === 'dev-sw-1');
+          const exSw1 = existing.rackConfig.devices.find((d) => d.id === 'dev-sw-1');
+          if (demoSw1 && exSw1 && !exSw1.ports.some((p) => p.id === 'p-7')) {
+            const p7 = demoSw1.ports.find((p) => p.id === 'p-7');
+            const p8 = demoSw1.ports.find((p) => p.id === 'p-8');
+            if (p7) exSw1.ports.push(structuredClone(p7));
+            if (p8) exSw1.ports.push(structuredClone(p8));
+            exSw1.uptimeLabel = exSw1.uptimeLabel ?? demoSw1.uptimeLabel;
+            exSw1.memPct = exSw1.memPct ?? demoSw1.memPct;
+          }
+        }
+      }
+    }
+    if (!scene.networkArchitecture || scene.networkArchitecture.userNodes.length === 0) {
+      scene.networkArchitecture = freshDemo.networkArchitecture;
+    } else if (!scene.networkArchitecture.topologyMap && freshDemo.networkArchitecture?.topologyMap) {
+      scene.networkArchitecture.topologyMap = structuredClone(freshDemo.networkArchitecture.topologyMap);
+    }
+  } else if (!scene.networkArchitecture) {
+    scene.networkArchitecture = {
+      userNodes: [],
+      interRackLinks: [],
+      monitoringApis: [
+        {
+          id: 'mon-prom-default',
+          name: 'Facility Prometheus + SNMP Exporter',
+          provider: 'Prometheus',
+          endpointUrl: 'https://prometheus.facility.local/api/v1/query',
+          authType: 'bearer',
+          pollIntervalSec: 15,
+          enabled: false,
+          lastStatus: 'idle',
+          mappedMetrics: ['ifHCInOctets', 'ifInErrors', 'poeWatts', 'deviceTempC'],
+        },
+      ],
+    };
+  }
+
+  // 4. Guarantee every room across all floors has a room number & 3D model, and every device has SOP/vendor/owner/cost-center history
+  ensureRoomsHaveCodesAndModels(scene);
+  scene.assets = scene.assets.map((a) => enrichAssetHistory(a));
+  scene.openings = ensureDoorsForAllRooms(scene.rooms, scene.walls, scene.openings);
+
+  // 5. Ensure multi-floor flows are seeded on the CinnaGen campus sample
+  if (freshDemo && scene.flows.length < freshDemo.flows.length) {
+    const existingIds = new Set(scene.flows.map((f) => f.id));
+    for (const flw of freshDemo.flows) {
+      if (!existingIds.has(flw.id)) {
+        scene.flows.push(flw);
+      }
+    }
+  }
+
+  return scene;
+}
+
 function loadLocalProjects(): DigitalTwinScene[] {
   try {
     const raw = localStorage.getItem(LOCAL_PROJECTS_KEY);
     if (!raw) return [createCinnaGenCampusScene()];
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed.map((p: DigitalTwinScene) => migrateSceneIntegrity(p));
+    }
     return [createCinnaGenCampusScene()];
   } catch {
     return [createCinnaGenCampusScene()];
@@ -187,9 +339,45 @@ export interface SplitLayoutState {
   ratio: number; // 0.2 .. 0.8
 }
 
+export interface CadOcrPlanPayload {
+  sourceName: string;
+  replaceExisting: boolean;
+  footprintWidthM: number;
+  footprintDepthM: number;
+  wallHeightM: number;
+  walls: {
+    x1: number;
+    z1: number;
+    x2: number;
+    z2: number;
+    presetId?: WallPresetId;
+    name?: string;
+    isExterior?: boolean;
+  }[];
+  rooms?: {
+    name: string;
+    code?: string;
+    x: number;
+    z: number;
+    width: number;
+    depth: number;
+    spaceTypeId?: string;
+  }[];
+  openings?: {
+    wallIndex: number;
+    offsetRatio: number;
+    kind: 'door' | 'window';
+    subtype?: OpeningSubtype;
+    width?: number;
+    height?: number;
+    sillHeight?: number;
+    name?: string;
+  }[];
+}
+
 interface TwinState {
   // App-level mode
-  screen: 'hub' | 'workspace';
+  screen: 'hub' | 'workspace' | 'datacenter';
   theme: 'dark' | 'light';
   canvasBackdrop: 'dark' | 'light';
   savedProjects: DigitalTwinScene[];
@@ -211,6 +399,8 @@ interface TwinState {
   renderStyle: RenderStyle;
 
   // View & tool controls
+  workspaceMode: WorkspaceMode;
+  categoryFilter: FacilityCategoryFilter;
   viewMode: ViewMode;
   orthoPreset: OrthoPreset;
   activeTool: ToolMode;
@@ -232,7 +422,15 @@ interface TwinState {
   lightingMode: 'day' | 'night';
   splitLayout: SplitLayoutState;
   animateFlows: boolean;
+  showFlows: boolean;
+  isolatedFlowId: string | null;
+  hiddenFlowIds: string[];
+  activeFlowInfoId: string | null;
   showFlowLegend: boolean;
+  showRoomPins: boolean;
+  showHvacOverlay: boolean;
+  hvacAhuFilter: string;
+  showFmeaIndicators: boolean;
   editingFlowId: string | null;
 
   // Panels & UI
@@ -246,6 +444,8 @@ interface TwinState {
   showXRModal: boolean;
   showOnboarding: boolean;
   showAIPlannerModal: boolean;
+  showCadOcrModal: boolean;
+  cadOcrReferenceId: string | null;
   showModelsGallery: boolean;
   showQuickSearch: boolean;
   showMayaChat: boolean;
@@ -300,11 +500,34 @@ interface TwinState {
   pendingAIActions: ProposedAIAction[];
   aiPreviewMessage: string | null;
 
+  // Universal Entity Info Dialog & WebXR VR Immersion state
+  entityInfoTarget: EntityInfoTarget;
+  entityInfoAutoEligibility: boolean;
+  vrSessionActive: boolean;
+  vrMode: 'off' | 'webxr' | 'stereo-preview';
+  vrToggleNonce: number;
+
+  // IT Port & Cable End-to-End Trace Overlay (2D & 3D)
+  activeNetworkTrace: NetworkTraceOverlay | null;
+
+  // Physical QR Scan Instant Highlight Beacon (2D & 3D)
+  qrHighlight: {
+    entityType: 'asset' | 'room';
+    entityId: string;
+    code: string;
+    label: string;
+    floorId: string;
+    x: number;
+    z: number;
+    scannedAt: number;
+  } | null;
+
   // Toast
   toast: ToastNotice | null;
 
   // Actions
-  setScreen: (screen: 'hub' | 'workspace') => void;
+  setScreen: (screen: 'hub' | 'workspace' | 'datacenter') => void;
+  openDataCenterPage: (assetId?: string | null) => void;
   toggleTheme: () => void;
   toggleCanvasBackdrop: () => void;
   openProject: (project: DigitalTwinScene) => void;
@@ -324,6 +547,8 @@ interface TwinState {
   redo: () => void;
 
   // Tools & Views
+  setWorkspaceMode: (mode: WorkspaceMode) => void;
+  setCategoryFilter: (filter: FacilityCategoryFilter) => void;
   setViewMode: (mode: ViewMode) => void;
   setOrthoPreset: (preset: OrthoPreset) => void;
   setActiveTool: (tool: ToolMode) => void;
@@ -344,7 +569,16 @@ interface TwinState {
   toggleLightingMode: () => void;
   updateSplitLayout: (patch: Partial<SplitLayoutState>) => void;
   setAnimateFlows: (animate: boolean) => void;
+  setShowFlows: (show: boolean) => void;
+  toggleFlowVisibility: (flowId: string) => void;
+  isolateFlow: (flowId: string | null) => void;
+  setActiveFlowInfoId: (flowId: string | null) => void;
   setShowFlowLegend: (show: boolean) => void;
+  setShowRoomPins: (show: boolean) => void;
+  setShowHvacOverlay: (show: boolean) => void;
+  setHvacAhuFilter: (ahuId: string) => void;
+  setShowFmeaIndicators: (show: boolean) => void;
+  walkInsideRoom: (roomId: string) => void;
   setEditingFlowId: (flowId: string | null) => void;
   setUnitSystem: (unit: UnitSystem) => void;
   updateSnap: (patch: Partial<SnapConfig>) => void;
@@ -360,6 +594,9 @@ interface TwinState {
   setShowXRModal: (open: boolean) => void;
   setShowOnboarding: (open: boolean) => void;
   setShowAIPlannerModal: (open: boolean) => void;
+  setShowCadOcrModal: (open: boolean) => void;
+  openCadOcrForReference: (refId: string) => void;
+  importCadOcrPlan: (payload: CadOcrPlanPayload, options?: { switchToViewMode?: ViewMode }) => void;
   setShowModelsGallery: (open: boolean) => void;
   setShowQuickSearch: (open: boolean) => void;
   setShowMayaChat: (open: boolean) => void;
@@ -417,6 +654,7 @@ interface TwinState {
 
   addRoom: (x: number, z: number, width: number, depth: number, spaceTypeId?: string, customName?: string) => Room;
   updateRoom: (id: string, patch: Partial<Room>) => void;
+  updateRoomHvac: (roomId: string, patch: Partial<RoomHvacConfig>) => void;
 
   addWall: (x1: number, z1: number, x2: number, z2: number, presetId?: WallPresetId) => Wall;
   updateWall: (id: string, patch: Partial<Wall>) => void;
@@ -439,6 +677,14 @@ interface TwinState {
   deleteCamera: (id: string) => void;
   flyToCamera: (position: [number, number, number], target: [number, number, number], fov?: number) => void;
   focusEntity: (entity: SelectedEntity) => void;
+  highlightScannedEntity: (opts: {
+    entityType: 'asset' | 'room';
+    entityId: string;
+    code: string;
+    label: string;
+    preferredView?: 'current' | '3d' | '2d';
+  }) => void;
+  clearQrHighlight: () => void;
 
   addReferencePlan: (ref: Omit<ReferencePlan, 'id'>) => ReferencePlan;
   updateReferencePlan: (id: string, patch: Partial<ReferencePlan>) => void;
@@ -454,6 +700,23 @@ interface TwinState {
   addFlowRoute: (flow: Omit<FlowRoute, 'id'>) => FlowRoute;
   updateFlowRoute: (id: string, patch: Partial<FlowRoute>) => void;
   deleteFlowRoute: (id: string) => void;
+
+  // Data Center & IT Network Architecture CRUD
+  addNetworkUserNode: (node: Omit<NetworkUserNode, 'id'>) => NetworkUserNode | null;
+  updateNetworkUserNode: (id: string, patch: Partial<NetworkUserNode>) => void;
+  deleteNetworkUserNode: (id: string) => void;
+  addInterRackLink: (link: Omit<NetworkInterRackLink, 'id'>) => NetworkInterRackLink | null;
+  updateInterRackLink: (id: string, patch: Partial<NetworkInterRackLink>) => void;
+  deleteInterRackLink: (id: string) => void;
+  updateTopologyMap: (updater: (prev: TopologyMapState | undefined) => TopologyMapState, label?: string) => void;
+  upsertMonitoringConnector: (connector: MonitoringApiConnector) => void;
+  deleteMonitoringConnector: (id: string) => void;
+  addDistributionRackToRoom: (
+    floorId: string,
+    roomId: string | undefined,
+    rackName: string,
+    role: 'core-dc' | 'distribution-idf' | 'access-closet'
+  ) => SpatialAsset | null;
 
   // 5D & Analytics
   setTimelineDate: (date: string) => void;
@@ -472,8 +735,21 @@ interface TwinState {
 
   // AI Copilot
   setPendingAIActions: (actions: ProposedAIAction[], message: string | null) => void;
-  applyPendingAIActions: () => void;
+  applyPendingAIActions: (opts?: { customComment?: string }) => {
+    createdEntities: { type: 'room' | 'asset' | 'camera' | 'flow'; id: string; code: string; name: string }[];
+    appliedCount: number;
+  };
   clearPendingAIActions: () => void;
+
+  // Entity Info Dialog & WebXR VR Immersion
+  openEntityInfo: (target: NonNullable<EntityInfoTarget>, opts?: { autoEligibility?: boolean }) => void;
+  closeEntityInfo: () => void;
+  requestVrToggle: () => void;
+  setVrSessionState: (active: boolean, mode: 'off' | 'webxr' | 'stereo-preview') => void;
+
+  // IT Network Port & Cable Trace Overlay
+  startNetworkTrace: (trace: NetworkTraceOverlay, mode: '2d' | '3d') => void;
+  clearNetworkTrace: () => void;
 
   // Toasts
   showToast: (message: string, tone?: ToastNotice['tone'], canUndo?: boolean) => void;
@@ -500,11 +776,37 @@ export const useTwinStore = create<TwinState>((set, get) => {
     return next;
   };
 
+  const guardEditable = (): boolean => {
+    if (get().workspaceMode === 'view') {
+      set({
+        toast: {
+          id: `t-${Date.now()}`,
+          message: 'View Mode active — switch to Design Mode to move or edit objects.',
+          tone: 'warning',
+        },
+      });
+      return false;
+    }
+    if (!canCurrentUserEditSpatial()) {
+      set({
+        toast: {
+          id: `t-${Date.now()}`,
+          message: 'ACL Read-Only — your active role does not have spatial edit permission.',
+          tone: 'warning',
+        },
+      });
+      return false;
+    }
+    return true;
+  };
+
   const commit = (
     updater: (draft: DigitalTwinScene) => DigitalTwinScene,
     toastMsg?: string,
-    auditMeta?: Omit<AuditLogEntry, 'id' | 'timestamp' | 'actor'>
+    auditMeta?: Omit<AuditLogEntry, 'id' | 'timestamp' | 'actor'>,
+    bypassReadOnly = false
   ) => {
+    if (!bypassReadOnly && !guardEditable()) return;
     const prev = get().scene;
     const next = updater(structuredClone(prev));
     next.updatedAt = new Date().toISOString();
@@ -558,6 +860,8 @@ export const useTwinStore = create<TwinState>((set, get) => {
     showAllFloors: false,
     renderStyle: 'realistic',
 
+    workspaceMode: 'design',
+    categoryFilter: 'all',
     viewMode: '3d-perspective',
     orthoPreset: 'isometric',
     activeTool: 'select',
@@ -579,7 +883,15 @@ export const useTwinStore = create<TwinState>((set, get) => {
     lightingMode: 'day',
     splitLayout: { orientation: 'horizontal', flipped: false, ratio: 0.48 },
     animateFlows: true,
+    showFlows: true,
+    isolatedFlowId: null,
+    hiddenFlowIds: [],
+    activeFlowInfoId: null,
     showFlowLegend: true,
+    showRoomPins: true,
+    showHvacOverlay: false,
+    hvacAhuFilter: 'all',
+    showFmeaIndicators: true,
     editingFlowId: null,
 
     leftTab: 'hierarchy',
@@ -592,6 +904,8 @@ export const useTwinStore = create<TwinState>((set, get) => {
     showXRModal: false,
     showOnboarding: false,
     showAIPlannerModal: false,
+    showCadOcrModal: false,
+    cadOcrReferenceId: null,
     showModelsGallery: false,
     showQuickSearch: false,
     showMayaChat: false,
@@ -599,6 +913,8 @@ export const useTwinStore = create<TwinState>((set, get) => {
     activeLiveCameraId: null,
     showNetworkRackModal: false,
     activeRackAssetId: null,
+    activeNetworkTrace: null,
+    qrHighlight: null,
     showSaveValidationModal: false,
     autoSaveEnabled: (() => {
       try {
@@ -650,6 +966,11 @@ export const useTwinStore = create<TwinState>((set, get) => {
 
     pendingAIActions: [],
     aiPreviewMessage: null,
+    entityInfoTarget: null,
+    entityInfoAutoEligibility: false,
+    vrSessionActive: false,
+    vrMode: 'off',
+    vrToggleNonce: 0,
     toast: null,
 
     setScreen: (screen) => set({ screen }),
@@ -665,7 +986,7 @@ export const useTwinStore = create<TwinState>((set, get) => {
       set((state) => ({ canvasBackdrop: state.canvasBackdrop === 'dark' ? 'light' : 'dark' })),
 
     openProject: (project) => {
-      const cloned = structuredClone(project);
+      const cloned = migrateSceneIntegrity(project);
       const bldgId = cloned.buildings[0]?.id ?? '';
       const flId = cloned.floors[0]?.id ?? '';
       set({
@@ -678,6 +999,7 @@ export const useTwinStore = create<TwinState>((set, get) => {
         activeFloorId: flId,
         selected: [],
         isolatedIds: [],
+        categoryFilter: 'all',
         analyticsMetric: 'none',
         validationIssues: runSpatialValidation(cloned),
         pendingAIActions: [],
@@ -761,6 +1083,7 @@ export const useTwinStore = create<TwinState>((set, get) => {
         set({
           drillLevel: 'campus',
           showAllFloors: true,
+          firstPersonMode: false,
           activeDepartmentId: null,
           activeRoomId: null,
           isolatedIds: [],
@@ -780,6 +1103,7 @@ export const useTwinStore = create<TwinState>((set, get) => {
           activeDepartmentId: null,
           activeRoomId: null,
           showAllFloors: true,
+          firstPersonMode: false,
           isolatedIds: [],
           isolatedAssetType: null,
           selected: [{ type: 'building', id: bldg.id }],
@@ -797,11 +1121,16 @@ export const useTwinStore = create<TwinState>((set, get) => {
           activeDepartmentId: null,
           activeRoomId: null,
           showAllFloors: false,
+          firstPersonMode: false,
           isolatedIds: [],
           isolatedAssetType: null,
           selected: [{ type: 'floor', id: fl.id }],
         });
-        get().flyToCamera([fl.width / 2, 22, fl.depth * 1.48], [fl.width / 2, fl.elevation + 1.2, fl.depth / 2], 45);
+        get().flyToCamera(
+          [fl.width / 2, fl.elevation + 22, fl.depth * 1.48],
+          [fl.width / 2, fl.elevation + 1.2, fl.depth / 2],
+          45
+        );
       } else if (level === 'department') {
         const deptId = entityId ?? get().activeDepartmentId;
         if (!deptId) return;
@@ -815,6 +1144,7 @@ export const useTwinStore = create<TwinState>((set, get) => {
           const maxZ = Math.max(...deptRooms.map((r) => r.z + r.depth));
           const cx = (minX + maxX) / 2;
           const cz = (minZ + maxZ) / 2;
+          const elev = fl?.elevation ?? 0;
           const deptAssetIds = scene.assets
             .filter((a) => deptRooms.some((r) => r.id === a.roomId))
             .map((a) => a.id);
@@ -825,10 +1155,11 @@ export const useTwinStore = create<TwinState>((set, get) => {
             activeDepartmentId: deptId,
             activeRoomId: null,
             showAllFloors: false,
+            firstPersonMode: false,
             isolatedAssetType: null,
             isolatedIds: [...deptRooms.map((r) => r.id), ...deptAssetIds],
           });
-          get().flyToCamera([cx + 12, 16, cz + 15], [cx, (fl?.elevation ?? 0) + 1.2, cz], 45);
+          get().flyToCamera([cx + 12, elev + 16, cz + 15], [cx, elev + 1.2, cz], 45);
         }
       } else if (level === 'room') {
         const rm = scene.rooms.find((r) => r.id === (entityId ?? get().activeRoomId));
@@ -841,6 +1172,7 @@ export const useTwinStore = create<TwinState>((set, get) => {
           activeDepartmentId: rm.departmentId,
           activeRoomId: rm.id,
           showAllFloors: false,
+          firstPersonMode: false,
           isolatedIds: [],
           isolatedAssetType: null,
           selected: [{ type: 'room', id: rm.id }],
@@ -848,8 +1180,9 @@ export const useTwinStore = create<TwinState>((set, get) => {
         const cx = rm.x + rm.width / 2;
         const cz = rm.z + rm.depth / 2;
         const elev = fl?.elevation ?? 0;
+        const span = Math.max(rm.width, rm.depth, 5);
         get().flyToCamera(
-          [cx + rm.width * 0.62, elev + Math.max(6.5, rm.width * 0.65), cz + rm.depth * 0.95],
+          [cx + Math.max(4.8, span * 0.65), elev + Math.max(6.2, span * 0.62), cz + Math.max(5.5, span * 0.85)],
           [cx, elev + 1.2, cz],
           44
         );
@@ -865,10 +1198,19 @@ export const useTwinStore = create<TwinState>((set, get) => {
           activeDepartmentId: rm?.departmentId ?? null,
           activeRoomId: rm?.id ?? null,
           showAllFloors: false,
+          firstPersonMode: false,
+          isolatedIds: [],
+          isolatedAssetType: null,
           selected: [{ type: 'asset', id: a.id }],
         });
         const elev = fl?.elevation ?? 0;
-        get().flyToCamera([a.x + 4.4, elev + Math.max(3.4, a.height + 1.8), a.z + 4.4], [a.x, elev + a.height / 2, a.z], 42);
+        const radius = Math.max(a.width, a.depth, 1.4);
+        const dist = Math.max(3.6, radius * 2.1);
+        get().flyToCamera(
+          [a.x + dist, elev + Math.max(3.0, a.height + 1.8), a.z + dist],
+          [a.x, elev + Math.max(0.6, a.height * 0.5), a.z],
+          42
+        );
       }
     },
 
@@ -898,13 +1240,42 @@ export const useTwinStore = create<TwinState>((set, get) => {
       });
     },
 
+    setWorkspaceMode: (workspaceMode) =>
+      set((s) => ({
+        workspaceMode,
+        activeTool: workspaceMode === 'view' ? 'select' : s.activeTool,
+        editingFlowId: workspaceMode === 'view' ? null : s.editingFlowId,
+        toast: {
+          id: `t-${Date.now()}`,
+          message:
+            workspaceMode === 'view'
+              ? 'View Mode enabled — all spatial editing & dragging locked'
+              : 'Design Mode enabled — full spatial editing unlocked',
+          tone: 'info',
+        },
+      })),
+    setCategoryFilter: (categoryFilter) =>
+      set({
+        categoryFilter,
+        toast:
+          categoryFilter === 'all'
+            ? null
+            : {
+                id: `t-${Date.now()}`,
+                message: `X-Ray Focus: ${categoryFilter} systems highlighted, non-matching zones ghosted`,
+                tone: 'info',
+              },
+      }),
     setViewMode: (viewMode) => set({ viewMode, firstPersonMode: false }),
     setOrthoPreset: (orthoPreset) => set({ orthoPreset, viewMode: '3d-ortho', firstPersonMode: false }),
-    setActiveTool: (activeTool) =>
+    setActiveTool: (activeTool) => {
+      const isReadOnlyTool = activeTool === 'select' || activeTool === 'measure';
+      if (!isReadOnlyTool && !guardEditable()) return;
       set({
         activeTool,
         measurePoints: activeTool === 'measure' ? [] : get().measurePoints,
-      }),
+      });
+    },
     setTransformMode: (transformMode) => set({ transformMode }),
     setSelectedSpaceTypeId: (selectedSpaceTypeId) => set({ selectedSpaceTypeId }),
     setSelectedObjectTemplateId: (selectedObjectTemplateId) => set({ selectedObjectTemplateId }),
@@ -977,7 +1348,67 @@ export const useTwinStore = create<TwinState>((set, get) => {
         splitLayout: { ...s.splitLayout, ...patch },
       })),
     setAnimateFlows: (animateFlows) => set({ animateFlows }),
+    setShowFlows: (showFlows) =>
+      set((s) => ({
+        showFlows,
+        isolatedFlowId: showFlows ? s.isolatedFlowId : null,
+      })),
+    toggleFlowVisibility: (flowId) =>
+      set((s) => {
+        const exists = s.hiddenFlowIds.includes(flowId);
+        const hiddenFlowIds = exists
+          ? s.hiddenFlowIds.filter((id) => id !== flowId)
+          : [...s.hiddenFlowIds, flowId];
+        return {
+          hiddenFlowIds,
+          isolatedFlowId: !exists && s.isolatedFlowId === flowId ? null : s.isolatedFlowId,
+        };
+      }),
+    isolateFlow: (flowId) =>
+      set((s) => {
+        const nextIsolated = s.isolatedFlowId === flowId ? null : flowId;
+        return {
+          isolatedFlowId: nextIsolated,
+          showFlows: nextIsolated ? true : s.showFlows,
+          hiddenFlowIds: nextIsolated
+            ? s.hiddenFlowIds.filter((id) => id !== nextIsolated)
+            : s.hiddenFlowIds,
+        };
+      }),
+    setActiveFlowInfoId: (activeFlowInfoId) => set({ activeFlowInfoId }),
     setShowFlowLegend: (showFlowLegend) => set({ showFlowLegend }),
+    setShowRoomPins: (showRoomPins) => set({ showRoomPins }),
+    setShowHvacOverlay: (showHvacOverlay) => set({ showHvacOverlay }),
+    setHvacAhuFilter: (hvacAhuFilter) => set({ hvacAhuFilter }),
+    setShowFmeaIndicators: (showFmeaIndicators) => set({ showFmeaIndicators }),
+    walkInsideRoom: (roomId) => {
+      const { scene } = get();
+      const rm = scene.rooms.find((r) => r.id === roomId);
+      if (!rm) return;
+      const fl = scene.floors.find((f) => f.id === rm.floorId);
+      const elev = fl?.elevation ?? 0;
+      const cx = rm.x + rm.width / 2;
+      const cz = rm.z + rm.depth / 2;
+      set({
+        activeBuildingId: fl?.buildingId ?? get().activeBuildingId,
+        activeFloorId: rm.floorId,
+        activeRoomId: rm.id,
+        viewMode: '3d-perspective',
+        firstPersonMode: true,
+        firstPersonTabletVisible: true,
+        selected: [{ type: 'room', id: rm.id }],
+        toast: {
+          id: `t-${Date.now()}`,
+          message: `Walk Inside: ${rm.code} — ${rm.name} (WASD to move, drag to look)`,
+          tone: 'info',
+        },
+      });
+      get().flyToCamera(
+        [cx - Math.min(1.8, rm.width * 0.22), elev + 1.68, cz + Math.min(2.2, rm.depth * 0.25)],
+        [cx + 1.2, elev + 1.55, cz - 1.2],
+        62
+      );
+    },
     setEditingFlowId: (editingFlowId) => set({ editingFlowId }),
     setUnitSystem: (unitSystem) =>
       commit(
@@ -1021,6 +1452,210 @@ export const useTwinStore = create<TwinState>((set, get) => {
     setShowXRModal: (showXRModal) => set({ showXRModal }),
     setShowOnboarding: (showOnboarding) => set({ showOnboarding }),
     setShowAIPlannerModal: (showAIPlannerModal) => set({ showAIPlannerModal }),
+    setShowCadOcrModal: (showCadOcrModal) =>
+      set((state) => ({
+        showCadOcrModal,
+        cadOcrReferenceId: showCadOcrModal ? state.cadOcrReferenceId : null,
+      })),
+    openCadOcrForReference: (refId) =>
+      set({
+        cadOcrReferenceId: refId,
+        showCadOcrModal: true,
+      }),
+    importCadOcrPlan: (payload, options) => {
+      const { activeFloorId, timelineDate } = get();
+      const stamp = Date.now();
+      let createdWallCount = 0;
+      let createdRoomCount = 0;
+      let createdOpeningCount = 0;
+
+      commit(
+        (draft) => {
+          const floor = draft.floors.find((f) => f.id === activeFloorId);
+          if (!floor) return draft;
+
+          const targetW = Math.max(8, Math.min(180, Number(payload.footprintWidthM) || floor.width));
+          const targetD = Math.max(8, Math.min(180, Number(payload.footprintDepthM) || floor.depth));
+          const wallH = Math.max(2.4, Math.min(9, Number(payload.wallHeightM) || floor.height || 3.6));
+
+          if (payload.replaceExisting) {
+            draft.walls = draft.walls.filter((w) => w.floorId !== activeFloorId);
+            draft.openings = draft.openings.filter((o) => o.floorId !== activeFloorId);
+            draft.rooms = draft.rooms.filter((r) => r.floorId !== activeFloorId);
+            draft.assets = draft.assets.filter((a) => a.floorId !== activeFloorId);
+            draft.flows = draft.flows.filter((fl) => fl.floorId !== activeFloorId);
+            floor.width = Math.max(floor.width, targetW + 2, 18);
+            floor.depth = Math.max(floor.depth, targetD + 2, 14);
+            floor.height = wallH;
+            // Keep imported CAD reference blueprint subtly visible under the new 3D walls
+            draft.references = draft.references.map((rp) =>
+              rp.floorId === activeFloorId ? { ...rp, visible: true, opacity: Math.min(rp.opacity, 0.35) } : rp
+            );
+          } else {
+            floor.width = Math.max(floor.width, targetW + 2);
+            floor.depth = Math.max(floor.depth, targetD + 2);
+          }
+
+          const createdWallIds: string[] = [];
+          const createdWalls: Wall[] = [];
+
+          (payload.walls || []).forEach((w, idx) => {
+            const len = Math.hypot(w.x2 - w.x1, w.z2 - w.z1);
+            if (!Number.isFinite(len) || len < 0.25) return;
+            const preset =
+              WALL_PRESETS.find((p) => p.id === (w.presetId || (w.isExterior ? 'exterior-structural' : 'interior-standard'))) ??
+              WALL_PRESETS[0];
+            const wallId = `w-ocr-${stamp}-${idx}`;
+            const wallObj: Wall = {
+              id: wallId,
+              floorId: activeFloorId,
+              name: w.name || `CAD Wall ${idx + 1}`,
+              x1: Number(w.x1.toFixed(2)),
+              z1: Number(w.z1.toFixed(2)),
+              x2: Number(w.x2.toFixed(2)),
+              z2: Number(w.z2.toFixed(2)),
+              height: wallH,
+              thickness: preset.thickness,
+              elevation: 0,
+              presetId: preset.id,
+              isExterior: w.isExterior ?? preset.isExterior,
+              isStructural: preset.isStructural,
+              fireRating: preset.fireRating,
+              acousticRatingDb: preset.acousticRatingDb,
+              materialId: preset.materialId,
+              color: preset.color,
+              opacity: preset.opacity,
+              layerId: 'layer-walls',
+              activeFromDate: timelineDate,
+            };
+            draft.walls.push(wallObj);
+            createdWallIds.push(wallId);
+            createdWalls.push(wallObj);
+            createdWallCount++;
+          });
+
+          const defaultDept = draft.hierarchy.find((n) => n.level === 'department')?.id ?? 'dept-mfg';
+          (payload.rooms || []).forEach((r, idx) => {
+            if (!Number.isFinite(r.width) || !Number.isFinite(r.depth) || r.width < 1 || r.depth < 1) return;
+            const tpl =
+              SPACE_TYPE_LIBRARY.find((s) => s.id === r.spaceTypeId) ??
+              SPACE_TYPE_LIBRARY.find((s) =>
+                r.name.toLowerCase().includes('lab')
+                  ? s.category === 'Quality & Laboratories'
+                  : r.name.toLowerCase().includes('office') || r.name.toLowerCase().includes('loft') || r.name.toLowerCase().includes('living')
+                    ? s.category === 'Offices & Administration'
+                    : r.name.toLowerCase().includes('warehouse') || r.name.toLowerCase().includes('storage')
+                      ? s.category === 'Warehouses & Logistics'
+                      : s.category === 'Cleanrooms'
+              ) ??
+              SPACE_TYPE_LIBRARY[0];
+            const rmCode = r.code?.trim() || `RM-${String(draft.rooms.length + 101)}`;
+            const roomObj: Room = {
+              id: `rm-ocr-${stamp}-${idx}`,
+              floorId: activeFloorId,
+              departmentId: defaultDept,
+              name: r.name || `Zone ${idx + 1}`,
+              code: rmCode,
+              spaceTypeId: tpl.id,
+              category: tpl.category,
+              x: Number(r.x.toFixed(2)),
+              z: Number(r.z.toFixed(2)),
+              width: Number(r.width.toFixed(2)),
+              depth: Number(r.depth.toFixed(2)),
+              height: wallH,
+              color: tpl.color,
+              floorMaterialId: tpl.defaultFloorMaterialId,
+              wallMaterialId: tpl.defaultWallMaterialId,
+              ceilingMaterialId: tpl.defaultCeilingMaterialId,
+              layerId: 'layer-architecture',
+              environmental: { ...tpl.environmental },
+              occupancyMax: Math.max(2, Math.round((r.width * r.depth) / 10)),
+              currentOccupancy: 1,
+              utilizationPct: 68,
+              riskLevel: 'low',
+              complianceStatus: 'compliant',
+              energyKw: Number(((r.width * r.depth) * 0.08).toFixed(1)),
+              costPerSqm: tpl.costPerSqm,
+              activeFromDate: timelineDate,
+              metadata: {
+                code: rmCode,
+                description: `Extracted via CAD/SVG OCR from ${payload.sourceName}`,
+                status: 'operational',
+                tags: ['CAD-OCR', payload.sourceName],
+                owner: 'Facility Engineering',
+                department: 'Architecture',
+                accessPermission: 'restricted',
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                revision: 1,
+                customProperties: { Source: payload.sourceName },
+                linkedDocuments: [],
+                relatedSystems: [],
+                relatedProcesses: [],
+              },
+            };
+            draft.rooms.push(roomObj);
+            createdRoomCount++;
+          });
+
+          (payload.openings || []).forEach((op, idx) => {
+            const hostWall = createdWalls[op.wallIndex];
+            if (!hostWall) return;
+            const defaultSubtype: OpeningSubtype =
+              op.subtype ?? (op.kind === 'window' ? 'double-glazing' : 'glass-door');
+            const preset =
+              OPENING_PRESETS.find((p) => p.subtype === defaultSubtype) ??
+              OPENING_PRESETS.find((p) => p.kind === op.kind) ??
+              OPENING_PRESETS[0];
+            draft.openings.push({
+              id: `op-ocr-${stamp}-${idx}`,
+              floorId: activeFloorId,
+              wallId: hostWall.id,
+              kind: op.kind,
+              subtype: preset.subtype,
+              name: op.name || `${preset.name} ${idx + 1}`,
+              offsetRatio: Math.max(0.12, Math.min(0.88, op.offsetRatio ?? 0.5)),
+              width: op.width ?? preset.width,
+              height: op.height ?? preset.height,
+              sillHeight: op.sillHeight ?? preset.sillHeight,
+              thickness: hostWall.thickness + 0.04,
+              swingDirection: preset.swingDirection,
+              swingAngle: 90,
+              materialId: op.kind === 'window' ? 'mat-glass-cleanroom' : 'mat-cleanroom-panel',
+              frameColor: preset.frameColor,
+              lockType: op.kind === 'door' ? 'Architectural Lever' : 'Fixed Glazing',
+              accessControl: preset.accessControl,
+              fireRating: preset.fireRating,
+              status: 'closed',
+              layerId: 'layer-openings',
+            });
+            createdOpeningCount++;
+          });
+
+          return draft;
+        },
+        `Imported ${createdWallCount} walls, ${createdRoomCount} rooms & ${createdOpeningCount} openings from ${payload.sourceName}`,
+        {
+          category: 'wall-opening',
+          action: 'Imported CAD / SVG OCR Plan',
+          summary: `Generated ${createdWallCount} walls, ${createdRoomCount} rooms, ${createdOpeningCount} openings from ${payload.sourceName}`,
+        }
+      );
+
+      set((state) => ({
+        showCadOcrModal: false,
+        cadOcrReferenceId: null,
+        viewMode: options?.switchToViewMode ?? state.viewMode,
+      }));
+      const fl = get().scene.floors.find((f) => f.id === activeFloorId);
+      if (fl) {
+        get().flyToCamera(
+          [fl.width * 0.5, Math.max(18, fl.width * 0.85), fl.depth * 1.45],
+          [fl.width * 0.5, fl.elevation + 1.2, fl.depth * 0.5],
+          44
+        );
+      }
+    },
     setShowModelsGallery: (showModelsGallery) => set({ showModelsGallery }),
     setShowQuickSearch: (showQuickSearch) => set({ showQuickSearch }),
     setShowMayaChat: (showMayaChat) => set({ showMayaChat }),
@@ -1042,6 +1677,22 @@ export const useTwinStore = create<TwinState>((set, get) => {
         );
       set({
         showNetworkRackModal: true,
+        activeRackAssetId: target?.id ?? null,
+      });
+    },
+    openDataCenterPage: (assetId) => {
+      const { scene } = get();
+      const target =
+        (assetId ? scene.assets.find((a) => a.id === assetId) : null) ??
+        scene.assets.find(
+          (a) =>
+            a.category === 'IT & Data Center' ||
+            a.rackConfig ||
+            ['server-rack', 'network-rack', 'patch-cabinet', 'pdu-cabinet', 'ups-tower'].includes(a.archetype)
+        );
+      set({
+        screen: 'datacenter',
+        showNetworkRackModal: false,
         activeRackAssetId: target?.id ?? null,
       });
     },
@@ -1942,8 +2593,17 @@ export const useTwinStore = create<TwinState>((set, get) => {
         allSpaceTypes.find((s) => s.id === (spaceTypeId ?? selectedSpaceTypeId)) ??
         allSpaceTypes[0];
       const id = `rm-${Date.now()}`;
-      const roomCount = scene.rooms.filter((r) => r.floorId === activeFloorId).length + 1;
-      const code = `RM-${String(roomCount).padStart(3, '0')}`;
+      const fl = scene.floors.find((f) => f.id === activeFloorId);
+      const flPrefix = (fl?.code || 'RM').replace(/[^A-Z0-9]/gi, '').toUpperCase() || 'RM';
+      const baseNum = (fl?.levelIndex ?? 0) === 0 ? 101 : 201 + ((fl?.levelIndex ?? 1) - 1) * 100;
+      const roomCount = scene.rooms.filter((r) => r.floorId === activeFloorId).length;
+      const usedCodes = new Set(scene.rooms.map((r) => r.code));
+      let seq = baseNum + roomCount;
+      let code = `${flPrefix}-${seq}`;
+      while (usedCodes.has(code)) {
+        seq += 1;
+        code = `${flPrefix}-${seq}`;
+      }
 
       const newRoom: Room = {
         id,
@@ -1993,8 +2653,9 @@ export const useTwinStore = create<TwinState>((set, get) => {
       commit((draft) => {
         draft.rooms.push(newRoom);
         draft.walls.push(...generateWallsForRoom(newRoom, id));
+        draft.openings = ensureDoorsForAllRooms(draft.rooms, draft.walls, draft.openings);
         return draft;
-      }, `Created room "${newRoom.name}" (${newRoom.width}×${newRoom.depth} m)`);
+      }, `Created room "${newRoom.name}" (${newRoom.width}×${newRoom.depth} m) with egress door`);
 
       set({ selected: [{ type: 'room', id }] });
       get().completeOnboardingStep(4);
@@ -2032,6 +2693,46 @@ export const useTwinStore = create<TwinState>((set, get) => {
         }
         return draft;
       });
+    },
+
+    updateRoomHvac: (roomId, patch) => {
+      commit(
+        (draft) => {
+          const rm = draft.rooms.find((r) => r.id === roomId);
+          if (!rm) return draft;
+          const current = getEffectiveRoomHvac(rm);
+          const nextStatus = patch.systemStatus ?? patch.status ?? current.status;
+          const nextHvac: RoomHvacConfig = {
+            ...current,
+            ...patch,
+            status: nextStatus,
+            systemStatus: nextStatus,
+          };
+          rm.environmental = {
+            ...rm.environmental,
+            hvac: nextHvac,
+            ...(patch.targetPressurePa !== undefined ? { pressurePa: patch.targetPressurePa } : {}),
+            ...(patch.airChangesPerHour !== undefined ? { airChangesPerHour: patch.airChangesPerHour } : {}),
+            ...(patch.supplyTempC !== undefined ? { temperatureC: patch.supplyTempC } : {}),
+          };
+          if (nextStatus === 'alarm') {
+            rm.complianceStatus = 'deviation';
+          } else if (nextStatus === 'maintenance') {
+            rm.complianceStatus = 'review-due';
+          } else if ((nextStatus === 'online' || nextStatus === 'running') && rm.complianceStatus === 'deviation') {
+            rm.complianceStatus = 'compliant';
+          }
+          return draft;
+        },
+        'Updated room HVAC configuration',
+        {
+          category: 'spatial',
+          action: 'Updated Room HVAC',
+          entityType: 'room',
+          entityId: roomId,
+          summary: `Updated HVAC parameters (${Object.keys(patch).join(', ')})`,
+        }
+      );
     },
 
     addWall: (x1, z1, x2, z2, presetId) => {
@@ -2268,17 +2969,19 @@ export const useTwinStore = create<TwinState>((set, get) => {
         relatedProcesses: [],
         ...opts,
       };
+      const enrichedAsset = enrichAssetHistory(newAsset);
 
       commit((draft) => {
-        draft.assets.push(newAsset);
+        draft.assets.push(enrichedAsset);
         return draft;
-      }, `Placed ${newAsset.name}`);
+      }, `Placed ${enrichedAsset.name}`);
       set({ selected: [{ type: 'asset', id }] });
       get().completeOnboardingStep(6);
-      return newAsset;
+      return enrichedAsset;
     },
 
     updateAsset: (id, patch, recordHistory = true) => {
+      if (!guardEditable()) return;
       if (!recordHistory) {
         set((s) => {
           const next = structuredClone(s.scene);
@@ -2460,48 +3163,100 @@ export const useTwinStore = create<TwinState>((set, get) => {
       }, 'Deleted camera'),
 
     flyToCamera: (position, target, fov) =>
-      set({
-        cameraCommand: { id: Date.now(), position, target, fov },
-      }),
+      set((state) => ({
+        cameraCommand: {
+          id: Math.max(Date.now(), (state.cameraCommand?.id ?? 0) + 1),
+          position,
+          target,
+          fov,
+        },
+      })),
 
     focusEntity: (entity) => {
-      const { scene } = get();
-      set({ selected: [entity] });
+      const { scene, activeBuildingId } = get();
       if (entity.type === 'room') {
-        const r = scene.rooms.find((x) => x.id === entity.id);
-        if (r) {
-          set({ activeFloorId: r.floorId });
-          const cx = r.x + r.width / 2;
-          const cz = r.z + r.depth / 2;
-          get().flyToCamera([cx + r.width * 0.7, Math.max(8, r.width * 0.8), cz + r.depth * 1.1], [cx, 1.2, cz]);
-        }
-      } else if (entity.type === 'asset') {
-        const a = scene.assets.find((x) => x.id === entity.id);
-        if (a) {
-          set({ activeFloorId: a.floorId });
-          get().flyToCamera([a.x + 5.5, 4.8, a.z + 5.5], [a.x, a.height / 2, a.z]);
-        }
-      } else if (entity.type === 'wall') {
+        get().drillInto('room', entity.id);
+        return;
+      }
+      if (entity.type === 'asset') {
+        get().drillInto('asset', entity.id);
+        return;
+      }
+      if (entity.type === 'floor') {
+        get().drillInto('floor', entity.id);
+        return;
+      }
+      if (entity.type === 'building') {
+        get().drillInto('building', entity.id);
+        return;
+      }
+      if (entity.type === 'wall') {
         const w = scene.walls.find((x) => x.id === entity.id);
         if (w) {
-          set({ activeFloorId: w.floorId });
+          const fl = scene.floors.find((f) => f.id === w.floorId);
+          const elev = fl?.elevation ?? 0;
+          set({
+            drillLevel: 'floor',
+            activeBuildingId: fl?.buildingId ?? activeBuildingId,
+            activeFloorId: w.floorId,
+            showAllFloors: false,
+            firstPersonMode: false,
+            isolatedIds: [],
+            isolatedAssetType: null,
+            selected: [entity],
+          });
           const cx = (w.x1 + w.x2) / 2;
           const cz = (w.z1 + w.z2) / 2;
-          get().flyToCamera([cx + 6, 5.5, cz + 6], [cx, w.height / 2, cz]);
+          const len = Math.hypot(w.x2 - w.x1, w.z2 - w.z1);
+          const dist = Math.max(4.8, len * 0.75);
+          get().flyToCamera([cx + dist, elev + Math.max(4.5, w.height + 1.8), cz + dist], [cx, elev + w.height / 2, cz], 44);
         }
-      } else if (entity.type === 'camera') {
+        return;
+      }
+      if (entity.type === 'opening') {
+        const op = scene.openings.find((x) => x.id === entity.id);
+        if (op) {
+          const fl = scene.floors.find((f) => f.id === op.floorId);
+          const elev = fl?.elevation ?? 0;
+          const w = scene.walls.find((x) => x.id === op.wallId);
+          set({
+            drillLevel: 'floor',
+            activeBuildingId: fl?.buildingId ?? activeBuildingId,
+            activeFloorId: op.floorId,
+            showAllFloors: false,
+            firstPersonMode: false,
+            isolatedIds: [],
+            isolatedAssetType: null,
+            selected: [entity],
+          });
+          if (w) {
+            const ox = w.x1 + (w.x2 - w.x1) * op.offsetRatio;
+            const oz = w.z1 + (w.z2 - w.z1) * op.offsetRatio;
+            const oy = elev + op.sillHeight + op.height / 2;
+            get().flyToCamera([ox + 3.8, elev + Math.max(3.2, op.height + 1.4), oz + 3.8], [ox, oy, oz], 42);
+          }
+        }
+        return;
+      }
+      if (entity.type === 'camera') {
         const c = scene.cameras.find((x) => x.id === entity.id);
         if (c) {
-          set({ activeFloorId: c.floorId });
+          const fl = scene.floors.find((f) => f.id === c.floorId);
+          set({
+            drillLevel: 'floor',
+            activeBuildingId: fl?.buildingId ?? activeBuildingId,
+            activeFloorId: c.floorId,
+            showAllFloors: false,
+            firstPersonMode: false,
+            isolatedIds: [],
+            isolatedAssetType: null,
+            selected: [entity],
+          });
           get().flyToCamera(c.position, c.target, c.fov);
         }
-      } else if (entity.type === 'floor') {
-        const f = scene.floors.find((x) => x.id === entity.id);
-        if (f) {
-          set({ activeFloorId: f.id, activeBuildingId: f.buildingId });
-          get().flyToCamera([f.width / 2, 24, f.depth * 1.55], [f.width / 2, 1, f.depth / 2]);
-        }
+        return;
       }
+      set({ selected: [entity] });
     },
 
     addReferencePlan: (ref) => {
@@ -2629,6 +3384,355 @@ export const useTwinStore = create<TwinState>((set, get) => {
         return draft;
       }, 'Deleted flow route'),
 
+    addNetworkUserNode: (node) => {
+      if (!guardEditable()) return null;
+      const created: NetworkUserNode = { ...node, id: `unode-${Date.now()}-${Math.floor(Math.random() * 999)}` };
+      commit(
+        (draft) => {
+          if (!draft.networkArchitecture) {
+            draft.networkArchitecture = { userNodes: [], interRackLinks: [], monitoringApis: [] };
+          }
+          draft.networkArchitecture.userNodes.push(created);
+          // Mark target switch port as connected & up
+          const rack = draft.assets.find((a) => a.id === created.connectedRackId);
+          const dev = rack?.rackConfig?.devices.find((d) => d.id === created.connectedDeviceId);
+          const port = dev?.ports.find((p) => p.id === created.connectedPortId);
+          if (port) {
+            port.status = created.status === 'error' ? 'error' : 'up';
+            port.connectedToLabel = `${created.code} (${created.name})`;
+            port.poeWatts = created.poeWatts;
+            port.vlan = created.vlan;
+          }
+          return draft;
+        },
+        `Placed user node ${created.code} → ${created.wallJackId}`,
+        {
+          category: 'network-rack',
+          action: 'Placed IT User Node',
+          entityType: 'asset',
+          entityId: created.id,
+          entityName: created.name,
+          summary: `Connected ${created.code} (${created.ipAddress}) to rack ${created.connectedRackId}`,
+        }
+      );
+      return created;
+    },
+
+    updateNetworkUserNode: (id, patch) => {
+      if (!guardEditable()) return;
+      commit(
+        (draft) => {
+          if (!draft.networkArchitecture) return draft;
+          const idx = draft.networkArchitecture.userNodes.findIndex((n) => n.id === id);
+          if (idx === -1) return draft;
+          const prev = draft.networkArchitecture.userNodes[idx];
+          const nextNode = { ...prev, ...patch };
+          draft.networkArchitecture.userNodes[idx] = nextNode;
+
+          // Update bound switch port metadata if connection changed
+          if (patch.connectedRackId || patch.connectedDeviceId || patch.connectedPortId || patch.status || patch.vlan) {
+            const oldRack = draft.assets.find((a) => a.id === prev.connectedRackId);
+            const oldDev = oldRack?.rackConfig?.devices.find((d) => d.id === prev.connectedDeviceId);
+            const oldPort = oldDev?.ports.find((p) => p.id === prev.connectedPortId);
+            if (oldPort && (prev.connectedPortId !== nextNode.connectedPortId || prev.connectedDeviceId !== nextNode.connectedDeviceId)) {
+              oldPort.connectedToLabel = undefined;
+              oldPort.status = 'down';
+              oldPort.poeWatts = 0;
+            }
+            const newRack = draft.assets.find((a) => a.id === nextNode.connectedRackId);
+            const newDev = newRack?.rackConfig?.devices.find((d) => d.id === nextNode.connectedDeviceId);
+            const newPort = newDev?.ports.find((p) => p.id === nextNode.connectedPortId);
+            if (newPort) {
+              newPort.status = nextNode.status === 'error' ? 'error' : nextNode.status === 'offline' ? 'down' : 'up';
+              newPort.connectedToLabel = `${nextNode.code} (${nextNode.name})`;
+              newPort.poeWatts = nextNode.poeWatts;
+              newPort.vlan = nextNode.vlan;
+            }
+          }
+          return draft;
+        },
+        undefined,
+        {
+          category: 'network-rack',
+          action: 'Updated IT User Node',
+          entityId: id,
+          summary: `Updated user node ${id}: ${Object.keys(patch).join(', ')}`,
+        }
+      );
+    },
+
+    deleteNetworkUserNode: (id) => {
+      if (!guardEditable()) return;
+      commit((draft) => {
+        if (!draft.networkArchitecture) return draft;
+        const target = draft.networkArchitecture.userNodes.find((n) => n.id === id);
+        if (target) {
+          const rack = draft.assets.find((a) => a.id === target.connectedRackId);
+          const dev = rack?.rackConfig?.devices.find((d) => d.id === target.connectedDeviceId);
+          const port = dev?.ports.find((p) => p.id === target.connectedPortId);
+          if (port) {
+            port.connectedToLabel = undefined;
+            port.status = 'down';
+            port.poeWatts = 0;
+          }
+        }
+        draft.networkArchitecture.userNodes = draft.networkArchitecture.userNodes.filter((n) => n.id !== id);
+        return draft;
+      }, 'Removed IT user node');
+    },
+
+    addInterRackLink: (link) => {
+      if (!guardEditable()) return null;
+      const created: NetworkInterRackLink = { ...link, id: `irl-${Date.now()}` };
+      commit((draft) => {
+        if (!draft.networkArchitecture) {
+          draft.networkArchitecture = { userNodes: [], interRackLinks: [], monitoringApis: [] };
+        }
+        draft.networkArchitecture.interRackLinks.push(created);
+        return draft;
+      }, `Connected uplink "${created.label}"`);
+      return created;
+    },
+
+    updateInterRackLink: (id, patch) => {
+      commit((draft) => {
+        if (!draft.networkArchitecture) return draft;
+        draft.networkArchitecture.interRackLinks = draft.networkArchitecture.interRackLinks.map((l) =>
+          l.id === id ? { ...l, ...patch } : l
+        );
+        return draft;
+      }, 'Updated inter-rack uplink');
+    },
+
+    deleteInterRackLink: (id) => {
+      if (!guardEditable()) return;
+      commit((draft) => {
+        if (!draft.networkArchitecture) return draft;
+        draft.networkArchitecture.interRackLinks = draft.networkArchitecture.interRackLinks.filter((l) => l.id !== id);
+        return draft;
+      }, 'Removed inter-rack uplink');
+    },
+
+    updateTopologyMap: (updater, label) => {
+      commit((draft) => {
+        if (!draft.networkArchitecture) {
+          draft.networkArchitecture = { userNodes: [], interRackLinks: [], monitoringApis: [] };
+        }
+        draft.networkArchitecture.topologyMap = updater(draft.networkArchitecture.topologyMap);
+        return draft;
+      }, label ?? 'Updated IT live port map');
+    },
+
+    upsertMonitoringConnector: (connector) => {
+      if (!guardEditable()) return;
+      commit((draft) => {
+        if (!draft.networkArchitecture) {
+          draft.networkArchitecture = { userNodes: [], interRackLinks: [], monitoringApis: [] };
+        }
+        const exists = draft.networkArchitecture.monitoringApis.some((c) => c.id === connector.id);
+        draft.networkArchitecture.monitoringApis = exists
+          ? draft.networkArchitecture.monitoringApis.map((c) => (c.id === connector.id ? connector : c))
+          : [...draft.networkArchitecture.monitoringApis, connector];
+        return draft;
+      }, `Saved monitoring connector "${connector.name}"`);
+    },
+
+    deleteMonitoringConnector: (id) => {
+      if (!guardEditable()) return;
+      commit((draft) => {
+        if (!draft.networkArchitecture) return draft;
+        draft.networkArchitecture.monitoringApis = draft.networkArchitecture.monitoringApis.filter((c) => c.id !== id);
+        return draft;
+      }, 'Deleted monitoring connector');
+    },
+
+    addDistributionRackToRoom: (floorId, roomId, rackName, role) => {
+      if (!guardEditable()) return null;
+      const { scene } = get();
+      const room = roomId ? scene.rooms.find((r) => r.id === roomId) : scene.rooms.find((r) => r.floorId === floorId);
+      const x = room ? Number((room.x + Math.min(1.2, room.width * 0.2)).toFixed(2)) : 3.5;
+      const z = room ? Number((room.z + Math.min(1.2, room.depth * 0.2)).toFixed(2)) : 3.5;
+      const seq = scene.assets.filter((a) => a.rackConfig).length + 1;
+      const code = role === 'core-dc' ? `DC-R0${seq}` : `IDF-R0${seq}`;
+      const id = `ast-idf-${Date.now()}`;
+      const totalUnits = role === 'core-dc' ? 42 : 24;
+      const distId = `dev-dist-${Date.now()}`;
+      const accId = `dev-2960-${Date.now()}`;
+
+      const newRack: SpatialAsset = {
+        id,
+        floorId,
+        roomId: room?.id,
+        templateId: role === 'core-dc' ? 'eq-server-rack-42u' : 'eq-network-rack-42u',
+        archetype: role === 'core-dc' ? 'server-rack' : 'network-rack',
+        name: rackName.trim() || `${code} Distribution Rack`,
+        assetId: code,
+        equipmentId: `EQ-${code}`,
+        category: 'IT & Data Center',
+        manufacturer: 'APC / Cisco',
+        model: role === 'core-dc' ? 'NetShelter SX 42U' : 'NetShelter Wall/Floor 24U IDF',
+        serialNumber: `SN-${code}-2026`,
+        description: `Provisioned ${role} rack in ${room?.name ?? floorId}`,
+        tags: ['IT', 'Network', role, 'Cisco 2960'],
+        criticality: 'high',
+        owner: 'IT & OT Infrastructure',
+        department: 'IT Infrastructure',
+        responsiblePerson: 'David Okafor',
+        x,
+        y: 0,
+        z,
+        rotationX: 0,
+        rotationY: 0,
+        rotationZ: 0,
+        width: 0.8,
+        depth: 0.9,
+        height: role === 'core-dc' ? 2.15 : 1.55,
+        weightKg: role === 'core-dc' ? 480 : 195,
+        clearanceM: 0.9,
+        materialId: 'mat-dark-steel',
+        color: '#0F172A',
+        layerId: 'layer-equipment',
+        operationalStatus: 'running',
+        installationDate: get().timelineDate,
+        commissioningDate: get().timelineDate,
+        warrantyUntil: '2030-11-22',
+        maintenanceSchedule: 'Quarterly Fiber & UPS Check',
+        lastMaintenance: get().timelineDate,
+        nextMaintenance: '2027-02-22',
+        capacityLabel: `${totalUnits}U · 40G Fiber Uplink`,
+        utilizationPct: 48,
+        availabilityPct: 99.98,
+        conditionScore: 99,
+        lifecycle: 'operational',
+        capexUsd: role === 'core-dc' ? 48000 : 18500,
+        annualOpexUsd: 2400,
+        energyKw: role === 'core-dc' ? 4.8 : 1.4,
+        connectivity: {
+          protocol: 'REST API',
+          endpoint: `https://dcim.cinnagen.io/racks/${code}`,
+          plcTag: `IT.${code.replace(/-/g, '_')}`,
+          scadaNode: `NET-${code}`,
+          historianId: `HIST_${code}`,
+          liveMetrics: [
+            { label: 'Load', value: '1.4', unit: 'kW', status: 'ok' },
+            { label: 'Inlet Temp', value: '21.8', unit: '°C', status: 'ok' },
+          ],
+        },
+        documents: [],
+        qrCode: `GRADIAN://IT-RACK/${code}`,
+        relatedSystems: ['Core Network', 'SCADA'],
+        relatedProcesses: ['IT / OT Telemetry'],
+        rackConfig: {
+          totalUnits,
+          rackRole: role,
+          locationZone: room ? `${room.code} · ${room.name}` : floorId,
+          maxPowerKw: role === 'core-dc' ? 12 : 4,
+          coolingZone: room?.name ?? 'Floor IDF Closet',
+          subnetCidr: `10.40.${20 + seq}.0/24`,
+          devices: [
+            {
+              id: distId,
+              name: `${code}-DIST-C9300`,
+              kind: 'switch',
+              tier: role === 'core-dc' ? 'core' : 'distribution',
+              uStart: totalUnits - 2,
+              uHeight: 1,
+              powerW: 320,
+              ipAddress: `10.40.${20 + seq}.2`,
+              macAddress: `00:1E:BD:${(10 + seq).toString(16).padStart(2, '0')}:93:01`,
+              serialNumber: `FCW26${seq}0C93`,
+              vlan: 'Trunk-All',
+              vendor: 'Cisco',
+              model: 'Catalyst 9300-24S Distribution',
+              status: 'online',
+              cpuPct: 24,
+              tempC: 36.4,
+              ports: [
+                { id: `${distId}-up1`, label: 'Te1/1/1 Uplink→Core', kind: 'SFP+', speedGbps: 10, vlan: 'Trunk-All', status: 'up', isUplink: true, utilizationPct: 41, opticalDbm: -2.4, crcErrors: 0, connectedToLabel: 'DC-CORE-01 (Nexus 9336)' },
+                { id: `${distId}-up2`, label: 'Te1/1/2 Redundant', kind: 'SFP+', speedGbps: 10, vlan: 'Trunk-All', status: 'standby', isUplink: true, utilizationPct: 4, opticalDbm: -2.8, crcErrors: 0, connectedToLabel: 'DC-CORE-01 Standby' },
+                { id: `${distId}-dn1`, label: 'Gi1/0/1 → 2960-X', kind: 'SFP+', speedGbps: 10, vlan: 'Trunk-Access', status: 'up', isUplink: true, utilizationPct: 28, opticalDbm: -1.9, crcErrors: 0, connectedToLabel: `${code}-ACC-2960X` },
+                { id: `${distId}-dn2`, label: 'Gi1/0/2 Spare', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-10', status: 'down', utilizationPct: 0, crcErrors: 0 },
+              ],
+            },
+            {
+              id: accId,
+              name: `${code}-ACC-2960X`,
+              kind: 'switch',
+              tier: 'access',
+              uStart: totalUnits - 5,
+              uHeight: 1,
+              powerW: 210,
+              ipAddress: `10.40.${20 + seq}.10`,
+              macAddress: `00:1E:BD:${(10 + seq).toString(16).padStart(2, '0')}:29:60`,
+              serialNumber: `FOC26${seq}02960`,
+              vlan: 'VLAN-10/20/30',
+              vendor: 'Cisco',
+              model: 'Catalyst 2960-X 48FPS-L',
+              status: 'online',
+              cpuPct: 19,
+              tempC: 34.1,
+              ports: [
+                { id: `${accId}-gi1`, label: 'Gi0/1', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-10', status: 'down', poeWatts: 0, utilizationPct: 0, crcErrors: 0 },
+                { id: `${accId}-gi2`, label: 'Gi0/2', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-20', status: 'down', poeWatts: 0, utilizationPct: 0, crcErrors: 0 },
+                { id: `${accId}-gi3`, label: 'Gi0/3', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-30', status: 'down', poeWatts: 0, utilizationPct: 0, crcErrors: 0 },
+                { id: `${accId}-gi4`, label: 'Gi0/4', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-40', status: 'down', poeWatts: 0, utilizationPct: 0, crcErrors: 0 },
+                { id: `${accId}-gi5`, label: 'Gi0/5', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-10', status: 'down', poeWatts: 0, utilizationPct: 0, crcErrors: 0 },
+                { id: `${accId}-gi6`, label: 'Gi0/6', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-20', status: 'down', poeWatts: 0, utilizationPct: 0, crcErrors: 0 },
+                { id: `${accId}-te1`, label: 'Te0/1 Uplink→Dist', kind: 'SFP+', speedGbps: 10, vlan: 'Trunk-Access', status: 'up', isUplink: true, utilizationPct: 28, opticalDbm: -2.0, crcErrors: 0, connectedToLabel: `${code}-DIST-C9300` },
+              ],
+            },
+          ],
+          cables: [
+            {
+              id: `cab-${Date.now()}`,
+              fromDeviceId: accId,
+              fromPortId: `${accId}-te1`,
+              toDeviceId: distId,
+              toPortId: `${distId}-dn1`,
+              media: 'OM4 Fiber',
+              vlan: 'Trunk-Access',
+              color: '#06B6D4',
+              label: '2960-X → C9300 10G Uplink',
+            },
+          ],
+        },
+      };
+
+      commit((draft) => {
+        draft.assets.push(newRack);
+        // Auto-wire a dist-to-core fiber trunk if a core DC rack exists
+        const coreRack = draft.assets.find(
+          (a) => a.id !== newRack.id && a.rackConfig?.rackRole === 'core-dc'
+        );
+        const coreSwitch = coreRack?.rackConfig?.devices.find((d) => d.tier === 'core' || d.kind === 'switch');
+        if (role !== 'core-dc' && coreRack && coreSwitch && coreSwitch.ports[0]) {
+          if (!draft.networkArchitecture) {
+            draft.networkArchitecture = { userNodes: [], interRackLinks: [], monitoringApis: [] };
+          }
+          draft.networkArchitecture.interRackLinks.push({
+            id: `irl-auto-${Date.now()}`,
+            label: `${code} → ${coreRack.assetId} Fiber Trunk`,
+            tier: 'dist-to-core',
+            fromRackId: newRack.id,
+            fromDeviceId: distId,
+            fromPortId: `${distId}-up1`,
+            toRackId: coreRack.id,
+            toDeviceId: coreSwitch.id,
+            toPortId: coreSwitch.ports[0].id,
+            media: 'OM4 Fiber',
+            speedGbps: 10,
+            vlanTrunk: 'VLAN-10,20,30,40',
+            status: 'up',
+            utilizationPct: 22,
+            opticalRxDbm: -2.3,
+            crcErrors: 0,
+          });
+        }
+        return draft;
+      }, `Provisioned ${code} (${role === 'core-dc' ? 'Core DC' : 'IDF Distribution'}) in ${room?.code ?? floorId}`);
+      return newRack;
+    },
+
     setTimelineDate: (timelineDate) => set({ timelineDate }),
     setCompareDate: (compareDate) => set({ compareDate }),
     setTimelinePlaying: (timelinePlaying) => set({ timelinePlaying }),
@@ -2677,14 +3781,92 @@ export const useTwinStore = create<TwinState>((set, get) => {
     setPendingAIActions: (pendingAIActions, aiPreviewMessage) =>
       set({ pendingAIActions, aiPreviewMessage }),
 
-    applyPendingAIActions: () => {
+    applyPendingAIActions: (opts) => {
       const actions = get().pendingAIActions;
-      if (actions.length === 0) return;
+      if (actions.length === 0) return { createdEntities: [], appliedCount: 0 };
 
       const { activeFloorId } = get();
+      const customComment = opts?.customComment?.trim();
       let appliedCount = 0;
+      const createdEntities: { type: 'room' | 'asset' | 'camera' | 'flow'; id: string; code: string; name: string }[] = [];
+
+      // Non-overlapping ground-aligned room placer that guarantees zero room conflicts & floor slab fit
+      const findNonOverlappingRoomRect = (
+        floor: Floor | undefined,
+        existingRooms: Room[],
+        prefX: number,
+        prefZ: number,
+        w: number,
+        d: number
+      ): { x: number; z: number; expandedFloorW?: number; expandedFloorD?: number } => {
+        const margin = 0.5;
+        const flW = floor?.width ?? 36;
+        const flD = floor?.depth ?? 22;
+        const overlapsAny = (cx: number, cz: number) =>
+          existingRooms.some((r) => {
+            const ox = Math.min(cx + w, r.x + r.width) - Math.max(cx, r.x);
+            const oz = Math.min(cz + d, r.z + r.depth) - Math.max(cz, r.z);
+            return ox > 0.05 && oz > 0.05;
+          });
+
+        // 1. Try preferred coordinate clamped inside slab
+        const clampedX = Number(Math.max(margin, Math.min(flW - w - margin, prefX)).toFixed(2));
+        const clampedZ = Number(Math.max(margin, Math.min(flD - d - margin, prefZ)).toFixed(2));
+        if (clampedX >= margin && clampedZ >= margin && clampedX + w <= flW - margin && clampedZ + d <= flD - margin && !overlapsAny(clampedX, clampedZ)) {
+          return { x: clampedX, z: clampedZ };
+        }
+
+        // 2. Scan existing floor slab in 0.5m steps for clean non-overlapping free bay
+        for (let z = margin; z + d <= flD - margin + 0.01; z += 1.0) {
+          for (let x = margin; x + w <= flW - margin + 0.01; x += 1.0) {
+            if (!overlapsAny(x, z)) {
+              return { x: Number(x.toFixed(2)), z: Number(z.toFixed(2)) };
+            }
+          }
+        }
+
+        // 3. Floor is full — cleanly extend the ground slab east or south so room sits flush on ground with zero conflict!
+        const maxRight = existingRooms.reduce((mx, r) => Math.max(mx, r.x + r.width), 1);
+        const maxBottom = existingRooms.reduce((mz, r) => Math.max(mz, r.z + r.depth), 1);
+        if (flW <= flD * 1.8) {
+          const nx = Number(Math.max(1, maxRight).toFixed(2));
+          const nz = Number(Math.max(1, Math.min(flD - d - 1, prefZ)).toFixed(2));
+          return {
+            x: nx,
+            z: Math.max(1, nz),
+            expandedFloorW: Math.ceil(nx + w + 1.5),
+            expandedFloorD: Math.max(flD, Math.ceil(Math.max(1, nz) + d + 1.5)),
+          };
+        }
+        const nx = 1;
+        const nz = Number(Math.max(1, maxBottom).toFixed(2));
+        return {
+          x: nx,
+          z: nz,
+          expandedFloorW: Math.max(flW, Math.ceil(nx + w + 1.5)),
+          expandedFloorD: Math.ceil(nz + d + 1.5),
+        };
+      };
+
+      const nextRoomCodeForFloor = (draft: DigitalTwinScene, floorId: string) => {
+        const fl = draft.floors.find((f) => f.id === floorId);
+        const flPrefix = (fl?.code || 'RM').replace(/[^A-Z0-9]/gi, '').toUpperCase() || 'RM';
+        const baseNum = (fl?.levelIndex ?? 0) === 0 ? 101 : 201 + ((fl?.levelIndex ?? 1) - 1) * 100;
+        const existingOnFloor = draft.rooms.filter((r) => r.floorId === floorId).length;
+        const usedCodes = new Set(draft.rooms.map((r) => r.code));
+        let seq = baseNum + existingOnFloor;
+        let candidate = `${flPrefix}-${seq}`;
+        while (usedCodes.has(candidate)) {
+          seq += 1;
+          candidate = `${flPrefix}-${seq}`;
+        }
+        return candidate;
+      };
 
       commit((draft) => {
+        const activeFloor = draft.floors.find((f) => f.id === activeFloorId) ?? draft.floors[0];
+        let lastCreatedRoom: Room | null = null;
+
         for (const act of actions) {
           if (act.type === 'create_room') {
             const tpl =
@@ -2694,21 +3876,38 @@ export const useTwinStore = create<TwinState>((set, get) => {
               ) ??
               SPACE_TYPE_LIBRARY[0];
             const id = `rm-ai-${Date.now()}-${appliedCount}`;
-            const w = Math.max(3, act.width ?? tpl.defaultWidth);
-            const d = Math.max(3, act.depth ?? tpl.defaultDepth);
+            const w = Math.max(3, Math.min(20, act.width ?? tpl.defaultWidth));
+            const d = Math.max(3, Math.min(18, act.depth ?? tpl.defaultDepth));
+            const floorRooms = draft.rooms.filter((r) => r.floorId === activeFloorId);
+            const placement = findNonOverlappingRoomRect(
+              activeFloor,
+              floorRooms,
+              act.x ?? 2,
+              act.z ?? 2,
+              w,
+              d
+            );
+            // Expand floor slab ground cleanly if needed so room sits solidly on ground
+            if (activeFloor && placement.expandedFloorW && placement.expandedFloorW > activeFloor.width) {
+              activeFloor.width = placement.expandedFloorW;
+            }
+            if (activeFloor && placement.expandedFloorD && placement.expandedFloorD > activeFloor.depth) {
+              activeFloor.depth = placement.expandedFloorD;
+            }
+            const roomCode = nextRoomCodeForFloor(draft, activeFloorId);
             const newRm: Room = {
               id,
               floorId: activeFloorId,
               departmentId: draft.hierarchy.find((h) => h.level === 'department')?.id ?? 'dept-1',
               name: act.roomName || tpl.name,
-              code: `AI-${draft.rooms.length + 1}`,
+              code: roomCode,
               spaceTypeId: tpl.id,
               category: tpl.category,
-              x: act.x ?? 2,
-              z: act.z ?? 2,
+              x: placement.x,
+              z: placement.z,
               width: w,
               depth: d,
-              height: act.height ?? tpl.defaultHeight,
+              height: act.height ?? activeFloor?.height ?? tpl.defaultHeight,
               color: tpl.color,
               floorMaterialId: tpl.defaultFloorMaterialId,
               wallMaterialId: tpl.defaultWallMaterialId,
@@ -2724,24 +3923,29 @@ export const useTwinStore = create<TwinState>((set, get) => {
               costPerSqm: tpl.costPerSqm,
               activeFromDate: get().timelineDate,
               metadata: {
-                code: `AI-${draft.rooms.length + 1}`,
-                description: `Created via AI Copilot: ${act.details}`,
+                code: roomCode,
+                description: customComment
+                  ? `Created via Maya AI: ${act.details} · Note: ${customComment}`
+                  : `Created via Maya AI: ${act.details}`,
                 status: 'planned',
-                tags: ['AI Generated', tpl.category],
-                owner: 'AI Copilot Proposal',
+                tags: ['Maya AI', tpl.category, ...(customComment ? ['Commented'] : [])],
+                owner: 'Facility Engineering (Maya AI)',
                 department: 'Engineering',
                 accessPermission: 'gmp-authorized',
                 createdAt: new Date().toISOString().slice(0, 10),
                 updatedAt: new Date().toISOString().slice(0, 10),
                 revision: 1,
-                customProperties: {},
+                customProperties: customComment ? { 'Change Comment': customComment } : {},
                 linkedDocuments: [],
-                relatedSystems: [],
+                relatedSystems: ['BMS / EMS'],
                 relatedProcesses: [],
               },
             };
             draft.rooms.push(newRm);
             draft.walls.push(...generateWallsForRoom(newRm, id));
+            draft.openings = ensureDoorsForAllRooms(draft.rooms, draft.walls, draft.openings);
+            lastCreatedRoom = newRm;
+            createdEntities.push({ type: 'room', id: newRm.id, code: newRm.code, name: newRm.name });
             appliedCount++;
           } else if (act.type === 'place_equipment') {
             const tpl =
@@ -2749,24 +3953,48 @@ export const useTwinStore = create<TwinState>((set, get) => {
               OBJECT_LIBRARY[0];
             const targetRoom =
               draft.rooms.find((r) => r.id === act.roomId) ??
+              (lastCreatedRoom &&
+              (!act.roomName ||
+                lastCreatedRoom.name.toLowerCase().includes(act.roomName.toLowerCase()) ||
+                act.roomName.toLowerCase().includes(lastCreatedRoom.name.toLowerCase()))
+                ? lastCreatedRoom
+                : undefined) ??
               draft.rooms.find(
                 (r) =>
                   r.floorId === activeFloorId &&
                   act.roomName &&
                   r.name.toLowerCase().includes(act.roomName.toLowerCase())
               ) ??
+              lastCreatedRoom ??
               draft.rooms.find((r) => r.floorId === activeFloorId);
+
             const count = Math.min(8, Math.max(1, act.count ?? 1));
-            const spacing = (act.clearance ?? tpl.clearanceM) + tpl.width;
-            const baseX = act.x ?? (targetRoom ? targetRoom.x + 2.2 : 5);
-            const baseZ = act.z ?? (targetRoom ? targetRoom.z + targetRoom.depth / 2 : 5);
+            const spacing = Math.max(1.2, (act.clearance ?? tpl.clearanceM) * 0.65 + tpl.width);
+            const padX = Math.max(0.8, tpl.width * 0.5 + 0.45);
+            const padZ = Math.max(0.8, tpl.depth * 0.5 + 0.45);
+            const rmMinX = targetRoom ? targetRoom.x + padX : 2;
+            const rmMaxX = targetRoom ? Math.max(rmMinX, targetRoom.x + targetRoom.width - padX) : 28;
+            const rmMinZ = targetRoom ? targetRoom.z + padZ : 2;
+            const rmMaxZ = targetRoom ? Math.max(rmMinZ, targetRoom.z + targetRoom.depth - padZ) : 18;
+            const cols = Math.max(1, Math.floor((rmMaxX - rmMinX) / Math.max(1.0, spacing)) + 1);
+
             for (let i = 0; i < count; i++) {
               const seq = draft.assets.length + 1;
               const code = `${tpl.archetype.slice(0, 3).toUpperCase()}-${String(seq).padStart(3, '0')}`;
-              const px = Number((baseX + i * spacing).toFixed(2));
-              draft.assets.push({
-                id: `ast-ai-${Date.now()}-${i}-${seq}`,
-                floorId: activeFloorId,
+              const colIdx = i % cols;
+              const rowIdx = Math.floor(i / cols);
+              const rawPx = targetRoom
+                ? rmMinX + colIdx * Math.min(spacing, (rmMaxX - rmMinX) / Math.max(1, cols))
+                : (act.x ?? 5) + i * spacing;
+              const rawPz = targetRoom
+                ? rmMinZ + rowIdx * Math.max(1.4, tpl.depth + 0.8)
+                : act.z ?? 5;
+              const px = Number(Math.max(rmMinX, Math.min(rmMaxX, rawPx)).toFixed(2));
+              const pz = Number(Math.max(rmMinZ, Math.min(rmMaxZ, rawPz)).toFixed(2));
+              const assetId = `ast-ai-${Date.now()}-${i}-${seq}`;
+              const placed = enrichAssetHistory({
+                id: assetId,
+                floorId: targetRoom?.floorId ?? activeFloorId,
                 roomId: targetRoom?.id,
                 templateId: tpl.id,
                 archetype: tpl.archetype,
@@ -2777,15 +4005,15 @@ export const useTwinStore = create<TwinState>((set, get) => {
                 manufacturer: tpl.manufacturer,
                 model: tpl.model,
                 serialNumber: `SN-AI-${seq}`,
-                description: tpl.description,
-                tags: ['AI Placed', tpl.category],
+                description: customComment ? `${tpl.description} · Note: ${customComment}` : tpl.description,
+                tags: ['Maya AI', tpl.category],
                 criticality: tpl.category === 'Biopharmaceutical' ? 'gmp-critical' : 'medium',
                 owner: 'Engineering',
                 department: 'Production',
                 responsiblePerson: 'Lead Engineer',
                 x: px,
                 y: 0,
-                z: baseZ,
+                z: pz,
                 rotationX: 0,
                 rotationY: 0,
                 rotationZ: 0,
@@ -2825,6 +4053,8 @@ export const useTwinStore = create<TwinState>((set, get) => {
                 relatedSystems: ['SCADA'],
                 relatedProcesses: [],
               });
+              draft.assets.push(placed);
+              createdEntities.push({ type: 'asset', id: placed.id, code: placed.assetId, name: placed.name });
             }
             appliedCount++;
           } else if (act.type === 'update_wall_height' && act.height) {
@@ -2875,26 +4105,33 @@ export const useTwinStore = create<TwinState>((set, get) => {
             }
           } else if (act.type === 'create_camera') {
             const floor = draft.floors.find((f) => f.id === activeFloorId);
-            const cx = act.x ?? (floor ? floor.width / 2 : 12);
-            const cz = act.z ?? (floor ? floor.depth - 2 : 12);
+            const hostRm = lastCreatedRoom ?? draft.rooms.find((r) => r.floorId === activeFloorId);
+            const cx = act.x ?? (hostRm ? hostRm.x + 0.9 : floor ? floor.width / 2 : 12);
+            const cz = act.z ?? (hostRm ? hostRm.z + 0.9 : floor ? floor.depth - 2 : 12);
+            const camId = `cam-ai-${Date.now()}`;
             draft.cameras.push({
-              id: `cam-ai-${Date.now()}`,
+              id: camId,
               floorId: activeFloorId,
+              roomId: hostRm?.id,
               name: act.cameraName || 'AI Entrance Viewpoint',
               kind: act.cameraType || 'security',
               group: 'AI Cameras',
-              position: [cx, act.height ?? 3.2, cz],
-              target: [cx, 1.4, Math.max(2, cz - 7)],
-              fov: 60,
+              position: [cx, act.height ?? 3.0, cz],
+              target: hostRm
+                ? [hostRm.x + hostRm.width / 2, 1.3, hostRm.z + hostRm.depth / 2]
+                : [cx, 1.4, Math.max(2, cz - 7)],
+              fov: 64,
               focalLengthMm: 28,
               coverageRadius: 10,
               visibleCone: true,
               layerId: 'layer-cameras',
             });
+            createdEntities.push({ type: 'camera', id: camId, code: 'CAM', name: act.cameraName || 'AI Entrance Viewpoint' });
             appliedCount++;
           } else if (act.type === 'create_flow') {
+            const flwId = `flw-ai-${Date.now()}`;
             draft.flows.push({
-              id: `flw-ai-${Date.now()}`,
+              id: flwId,
               floorId: activeFloorId,
               name: act.title || 'AI Personnel Route',
               flowType: act.flowType || 'personnel',
@@ -2907,14 +4144,15 @@ export const useTwinStore = create<TwinState>((set, get) => {
               flowRateLabel: 'Standard Shift',
               capacityLabel: 'GMP Compliant',
               cleanlinessClass: act.flowType === 'waste' ? 'dirty' : 'clean',
-              restrictions: 'Proposed via AI Copilot',
+              restrictions: customComment ? `Proposed via Maya AI · ${customComment}` : 'Proposed via Maya AI',
               layerId: 'layer-flows',
             });
+            createdEntities.push({ type: 'flow', id: flwId, code: 'FLOW', name: act.title || 'AI Personnel Route' });
             appliedCount++;
           }
         }
         return draft;
-      }, appliedCount > 0 ? `Applied ${appliedCount} AI Copilot spatial action${appliedCount > 1 ? 's' : ''}` : undefined);
+      }, appliedCount > 0 ? `Maya AI applied ${appliedCount} action${appliedCount > 1 ? 's' : ''}${customComment ? ` — "${customComment}"` : ''}` : undefined);
 
       // Handle non-mutating view/selection actions
       for (const act of actions) {
@@ -2942,10 +4180,165 @@ export const useTwinStore = create<TwinState>((set, get) => {
         }
       }
 
+      if (createdEntities.length > 0) {
+        const first = createdEntities[0];
+        set({ selected: [{ type: first.type, id: first.id }] });
+      }
+
       set({ pendingAIActions: [], aiPreviewMessage: null });
+      return { createdEntities, appliedCount };
     },
 
     clearPendingAIActions: () => set({ pendingAIActions: [], aiPreviewMessage: null }),
+
+    openEntityInfo: (target, opts) =>
+      set({
+        entityInfoTarget: target,
+        entityInfoAutoEligibility: Boolean(opts?.autoEligibility),
+      }),
+
+    closeEntityInfo: () =>
+      set({
+        entityInfoTarget: null,
+        entityInfoAutoEligibility: false,
+      }),
+
+    requestVrToggle: () =>
+      set((s) => ({
+        vrToggleNonce: s.vrToggleNonce + 1,
+        viewMode: s.viewMode === '2d' ? '3d-perspective' : s.viewMode,
+      })),
+
+    setVrSessionState: (active, mode) =>
+      set({
+        vrSessionActive: active,
+        vrMode: mode,
+      }),
+
+    startNetworkTrace: (trace, mode) => {
+      const { scene } = get();
+      const targetFloor = scene.floors.find((f) => f.id === trace.floorId) ?? scene.floors[0];
+      const buildingId = trace.buildingId || targetFloor?.buildingId || scene.buildings[0]?.id || 'bldg-a';
+      const floorId = targetFloor?.id || scene.floors[0]?.id || 'fl-a-0';
+
+      // Compute midpoint of all hops on this floor for camera framing
+      const hops = trace.hops.length > 0 ? trace.hops : [{ x: 14, z: 10, elevation: 1.5, id: 'default', label: trace.title, sublabel: '', kind: 'rack' as const }];
+      const xs = hops.map((h) => h.x);
+      const zs = hops.map((h) => h.z);
+      const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+      const cz = (Math.min(...zs) + Math.max(...zs)) / 2;
+      const span = Math.max(8, Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...zs) - Math.min(...zs)));
+
+      set({
+        screen: 'workspace',
+        showNetworkRackModal: false,
+        activeNetworkTrace: { ...trace, buildingId, floorId },
+        activeBuildingId: buildingId,
+        activeFloorId: floorId,
+        drillLevel: 'floor',
+        showAllFloors: false,
+        viewMode: mode === '2d' ? '2d' : '3d-perspective',
+        categoryFilter: mode === '3d' ? 'IT' : get().categoryFilter,
+        selected: trace.targetAssetId
+          ? [{ type: 'asset', id: trace.targetAssetId }]
+          : get().selected,
+        toast: {
+          id: `t-${Date.now()}`,
+          message: `Tracing ${trace.title} in ${mode.toUpperCase()} (${trace.hops.length} hops)`,
+          tone: 'info',
+        },
+      });
+
+      if (mode === '3d') {
+        const dist = Math.min(26, Math.max(9, span * 0.95));
+        get().flyToCamera([cx + dist * 0.65, Math.min(18, Math.max(6.5, span * 0.55)), cz + dist * 0.72], [cx, 1.4, cz], 46);
+      }
+    },
+
+    clearNetworkTrace: () =>
+      set((s) => ({
+        activeNetworkTrace: null,
+        categoryFilter: s.categoryFilter === 'IT' ? 'all' : s.categoryFilter,
+      })),
+
+    highlightScannedEntity: ({ entityType, entityId, code, label, preferredView = 'current' }) => {
+      const { scene, viewMode } = get();
+      let floorId = get().activeFloorId;
+      let buildingId = get().activeBuildingId;
+      let x = 0;
+      let z = 0;
+      let elevation = 0;
+      let targetH = 1.2;
+
+      if (entityType === 'asset') {
+        const asset = scene.assets.find((a) => a.id === entityId);
+        if (!asset) return;
+        floorId = asset.floorId;
+        const fl = scene.floors.find((f) => f.id === asset.floorId);
+        buildingId = fl?.buildingId ?? buildingId;
+        elevation = fl?.elevation ?? 0;
+        x = asset.x;
+        z = asset.z;
+        targetH = Math.max(0.6, asset.height * 0.5);
+      } else {
+        const room = scene.rooms.find((r) => r.id === entityId);
+        if (!room) return;
+        floorId = room.floorId;
+        const fl = scene.floors.find((f) => f.id === room.floorId);
+        buildingId = fl?.buildingId ?? buildingId;
+        elevation = fl?.elevation ?? 0;
+        x = room.x + room.width / 2;
+        z = room.z + room.depth / 2;
+        targetH = 0.6;
+      }
+
+      const nextViewMode =
+        preferredView === '2d'
+          ? '2d'
+          : preferredView === '3d'
+            ? viewMode === '3d-ortho'
+              ? '3d-ortho'
+              : '3d-perspective'
+            : viewMode;
+
+      const scannedAt = Date.now();
+      set({
+        screen: 'workspace',
+        activeBuildingId: buildingId,
+        activeFloorId: floorId,
+        drillLevel: entityType === 'asset' ? 'asset' : 'room',
+        showAllFloors: false,
+        viewMode: nextViewMode,
+        firstPersonMode: false,
+        selected: [{ type: entityType, id: entityId }],
+        rightPanelOpen: true,
+        rightTab: 'properties',
+        qrHighlight: {
+          entityType,
+          entityId,
+          code,
+          label,
+          floorId,
+          x,
+          z,
+          scannedAt,
+        },
+        toast: {
+          id: `t-${scannedAt}`,
+          message: `QR Highlighted ${code} · ${label} in ${nextViewMode === '2d' ? '2D Plan' : nextViewMode === 'split' ? '2D/3D Split' : '3D View'}`,
+          tone: 'success',
+        },
+      });
+
+      // Fly 3D camera directly to the scanned asset or room
+      if (entityType === 'asset') {
+        get().flyToCamera([x + 3.8, elevation + 3.1, z + 3.8], [x, elevation + targetH, z], 46);
+      } else {
+        get().flyToCamera([x + 7.2, elevation + 7.4, z + 7.2], [x, elevation + targetH, z], 46);
+      }
+    },
+
+    clearQrHighlight: () => set({ qrHighlight: null }),
 
     showToast: (message, tone = 'info', canUndo = false) =>
       set({ toast: { id: `t-${Date.now()}`, message, tone, canUndo } }),

@@ -5,6 +5,7 @@ import {
   ArrowLeft,
   ArrowUpRight,
   Box,
+  CalendarClock,
   ChevronRight,
   Cpu,
   ExternalLink,
@@ -20,13 +21,22 @@ import {
   SlidersHorizontal,
   Star,
   Trash2,
+  TrendingDown,
+  Wrench,
   X,
 } from 'lucide-react';
 import { useTelemetryStore } from '../store/useTelemetryStore';
 import { useTwinStore } from '../store/useTwinStore';
+import { useGmpStore } from '../store/useGmpStore';
 import { AssetMini3DViewer } from './AssetMini3DViewer';
+import {
+  buildSensorForecastSeries,
+  computeAssetFailurePredictions,
+  type MaintenanceMilestone,
+  type MaintenanceSeverity,
+} from '../utils/predictiveMaintenance';
 
-type TelemetryDashboardTab = 'trends' | 'equipment' | 'define' | 'relationships';
+type TelemetryDashboardTab = 'trends' | 'equipment' | 'predictive' | 'define' | 'relationships';
 import {
   METRIC_PRESETS,
   type LiveSensorSnapshot,
@@ -111,6 +121,295 @@ export const MiniSparkline: React.FC<{
     <svg width={width} height={height} className="overflow-visible shrink-0">
       <path d={path} fill="none" stroke={color} strokeWidth={1.8} strokeLinejoin="round" strokeLinecap="round" />
     </svg>
+  );
+};
+
+function severityMeta(sev: MaintenanceSeverity): { label: string; glyph: string; textCls: string; accentHex: string } {
+  if (sev === 'critical') {
+    return { label: 'Critical', glyph: '✖', textCls: 'text-rose-500 dark:text-rose-400', accentHex: '#F43F5E' };
+  }
+  if (sev === 'warning') {
+    return { label: 'Due Soon', glyph: '▲', textCls: 'text-amber-600 dark:text-amber-400', accentHex: '#F59E0B' };
+  }
+  if (sev === 'advisory') {
+    return { label: 'Advisory', glyph: '◆', textCls: 'text-cyan-600 dark:text-cyan-400', accentHex: '#06B6D4' };
+  }
+  return { label: 'Healthy', glyph: '●', textCls: 'text-emerald-600 dark:text-emerald-400', accentHex: '#10B981' };
+}
+
+/**
+ * Predictive Degradation & Failure Horizon Chart (SVG):
+ * Plots historical sensor readings (solid) and OLS projected drift trajectory (dashed)
+ * intersecting the equipment alarm limit at the predicted failure date.
+ */
+const PredictiveHorizonChart: React.FC<{
+  sensor: SensorDefinition;
+  snapshot?: LiveSensorSnapshot;
+  milestone: MaintenanceMilestone;
+}> = ({ sensor, snapshot, milestone }) => {
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const series = useMemo(
+    () => buildSensorForecastSeries(sensor, snapshot, milestone),
+    [sensor, snapshot, milestone]
+  );
+
+  const W = 720;
+  const H = 224;
+  const padL = 54;
+  const padR = 24;
+  const padT = 20;
+  const padB = 30;
+  const innerW = W - padL - padR;
+  const innerH = H - padT - padB;
+
+  const { minX, maxX, yMin, yMax, mapped, histD, projD, nowX, failX } = useMemo(() => {
+    const xs = series.map((p) => p.dayOffset);
+    const ys = series.map((p) => p.value);
+    const xLo = Math.min(-14, ...xs);
+    const xHi = Math.max(7, ...xs);
+    const xSpan = Math.max(1, xHi - xLo);
+
+    const loVal = Math.min(...ys, milestone.alarmThreshold, sensor.nominal);
+    const hiVal = Math.max(...ys, milestone.alarmThreshold, sensor.nominal);
+    const padVal = Math.max(0.15, (hiVal - loVal) * 0.18);
+    const yLo = loVal - padVal;
+    const yHi = hiVal + padVal;
+    const ySpan = Math.max(0.001, yHi - yLo);
+
+    const mPts = series.map((p) => ({
+      ...p,
+      x: padL + ((p.dayOffset - xLo) / xSpan) * innerW,
+      y: padT + innerH - ((p.value - yLo) / ySpan) * innerH,
+    }));
+
+    const histPts = mPts.filter((p) => p.kind === 'history');
+    const forecastPts = mPts.filter((p) => p.kind === 'forecast');
+    const bridgeStart = histPts[histPts.length - 1];
+    const projChain = bridgeStart ? [bridgeStart, ...forecastPts] : forecastPts;
+
+    const hD = histPts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+    const pD = projChain.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+
+    return {
+      minX: xLo,
+      maxX: xHi,
+      yMin: yLo,
+      yMax: yHi,
+      mapped: mPts,
+      histD: hD,
+      projD: pD,
+      nowX: padL + ((0 - xLo) / xSpan) * innerW,
+      failX: padL + ((milestone.daysUntilFailure - xLo) / xSpan) * innerW,
+    };
+  }, [series, milestone, sensor.nominal, innerW, innerH]);
+
+  const mapY = (v: number) => padT + innerH - ((v - yMin) / Math.max(0.001, yMax - yMin)) * innerH;
+  const activePt = hoverIdx !== null && mapped[hoverIdx] ? mapped[hoverIdx] : mapped[mapped.length - 1];
+  const sev = severityMeta(milestone.severity);
+  const yTicks = [0, 0.33, 0.66, 1].map((t) => yMin + (yMax - yMin) * t);
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+        <div className="flex items-center gap-2 font-mono text-[11px] text-zinc-600 dark:text-zinc-300">
+          <span className="font-semibold text-violet-600 dark:text-violet-400">{sensor.tag}</span>
+          <span className="text-zinc-400">·</span>
+          <span>Solid: Sensor History</span>
+          <span className="text-zinc-400">·</span>
+          <span style={{ color: sev.accentHex }}>Dashed: OLS Failure Projection</span>
+        </div>
+        {activePt && (
+          <div className="font-mono tabular-nums text-[11px] text-zinc-600 dark:text-zinc-300">
+            <span>{activePt.dateLabel}</span>
+            <span className="mx-1.5 text-zinc-400">·</span>
+            <span className="font-semibold text-zinc-900 dark:text-white">
+              {activePt.value.toFixed(sensor.precision)} {sensor.unit}
+            </span>
+            <span className="ml-1.5 text-zinc-500">
+              ({activePt.kind === 'history' ? 'Observed' : `+${activePt.dayOffset}d Forecast`})
+            </span>
+          </div>
+        )}
+      </div>
+
+      <div className="relative w-full overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#0B0B0E]">
+        <svg
+          viewBox={`0 0 ${W} ${H}`}
+          className="w-full h-[224px] block cursor-crosshair select-none"
+          onMouseLeave={() => setHoverIdx(null)}
+          onMouseMove={(e) => {
+            if (!mapped.length) return;
+            const rect = e.currentTarget.getBoundingClientRect();
+            const relX = ((e.clientX - rect.left) / rect.width) * W;
+            let best = 0;
+            let bestDist = Infinity;
+            mapped.forEach((p, idx) => {
+              const d = Math.abs(p.x - relX);
+              if (d < bestDist) {
+                bestDist = d;
+                best = idx;
+              }
+            });
+            setHoverIdx(best);
+          }}
+        >
+          {/* Horizontal Grid & Y Labels */}
+          {yTicks.map((val, i) => {
+            const y = mapY(val);
+            return (
+              <g key={i}>
+                <line
+                  x1={padL}
+                  x2={W - padR}
+                  y1={y}
+                  y2={y}
+                  stroke="currentColor"
+                  className="text-zinc-200 dark:text-zinc-800/80"
+                  strokeWidth={1}
+                />
+                <text
+                  x={padL - 8}
+                  y={y + 3.5}
+                  textAnchor="end"
+                  className="fill-zinc-500 font-mono text-[10px]"
+                >
+                  {val.toFixed(sensor.precision)}
+                </text>
+              </g>
+            );
+          })}
+
+          {/* Forecast region subtle tint */}
+          <rect
+            x={nowX}
+            y={padT}
+            width={Math.max(0, W - padR - nowX)}
+            height={innerH}
+            fill={sev.accentHex}
+            opacity={0.05}
+          />
+
+          {/* "Today" vertical divider */}
+          <line
+            x1={nowX}
+            x2={nowX}
+            y1={padT}
+            y2={padT + innerH}
+            stroke="#71717A"
+            strokeDasharray="3 3"
+            strokeWidth={1}
+          />
+          <text x={nowX + 4} y={padT + 11} className="fill-zinc-500 font-mono text-[9.5px]">
+            Today
+          </text>
+
+          {/* Horizontal Alarm Threshold */}
+          <line
+            x1={padL}
+            x2={W - padR}
+            y1={mapY(milestone.alarmThreshold)}
+            y2={mapY(milestone.alarmThreshold)}
+            stroke="#F43F5E"
+            strokeDasharray="5 4"
+            strokeWidth={1.3}
+          />
+          <text
+            x={W - padR - 4}
+            y={Math.max(padT + 11, mapY(milestone.alarmThreshold) - 4)}
+            textAnchor="end"
+            className="fill-rose-500 font-mono text-[9.5px] font-semibold"
+          >
+            Alarm Limit ({milestone.alarmThreshold} {sensor.unit})
+          </text>
+
+          {/* Predicted Failure Vertical Marker */}
+          <line
+            x1={failX}
+            x2={failX}
+            y1={padT}
+            y2={padT + innerH}
+            stroke={sev.accentHex}
+            strokeDasharray="3 3"
+            strokeWidth={1.4}
+          />
+
+          {/* Solid Historical Curve */}
+          {histD && (
+            <path
+              d={histD}
+              fill="none"
+              stroke="#8B5CF6"
+              strokeWidth={2.2}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+            />
+          )}
+
+          {/* Dashed Projected Trajectory */}
+          {projD && (
+            <path
+              d={projD}
+              fill="none"
+              stroke={sev.accentHex}
+              strokeWidth={2.2}
+              strokeDasharray="6 4"
+              strokeLinejoin="round"
+              strokeLinecap="round"
+            />
+          )}
+
+          {/* Failure Intersection Diamond */}
+          <g transform={`translate(${failX}, ${mapY(milestone.alarmThreshold)})`}>
+            <polygon
+              points="0,-6 6,0 0,6 -6,0"
+              fill={sev.accentHex}
+              stroke="#FFFFFF"
+              strokeWidth={1.4}
+            />
+          </g>
+
+          {/* Hover Crosshair */}
+          {activePt && (
+            <g>
+              <line
+                x1={activePt.x}
+                x2={activePt.x}
+                y1={padT}
+                y2={padT + innerH}
+                stroke="#A1A1AA"
+                strokeWidth={1}
+                strokeDasharray="2 2"
+              />
+              <circle
+                cx={activePt.x}
+                cy={activePt.y}
+                r={4.2}
+                fill={activePt.kind === 'history' ? '#8B5CF6' : sev.accentHex}
+                stroke="#FFFFFF"
+                strokeWidth={1.5}
+              />
+            </g>
+          )}
+
+          {/* Bottom X Axis labels */}
+          <text x={padL} y={H - 8} className="fill-zinc-500 font-mono text-[9.5px]">
+            {minX}d History
+          </text>
+          <text x={nowX} y={H - 8} textAnchor="middle" className="fill-zinc-500 font-mono text-[9.5px]">
+            Now
+          </text>
+          <text
+            x={Math.min(W - padR, failX)}
+            y={H - 8}
+            textAnchor="end"
+            className="font-mono text-[9.5px] font-semibold"
+            fill={sev.accentHex}
+          >
+            Fail {milestone.predictedFailureDate} (+{maxX}d)
+          </text>
+        </svg>
+      </div>
+    </div>
   );
 };
 
@@ -338,6 +637,9 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
   const scene = useTwinStore((s) => s.scene);
   const drillInto = useTwinStore((s) => s.drillInto);
   const showToast = useTwinStore((s) => s.showToast);
+  const complianceByAssetId = useGmpStore((s) => s.complianceByAssetId);
+  const createWorkOrder = useGmpStore((s) => s.createWorkOrder);
+  const personnel = useGmpStore((s) => s.personnel);
 
   const dashboardOpen = useTelemetryStore((s) => s.dashboardOpen);
   const dashboardTab = useTelemetryStore((s) => s.dashboardTab);
@@ -350,6 +652,8 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
   const streamRunning = useTelemetryStore((s) => s.streamRunning);
   const activeScenario = useTelemetryStore((s) => s.activeScenario);
   const serverTime = useTelemetryStore((s) => s.serverTime);
+  const showMaintenanceMilestones = useTelemetryStore((s) => s.showMaintenanceMilestones);
+  const activeMilestoneAssetId = useTelemetryStore((s) => s.activeMilestoneAssetId);
 
   const closeDashboard = useTelemetryStore((s) => s.closeDashboard);
   const setDashboardTab = useTelemetryStore((s) => s.setDashboardTab);
@@ -363,6 +667,8 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
   const deleteRelationship = useTelemetryStore((s) => s.deleteRelationship);
   const triggerScenario = useTelemetryStore((s) => s.triggerScenario);
   const buildTelemetryTabUrl = useTelemetryStore((s) => s.buildTelemetryTabUrl);
+  const setShowMaintenanceMilestones = useTelemetryStore((s) => s.setShowMaintenanceMilestones);
+  const setActiveMilestoneAssetId = useTelemetryStore((s) => s.setActiveMilestoneAssetId);
 
   // Back navigation stack across all steps/tabs
   const [navHistory, setNavHistory] = useState<TelemetryDashboardTab[]>([]);
@@ -371,6 +677,8 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
   const moreMenuRef = useRef<HTMLDivElement | null>(null);
 
   const [categoryFilter, setCategoryFilter] = useState<'all' | 'bioreactors' | 'hplc' | 'equipment' | 'rooms' | 'alarms'>('all');
+  const [predictiveSeverityFilter, setPredictiveSeverityFilter] = useState<'all' | MaintenanceSeverity>('all');
+  const [selectedPredictiveAssetId, setSelectedPredictiveAssetId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
 
   // Sensor Definition Form State
@@ -595,6 +903,99 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
     [activeGroup, scene.floors]
   );
 
+  // Predictive Asset Failure & Maintenance Milestones computed from live sensor history
+  const maintenanceMilestones = useMemo(
+    () => computeAssetFailurePredictions(sensors, readings, scene.assets, complianceByAssetId),
+    [sensors, readings, scene.assets, complianceByAssetId]
+  );
+
+  const filteredMilestones = useMemo(() => {
+    if (predictiveSeverityFilter === 'all') return maintenanceMilestones;
+    return maintenanceMilestones.filter((m) => m.severity === predictiveSeverityFilter);
+  }, [maintenanceMilestones, predictiveSeverityFilter]);
+
+  const focusedAssetMilestone = useMemo(() => {
+    if (!focusedAsset) return null;
+    return maintenanceMilestones.find((m) => m.assetId === focusedAsset.id) ?? null;
+  }, [focusedAsset, maintenanceMilestones]);
+
+  const selectedMilestone = useMemo(() => {
+    const targetId = selectedPredictiveAssetId ?? activeMilestoneAssetId ?? dashboardFocusAssetId;
+    if (targetId) {
+      const hit = maintenanceMilestones.find((m) => m.assetId === targetId);
+      if (hit) return hit;
+    }
+    return filteredMilestones[0] ?? maintenanceMilestones[0] ?? null;
+  }, [
+    selectedPredictiveAssetId,
+    activeMilestoneAssetId,
+    dashboardFocusAssetId,
+    filteredMilestones,
+    maintenanceMilestones,
+  ]);
+
+  const selectedMilestoneSensor = useMemo(
+    () => (selectedMilestone ? sensors.find((s) => s.id === selectedMilestone.driverSensorId) ?? null : null),
+    [selectedMilestone, sensors]
+  );
+
+  const predictiveSummary = useMemo(() => {
+    const total = maintenanceMilestones.length;
+    const critical = maintenanceMilestones.filter((m) => m.severity === 'critical').length;
+    const warning = maintenanceMilestones.filter((m) => m.severity === 'warning').length;
+    const meanHealth =
+      total > 0
+        ? Math.round(maintenanceMilestones.reduce((acc, m) => acc + m.healthScore, 0) / total)
+        : 100;
+    return { total, critical, warning, meanHealth };
+  }, [maintenanceMilestones]);
+
+  const handleJumpToTimelineMilestone = (milestone: MaintenanceMilestone) => {
+    const twin = useTwinStore.getState();
+    setShowMaintenanceMilestones(true);
+    setActiveMilestoneAssetId(milestone.assetId);
+    twin.setScreen('workspace');
+    twin.setBottomTimelineOpen(true);
+    twin.setTimelineDate(milestone.predictedFailureDate);
+    twin.setActiveFloor(milestone.floorId);
+    twin.selectEntity({ type: 'asset', id: milestone.assetId });
+    if (!standalone) {
+      closeDashboard();
+      window.setTimeout(() => {
+        useTwinStore.getState().drillInto('asset', milestone.assetId);
+      }, 60);
+    }
+    showToast(
+      `Timeline set to Maintenance Milestone: ${milestone.assetCode} (${milestone.predictedFailureDate})`,
+      'info'
+    );
+  };
+
+  const handleSchedulePredictivePm = (milestone: MaintenanceMilestone) => {
+    const tech = personnel[0];
+    const wo = createWorkOrder({
+      title: `Predictive PM — ${milestone.assetCode} (${milestone.driverMetricLabel})`,
+      description: `Auto-scheduled from Telemetry Sensor History forecast.\nPredicted failure: ${milestone.predictedFailureDate} (${milestone.daysUntilFailure}d, ${milestone.confidencePct}% confidence).\nDriver: ${milestone.driverSensorTag} (${milestone.currentValue} ${milestone.unit} → Alarm ${milestone.alarmThreshold} ${milestone.unit}).\nAction: ${milestone.recommendedAction}`,
+      serviceType: 'maintenance',
+      targetKind: 'asset',
+      targetId: milestone.assetId,
+      targetName: `${milestone.assetCode} · ${milestone.assetName}`,
+      targetCategory: milestone.category,
+      assigneeId: tech?.id ?? 'tech-01',
+      assigneeName: tech?.name ?? 'Reliability Engineer',
+      priority: milestone.severity === 'critical' ? 'critical' : milestone.severity === 'warning' ? 'high' : 'medium',
+      status: 'open',
+      lastServiceDate: new Date().toISOString().slice(0, 10),
+      dueDate: milestone.recommendedServiceDate,
+      estimatedHours: 3,
+      checklist: [
+        { id: `pm-1-${Date.now()}`, text: milestone.recommendedAction, done: false },
+        { id: `pm-2-${Date.now()}`, text: `Verify ${milestone.driverSensorTag} returns within nominal band`, done: false },
+      ],
+    });
+    showToast(`Scheduled Predictive PM ${wo.woNumber} for ${milestone.assetCode} (due ${milestone.recommendedServiceDate})`, 'success');
+  };
+
   // Global Telemetry KPIs
   const kpis = useMemo(() => {
     const roomTemp = sensors.filter((s) => s.targetKind === 'room' && s.metric === 'temperature');
@@ -731,8 +1132,8 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
         : 'Back to 3D';
 
   const containerCls = standalone
-    ? 'h-screen w-screen flex flex-col bg-zinc-50 dark:bg-[#0A0A0D] text-zinc-900 dark:text-zinc-100 overflow-hidden'
-    : 'fixed inset-0 z-50 flex flex-col bg-zinc-50 dark:bg-[#0A0A0D] text-zinc-900 dark:text-zinc-100 overflow-hidden';
+    ? 'h-[100dvh] w-screen flex flex-col bg-zinc-50 dark:bg-[#0A0A0D] text-zinc-900 dark:text-zinc-100 overflow-hidden'
+    : 'fixed inset-0 h-[100dvh] z-50 flex flex-col bg-zinc-50 dark:bg-[#0A0A0D] text-zinc-900 dark:text-zinc-100 overflow-hidden';
 
   return (
     <div className={containerCls}>
@@ -782,6 +1183,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
           {(
             [
               { id: 'trends', label: 'Live Trends', icon: <Activity className="w-3.5 h-3.5" /> },
+              { id: 'predictive', label: 'Predictive Failure', icon: <TrendingDown className="w-3.5 h-3.5" /> },
               { id: 'equipment', label: 'Equipment Matrix', icon: <Cpu className="w-3.5 h-3.5" /> },
               { id: 'define', label: 'Add Sensor Tag', icon: <Plus className="w-3.5 h-3.5" /> },
               { id: 'relationships', label: 'Control Loops', icon: <GitBranch className="w-3.5 h-3.5" /> },
@@ -790,7 +1192,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
             <button
               key={t.id}
               onClick={() => navigateToTab(t.id)}
-              className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-medium whitespace-nowrap transition-colors ${
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium whitespace-nowrap transition-colors ${
                 dashboardTab === t.id
                   ? 'bg-violet-600 text-white shadow-sm'
                   : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100'
@@ -798,6 +1200,11 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
             >
               {t.icon}
               {t.label}
+              {t.id === 'predictive' && predictiveSummary.critical > 0 && (
+                <span className="ml-0.5 font-mono text-[10px] font-bold text-rose-400">
+                  ({predictiveSummary.critical})
+                </span>
+              )}
             </button>
           ))}
         </nav>
@@ -926,6 +1333,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
         {(
           [
             { id: 'trends', label: 'Live Trends' },
+            { id: 'predictive', label: 'Predictive Failure' },
             { id: 'equipment', label: 'Equipment Matrix' },
             { id: 'define', label: 'Add Sensor Tag' },
             { id: 'relationships', label: 'Control Loops' },
@@ -1253,6 +1661,52 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                         <div className="mt-0.5">{activeSensor.calibrationDue}</div>
                       </div>
                     </div>
+
+                    {/* Inline Predictive Failure Forecast Strip for Focused Asset */}
+                    {focusedAssetMilestone && (() => {
+                      const sev = severityMeta(focusedAssetMilestone.severity);
+                      return (
+                        <div className="mt-4 pt-3.5 border-t border-zinc-200 dark:border-zinc-800/80 flex flex-wrap items-center justify-between gap-3">
+                          <div className="space-y-0.5 min-w-0">
+                            <div className="text-[11px] font-mono text-zinc-500 dark:text-zinc-400 flex flex-wrap items-center gap-x-2">
+                              <span className={`font-semibold ${sev.textCls}`}>
+                                {sev.glyph} Predicted Failure: {focusedAssetMilestone.predictedFailureDate}
+                              </span>
+                              <span>·</span>
+                              <span className="tabular-nums">{focusedAssetMilestone.daysUntilFailure}d remaining</span>
+                              <span>·</span>
+                              <span className="tabular-nums">{focusedAssetMilestone.confidencePct}% confidence</span>
+                            </div>
+                            <div className="text-xs text-zinc-600 dark:text-zinc-300">
+                              Driver {focusedAssetMilestone.driverSensorTag} · Recommended PM by{' '}
+                              <span className="font-mono font-semibold">{focusedAssetMilestone.recommendedServiceDate}</span>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSelectedPredictiveAssetId(focusedAssetMilestone.assetId);
+                                navigateToTab('predictive');
+                              }}
+                              className="px-3 py-1.5 rounded-xl border border-zinc-200 dark:border-zinc-700 hover:border-violet-500 text-xs font-medium text-zinc-700 dark:text-zinc-200 cursor-pointer"
+                            >
+                              Forecast Curve
+                            </button>
+                            {!standalone && (
+                              <button
+                                type="button"
+                                onClick={() => handleJumpToTimelineMilestone(focusedAssetMilestone)}
+                                className="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                              >
+                                <CalendarClock className="w-3.5 h-3.5" />
+                                Show on Timeline
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
 
                   {/* Connected Sensor Relationships for This Asset */}
@@ -1996,6 +2450,345 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                       );
                     })}
                   </div>
+                </div>
+              </div>
+            </div>
+          </main>
+        )}
+
+        {/* TAB 5: PREDICTIVE FAILURE FORECAST & MAINTENANCE MILESTONES */}
+        {dashboardTab === 'predictive' && (
+          <main className="flex-1 overflow-y-auto p-4 lg:p-6">
+            <div className="max-w-[1440px] mx-auto space-y-5">
+              {/* Top Section Header + Timeline Sync Toggle */}
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={handleBack}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#17171F] hover:border-violet-500 text-xs font-medium cursor-pointer"
+                  >
+                    <ArrowLeft className="w-3.5 h-3.5 text-violet-500" />
+                    Back
+                  </button>
+                  <div>
+                    <h2 className="text-base font-semibold text-zinc-900 dark:text-white">
+                      Predictive Asset Failure &amp; Maintenance Milestones
+                    </h2>
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                      Extrapolated from live sensor drift regression and alarm margins · Synced directly to the 5D Timeline bar
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#17171F] text-xs font-medium text-zinc-700 dark:text-zinc-200 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={showMaintenanceMilestones}
+                      onChange={(e) => setShowMaintenanceMilestones(e.target.checked)}
+                      className="accent-amber-500 rounded"
+                    />
+                    <span>Show Milestones on 5D Timeline</span>
+                  </label>
+                  {!standalone && selectedMilestone && (
+                    <button
+                      type="button"
+                      onClick={() => handleJumpToTimelineMilestone(selectedMilestone)}
+                      className="h-9 px-3.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <CalendarClock className="w-3.5 h-3.5" />
+                      Open Timeline Bar
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* 4-Column Fleet Predictive KPI Strip */}
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                <div className="p-4 rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#121216]">
+                  <div className="text-xs text-zinc-500 dark:text-zinc-400">Monitored Equipment</div>
+                  <div className="mt-1 text-2xl font-mono font-bold tabular-nums text-zinc-900 dark:text-white">
+                    {predictiveSummary.total}
+                  </div>
+                  <div className="text-[11px] text-zinc-500 mt-0.5">Active sensor-history models</div>
+                </div>
+                <div className="p-4 rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#121216]">
+                  <div className="text-xs text-zinc-500 dark:text-zinc-400">Critical Failures (≤14d)</div>
+                  <div className="mt-1 text-2xl font-mono font-bold tabular-nums text-rose-500">
+                    {predictiveSummary.critical}
+                  </div>
+                  <div className="text-[11px] text-zinc-500 mt-0.5">Immediate PM intervention</div>
+                </div>
+                <div className="p-4 rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#121216]">
+                  <div className="text-xs text-zinc-500 dark:text-zinc-400">Upcoming Service (15–45d)</div>
+                  <div className="mt-1 text-2xl font-mono font-bold tabular-nums text-amber-500">
+                    {predictiveSummary.warning}
+                  </div>
+                  <div className="text-[11px] text-zinc-500 mt-0.5">Pinned as 5D timeline milestones</div>
+                </div>
+                <div className="p-4 rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#121216]">
+                  <div className="text-xs text-zinc-500 dark:text-zinc-400">Mean Fleet Health</div>
+                  <div className="mt-1 text-2xl font-mono font-bold tabular-nums text-emerald-500">
+                    {predictiveSummary.meanHealth}%
+                  </div>
+                  <div className="text-[11px] text-zinc-500 mt-0.5">Composite drift &amp; margin index</div>
+                </div>
+              </div>
+
+              {/* Selected Asset Degradation & Failure Horizon Chart */}
+              {selectedMilestone && selectedMilestoneSensor && (() => {
+                const sev = severityMeta(selectedMilestone.severity);
+                return (
+                  <div className="p-5 rounded-3xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#121216] space-y-4">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="space-y-1 min-w-0">
+                        <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+                          <span className="font-bold text-violet-600 dark:text-violet-400">
+                            {selectedMilestone.assetCode}
+                          </span>
+                          <span className="text-zinc-400">·</span>
+                          <span className={`font-semibold ${sev.textCls}`}>
+                            {sev.glyph} {sev.label} ({selectedMilestone.daysUntilFailure}d)
+                          </span>
+                          <span className="text-zinc-400">·</span>
+                          <span className="text-zinc-500 dark:text-zinc-400">
+                            {selectedMilestone.category}
+                          </span>
+                        </div>
+                        <h3 className="text-base font-bold text-zinc-900 dark:text-white">
+                          {selectedMilestone.assetName} — Failure Horizon {selectedMilestone.predictedFailureDate}
+                        </h3>
+                        <p className="text-xs text-zinc-600 dark:text-zinc-400">
+                          {selectedMilestone.recommendedAction}
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        {!standalone && (
+                          <button
+                            type="button"
+                            onClick={() => handleJumpToTimelineMilestone(selectedMilestone)}
+                            className="h-9 px-3.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <CalendarClock className="w-3.5 h-3.5" />
+                            Show on Timeline
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleSchedulePredictivePm(selectedMilestone)}
+                          className="h-9 px-3.5 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Wrench className="w-3.5 h-3.5" />
+                          Schedule PM ({selectedMilestone.recommendedServiceDate})
+                        </button>
+                        {!standalone && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const twin = useTwinStore.getState();
+                              twin.setScreen('workspace');
+                              closeDashboard();
+                              window.setTimeout(() => {
+                                useTwinStore.getState().drillInto('asset', selectedMilestone.assetId);
+                              }, 60);
+                            }}
+                            className="h-9 px-3 rounded-xl border border-zinc-200 dark:border-zinc-700 hover:border-violet-500 text-xs font-medium text-zinc-700 dark:text-zinc-200 flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <Box className="w-3.5 h-3.5 text-violet-500" />
+                            3D
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    <PredictiveHorizonChart
+                      sensor={selectedMilestoneSensor}
+                      snapshot={readings[selectedMilestoneSensor.id]}
+                      milestone={selectedMilestone}
+                    />
+
+                    <div className="pt-3 border-t border-zinc-200 dark:border-zinc-800 grid grid-cols-2 sm:grid-cols-6 gap-3 text-xs font-mono tabular-nums">
+                      <div>
+                        <div className="text-[10.5px] font-sans text-zinc-500">Current Reading</div>
+                        <div className="mt-0.5 font-semibold text-zinc-900 dark:text-white">
+                          {selectedMilestone.currentValue.toFixed(selectedMilestone.precision)} {selectedMilestone.unit}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[10.5px] font-sans text-zinc-500">Alarm Limit</div>
+                        <div className="mt-0.5 font-semibold text-rose-500">
+                          {selectedMilestone.alarmThreshold} {selectedMilestone.unit}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[10.5px] font-sans text-zinc-500">Est. Drift / Day</div>
+                        <div className="mt-0.5 font-semibold text-amber-500">
+                          {selectedMilestone.driftPerDay >= 0 ? '+' : ''}
+                          {selectedMilestone.driftPerDay} {selectedMilestone.unit}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[10.5px] font-sans text-zinc-500">Predicted Failure</div>
+                        <div className="mt-0.5 font-semibold" style={{ color: sev.accentHex }}>
+                          {selectedMilestone.predictedFailureDate}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[10.5px] font-sans text-zinc-500">Model Confidence</div>
+                        <div className="mt-0.5 font-semibold text-zinc-900 dark:text-white">
+                          {selectedMilestone.confidencePct}% (n={selectedMilestone.sampleCount})
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[10.5px] font-sans text-zinc-500">Asset Health</div>
+                        <div className="mt-0.5 font-semibold text-zinc-900 dark:text-white">
+                          {selectedMilestone.healthScore} / 100
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Ranked Maintenance Milestones Table */}
+              <div className="rounded-3xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#121216] overflow-hidden">
+                <div className="px-5 py-3.5 border-b border-zinc-200 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-zinc-900 dark:text-white">
+                      Maintenance Milestones Forecast ({filteredMilestones.length})
+                    </h3>
+                    <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                      Click any row to inspect its degradation trajectory or scrub directly to its Maintenance Milestone on the 5D Timeline
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-1 p-1 rounded-xl bg-zinc-100 dark:bg-[#191922] border border-zinc-200 dark:border-zinc-800">
+                    {(
+                      [
+                        { id: 'all', label: 'All' },
+                        { id: 'critical', label: 'Critical ≤14d' },
+                        { id: 'warning', label: 'Due Soon ≤45d' },
+                        { id: 'advisory', label: 'Advisory' },
+                        { id: 'healthy', label: 'Healthy' },
+                      ] as const
+                    ).map((f) => (
+                      <button
+                        key={f.id}
+                        type="button"
+                        onClick={() => setPredictiveSeverityFilter(f.id)}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                          predictiveSeverityFilter === f.id
+                            ? 'bg-violet-600 text-white'
+                            : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100'
+                        }`}
+                      >
+                        {f.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#16161E] text-[11px] text-zinc-500 dark:text-zinc-400 font-medium">
+                        <th className="py-2.5 px-4">Equipment</th>
+                        <th className="py-2.5 px-3">Driver Sensor</th>
+                        <th className="py-2.5 px-3 text-right">Live / Alarm</th>
+                        <th className="py-2.5 px-3 text-right">Predicted Failure</th>
+                        <th className="py-2.5 px-3 text-right">Confidence</th>
+                        <th className="py-2.5 px-3 text-right">Health</th>
+                        <th className="py-2.5 px-4 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
+                      {filteredMilestones.map((m) => {
+                        const sev = severityMeta(m.severity);
+                        const isSel = selectedMilestone?.assetId === m.assetId;
+                        return (
+                          <tr
+                            key={m.id}
+                            onClick={() => setSelectedPredictiveAssetId(m.assetId)}
+                            className={`cursor-pointer transition-colors ${
+                              isSel
+                                ? 'bg-violet-500/10'
+                                : 'hover:bg-zinc-50 dark:hover:bg-[#181822]'
+                            }`}
+                          >
+                            <td className="py-3 px-4">
+                              <div className="font-mono font-semibold text-zinc-900 dark:text-white">
+                                {m.assetCode}
+                              </div>
+                              <div className="text-[11px] text-zinc-500 dark:text-zinc-400 truncate max-w-[200px]">
+                                {m.assetName}
+                              </div>
+                            </td>
+                            <td className="py-3 px-3">
+                              <div className="font-mono text-violet-600 dark:text-violet-400">
+                                {m.driverSensorTag}
+                              </div>
+                              <div className="text-[11px] text-zinc-500">{m.driverMetricLabel}</div>
+                            </td>
+                            <td className="py-3 px-3 text-right font-mono tabular-nums whitespace-nowrap">
+                              <div className="font-semibold text-zinc-900 dark:text-white">
+                                {m.currentValue.toFixed(m.precision)} {m.unit}
+                              </div>
+                              <div className="text-[10.5px] text-rose-500">
+                                Limit {m.alarmThreshold} {m.unit}
+                              </div>
+                            </td>
+                            <td className="py-3 px-3 text-right font-mono tabular-nums whitespace-nowrap">
+                              <div className={`font-semibold ${sev.textCls}`}>
+                                {sev.glyph} {m.predictedFailureDate}
+                              </div>
+                              <div className="text-[10.5px] text-zinc-500">
+                                in {m.daysUntilFailure}d · PM {m.recommendedServiceDate}
+                              </div>
+                            </td>
+                            <td className="py-3 px-3 text-right font-mono tabular-nums">
+                              {m.confidencePct}%
+                            </td>
+                            <td className="py-3 px-3 text-right font-mono tabular-nums">
+                              <span className={m.healthScore < 55 ? 'text-rose-500 font-semibold' : m.healthScore < 75 ? 'text-amber-500 font-semibold' : 'text-emerald-500 font-semibold'}>
+                                {m.healthScore}%
+                              </span>
+                            </td>
+                            <td
+                              className="py-3 px-4 text-right whitespace-nowrap"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <div className="inline-flex items-center gap-1.5">
+                                {!standalone && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleJumpToTimelineMilestone(m)}
+                                    className="px-2.5 py-1 rounded-lg bg-amber-500/15 hover:bg-amber-500 text-amber-600 dark:text-amber-400 hover:text-zinc-950 font-semibold text-[11px] transition-colors cursor-pointer"
+                                  >
+                                    Timeline
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => handleSchedulePredictivePm(m)}
+                                  className="px-2.5 py-1 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:border-violet-500 text-zinc-700 dark:text-zinc-200 text-[11px] font-medium transition-colors cursor-pointer"
+                                >
+                                  PM Order
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                      {filteredMilestones.length === 0 && (
+                        <tr>
+                          <td colSpan={7} className="py-8 text-center text-xs text-zinc-500">
+                            No equipment matches this predictive severity filter.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
                 </div>
               </div>
             </div>

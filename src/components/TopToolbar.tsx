@@ -4,6 +4,7 @@ import {
   AppWindow,
   ArrowLeft,
   Box,
+  CalendarClock,
   Camera,
   ChevronDown,
   CloudUpload,
@@ -11,6 +12,8 @@ import {
   DoorOpen,
   Download,
   Droplets,
+  FileText,
+  Flame,
   Footprints,
   Gauge,
   Glasses,
@@ -33,6 +36,7 @@ import {
   Ruler,
   Save,
   Scale,
+  ScanText,
   Scissors,
   Search,
   Server,
@@ -51,6 +55,9 @@ import {
   QrCode,
   Shield,
   TrendingDown,
+  Eye,
+  Lock,
+  Pencil,
   Wand2,
   Waypoints,
   Workflow,
@@ -59,7 +66,8 @@ import {
 import { useTwinStore } from '../store/useTwinStore';
 import { useTelemetryStore } from '../store/useTelemetryStore';
 import { useGmpStore } from '../store/useGmpStore';
-import { useAclStore } from '../store/useAclStore';
+import { useRiskIncidentStore } from '../store/useRiskIncidentStore';
+import { useAclStore, computeEffectivePermissions, getActiveAclUser } from '../store/useAclStore';
 import { useAuth } from '../context/AuthContext';
 import { UserAvatarMenu } from './UserAvatarMenu';
 import type { OrthoPreset, ToolMode } from '../types/twin';
@@ -67,6 +75,10 @@ import type { OrthoPreset, ToolMode } from '../types/twin';
 export const TopToolbar: React.FC = () => {
   const scene = useTwinStore((s) => s.scene);
   const activeFloorId = useTwinStore((s) => s.activeFloorId);
+  const activeBuildingId = useTwinStore((s) => s.activeBuildingId);
+  const drillLevel = useTwinStore((s) => s.drillLevel);
+  const showAllFloors = useTwinStore((s) => s.showAllFloors);
+  const workspaceMode = useTwinStore((s) => s.workspaceMode);
   const viewMode = useTwinStore((s) => s.viewMode);
   const orthoPreset = useTwinStore((s) => s.orthoPreset);
   const activeTool = useTwinStore((s) => s.activeTool);
@@ -81,6 +93,7 @@ export const TopToolbar: React.FC = () => {
   const sectionCutFlipped = useTwinStore((s) => s.sectionCutFlipped);
   const explodedFactor = useTwinStore((s) => s.explodedFactor);
   const firstPersonMode = useTwinStore((s) => s.firstPersonMode);
+  const vrSessionActive = useTwinStore((s) => s.vrSessionActive);
   const lightingMode = useTwinStore((s) => s.lightingMode);
   const showNavMesh = useTwinStore((s) => s.showNavMesh);
   const animateFlows = useTwinStore((s) => s.animateFlows);
@@ -94,6 +107,9 @@ export const TopToolbar: React.FC = () => {
 
   const setScreen = useTwinStore((s) => s.setScreen);
   const setActiveFloor = useTwinStore((s) => s.setActiveFloor);
+  const setShowAllFloors = useTwinStore((s) => s.setShowAllFloors);
+  const drillInto = useTwinStore((s) => s.drillInto);
+  const setWorkspaceMode = useTwinStore((s) => s.setWorkspaceMode);
   const setViewMode = useTwinStore((s) => s.setViewMode);
   const setOrthoPreset = useTwinStore((s) => s.setOrthoPreset);
   const setActiveTool = useTwinStore((s) => s.setActiveTool);
@@ -107,6 +123,7 @@ export const TopToolbar: React.FC = () => {
   const resetSectionCut = useTwinStore((s) => s.resetSectionCut);
   const setExplodedFactor = useTwinStore((s) => s.setExplodedFactor);
   const setFirstPersonMode = useTwinStore((s) => s.setFirstPersonMode);
+  const requestVrToggle = useTwinStore((s) => s.requestVrToggle);
   const toggleLightingMode = useTwinStore((s) => s.toggleLightingMode);
   const setShowNavMesh = useTwinStore((s) => s.setShowNavMesh);
   const setAnimateFlows = useTwinStore((s) => s.setAnimateFlows);
@@ -115,6 +132,7 @@ export const TopToolbar: React.FC = () => {
   const setShowExportModal = useTwinStore((s) => s.setShowExportModal);
   const setShowXRModal = useTwinStore((s) => s.setShowXRModal);
   const setShowAIPlannerModal = useTwinStore((s) => s.setShowAIPlannerModal);
+  const setShowCadOcrModal = useTwinStore((s) => s.setShowCadOcrModal);
   const setShowModelsGallery = useTwinStore((s) => s.setShowModelsGallery);
   const setShowQuickSearch = useTwinStore((s) => s.setShowQuickSearch);
   const setShowMayaChat = useTwinStore((s) => s.setShowMayaChat);
@@ -138,10 +156,31 @@ export const TopToolbar: React.FC = () => {
   const activeAlarmCount = Object.values(readings).filter((r) => r.status === 'alarm').length;
   const openGmpModal = useGmpStore((s) => s.openGmpModal);
   const openQrLabelModal = useGmpStore((s) => s.openQrLabelModal);
+  const openResourceSchedulingModal = useGmpStore((s) => s.openResourceSchedulingModal);
+  const heldSchedulesCount = useGmpStore(
+    (s) => s.resourceAssignments.filter((a) => a.status === 'telemetry-hold').length
+  );
   const showMiniMap = useGmpStore((s) => s.showMiniMap);
   const setShowMiniMap = useGmpStore((s) => s.setShowMiniMap);
   const overdueWorkOrders = useGmpStore((s) => s.workOrders.filter((w) => w.status === 'overdue').length);
+  const selected = useTwinStore((s) => s.selected);
+  const openRiskModal = useRiskIncidentStore((s) => s.openRiskModal);
+  const openAssetPdfModal = useRiskIncidentStore((s) => s.openAssetPdfModal);
+  const openRiskCount = useRiskIncidentStore(
+    (s) => s.incidents.filter((i) => i.status === 'open' || i.status === 'investigating').length
+  );
   const openAclModal = useAclStore((s) => s.openAclModal);
+  const aclUsers = useAclStore((s) => s.users);
+  const aclRoles = useAclStore((s) => s.roles);
+  const aclGroups = useAclStore((s) => s.groups);
+  const activeAclUserId = useAclStore((s) => s.activeAclUserId);
+  const aclCanEdit = (() => {
+    const activeUser = getActiveAclUser({ users: aclUsers, activeAclUserId });
+    if (!activeUser) return true;
+    if (activeUser.status === 'suspended') return false;
+    return computeEffectivePermissions(activeUser, aclRoles, aclGroups).includes('spatial.edit');
+  })();
+  const isReadOnly = workspaceMode === 'view' || !aclCanEdit;
 
   const { user, signInWithGoogle, getIdToken } = useAuth();
   const [savingCloud, setSavingCloud] = useState(false);
@@ -296,11 +335,30 @@ export const TopToolbar: React.FC = () => {
         </button>
 
         <select
-          aria-label="Active Floor"
-          value={activeFloorId}
-          onChange={(e) => setActiveFloor(e.target.value)}
-          className="h-9 px-2.5 text-xs font-medium rounded-xl bg-zinc-100 dark:bg-[#18181F] border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100 max-w-[140px] lg:max-w-[185px] truncate focus:outline-none focus:border-violet-500"
+          aria-label="Active Floor or Campus View"
+          value={
+            drillLevel === 'campus'
+              ? '__SITE__'
+              : showAllFloors
+                ? '__ALL_FLOORS__'
+                : activeFloorId
+          }
+          onChange={(e) => {
+            const val = e.target.value;
+            if (val === '__SITE__') {
+              drillInto('campus');
+            } else if (val === '__ALL_FLOORS__') {
+              drillInto('building', activeBuildingId);
+              setShowAllFloors(true);
+            } else {
+              setShowAllFloors(false);
+              setActiveFloor(val);
+            }
+          }}
+          className="h-9 px-2.5 text-xs font-medium rounded-xl bg-zinc-100 dark:bg-[#18181F] border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100 max-w-[148px] lg:max-w-[192px] truncate focus:outline-none focus:border-violet-500"
         >
+          <option value="__SITE__">All Buildings (Site)</option>
+          <option value="__ALL_FLOORS__">All Floors (Building)</option>
           {scene.floors.map((fl) => (
             <option key={fl.id} value={fl.id}>
               {fl.code} — {fl.name}
@@ -342,8 +400,47 @@ export const TopToolbar: React.FC = () => {
         </div>
       </div>
 
-      {/* ZONE 2 (Center): Clean View Mode Switcher + Hover/Click CAD Tools & 3D/Heatmap Popovers */}
+      {/* ZONE 2 (Center): Design/View Lock + View Mode Switcher + CAD Tools & 3D/Heatmap Popovers */}
       <div className="flex items-center gap-2 shrink-0">
+        {/* Strict Design / View Mode Segmented Switcher */}
+        <div
+          className="flex items-center bg-zinc-100 dark:bg-[#18181F] p-1 rounded-xl border border-zinc-200 dark:border-zinc-800"
+          title={
+            !aclCanEdit
+              ? 'ACL Read-Only — active role lacks spatial edit permission'
+              : 'Switch between Design Mode (editable) and View Mode (strict read-only)'
+          }
+        >
+          <button
+            onClick={() => {
+              if (!aclCanEdit) {
+                showToast('ACL Read-Only: active user role cannot enter Design Mode.', 'warning');
+                return;
+              }
+              setWorkspaceMode('design');
+            }}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold whitespace-nowrap transition-colors ${
+              !isReadOnly
+                ? 'bg-violet-600 text-white shadow-xs'
+                : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
+            } ${!aclCanEdit ? 'opacity-45 cursor-not-allowed' : ''}`}
+          >
+            <Pencil className="w-3 h-3" />
+            <span className="hidden xl:inline">Design</span>
+          </button>
+          <button
+            onClick={() => setWorkspaceMode('view')}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold whitespace-nowrap transition-colors ${
+              isReadOnly
+                ? 'bg-amber-500 text-zinc-950 shadow-xs'
+                : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
+            }`}
+          >
+            {!aclCanEdit ? <Lock className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
+            <span className="hidden xl:inline">{!aclCanEdit ? 'ACL Lock' : 'View'}</span>
+          </button>
+        </div>
+
         {/* CAD Authoring Tools — Hover or Click Popover (Eliminates Always-Visible Clutter) */}
         <div
           className="relative"
@@ -372,33 +469,39 @@ export const TopToolbar: React.FC = () => {
                   <span className="font-mono text-zinc-400">Shortcuts</span>
                 </div>
                 <div className="grid grid-cols-2 gap-1.5">
-                  {tools.map((t) => (
-                    <button
-                      key={t.id}
-                      onClick={() => {
-                        setActiveTool(t.id);
-                        t.onPick?.();
-                        setOpenMenu('none');
-                      }}
-                      className={`flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl text-xs font-medium transition-colors ${
-                        activeTool === t.id
-                          ? 'bg-violet-600 text-white shadow-xs'
-                          : 'bg-zinc-50 dark:bg-[#1B1B24] text-zinc-700 dark:text-zinc-200 hover:bg-violet-500/15 hover:text-violet-600 dark:hover:text-violet-300'
-                      }`}
-                    >
-                      <span className="flex items-center gap-2 truncate">
-                        {t.icon}
-                        <span className="truncate">{t.label}</span>
-                      </span>
-                      <kbd
-                        className={`text-[9.5px] font-mono px-1 rounded ${
-                          activeTool === t.id ? 'bg-white/20 text-white' : 'text-zinc-400'
+                  {tools.map((t) => {
+                    const toolBlocked = isReadOnly && t.id !== 'select' && t.id !== 'measure';
+                    return (
+                      <button
+                        key={t.id}
+                        disabled={toolBlocked}
+                        onClick={() => {
+                          setActiveTool(t.id);
+                          t.onPick?.();
+                          setOpenMenu('none');
+                        }}
+                        className={`flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl text-xs font-medium transition-colors ${
+                          activeTool === t.id
+                            ? 'bg-violet-600 text-white shadow-xs'
+                            : toolBlocked
+                              ? 'bg-zinc-100/60 dark:bg-[#181820]/60 text-zinc-400 opacity-45 cursor-not-allowed'
+                              : 'bg-zinc-50 dark:bg-[#1B1B24] text-zinc-700 dark:text-zinc-200 hover:bg-violet-500/15 hover:text-violet-600 dark:hover:text-violet-300'
                         }`}
                       >
-                        {t.shortcut}
-                      </kbd>
-                    </button>
-                  ))}
+                        <span className="flex items-center gap-2 truncate">
+                          {t.icon}
+                          <span className="truncate">{t.label}</span>
+                        </span>
+                        <kbd
+                          className={`text-[9.5px] font-mono px-1 rounded ${
+                            activeTool === t.id ? 'bg-white/20 text-white' : 'text-zinc-400'
+                          }`}
+                        >
+                          {t.shortcut}
+                        </kbd>
+                      </button>
+                    );
+                  })}
                 </div>
 
                 {/* Transform Gizmo + Snap/Grid Quick Row */}
@@ -678,12 +781,14 @@ export const TopToolbar: React.FC = () => {
                     </div>
                   )}
 
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[11px] text-zinc-600 dark:text-zinc-300">
-                      <span className="flex items-center gap-1.5">
-                        <Layers className="w-3.5 h-3.5 text-amber-500" /> Exploded Floors
+                  <div className="space-y-1.5">
+                    <div className="flex justify-between items-center text-[11px] text-zinc-600 dark:text-zinc-300">
+                      <span className="flex items-center gap-1.5 font-medium">
+                        <Layers className="w-3.5 h-3.5 text-amber-500" /> Floor Decomposition
                       </span>
-                      <span className="font-mono">{Math.round(explodedFactor * 100)}%</span>
+                      <span className="font-mono tabular-nums text-amber-500 font-semibold">
+                        {Math.round(explodedFactor * 100)}%
+                      </span>
                     </div>
                     <input
                       type="range"
@@ -694,6 +799,21 @@ export const TopToolbar: React.FC = () => {
                       onChange={(e) => setExplodedFactor(Number(e.target.value))}
                       className="w-full accent-amber-500"
                     />
+                    <div className="grid grid-cols-3 gap-1">
+                      {[0, 0.5, 1].map((preset) => (
+                        <button
+                          key={preset}
+                          onClick={() => setExplodedFactor(preset)}
+                          className={`py-1 rounded-lg text-[10px] font-mono font-semibold transition-colors ${
+                            Math.abs(explodedFactor - preset) < 0.04
+                              ? 'bg-amber-500 text-zinc-950'
+                              : 'bg-zinc-100 dark:bg-[#1D1D26] text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
+                          }`}
+                        >
+                          {preset === 0 ? 'Stacked 0%' : preset === 0.5 ? 'Split 50%' : 'Decomp 100%'}
+                        </button>
+                      ))}
+                    </div>
                   </div>
 
                   {/* Quick 3D Overlays: Night Spotlights, NavMesh, Animated Flows, Flow Legend */}
@@ -761,6 +881,28 @@ export const TopToolbar: React.FC = () => {
         >
           <Footprints className={`w-3.5 h-3.5 ${firstPersonMode ? 'text-white' : 'text-violet-500'}`} />
           <span className="hidden lg:inline">{firstPersonMode ? 'Exit Walk' : 'Walkthrough'}</span>
+        </button>
+
+        {/* WebXR VR Immersion Toggle */}
+        <button
+          type="button"
+          onClick={() => {
+            if (!vrSessionActive && viewMode === '2d') {
+              setViewMode('3d-perspective');
+              setTimeout(() => requestVrToggle(), 80);
+            } else {
+              requestVrToggle();
+            }
+          }}
+          className={`flex items-center gap-1.5 h-9 px-3 rounded-xl border text-xs font-semibold whitespace-nowrap transition-colors cursor-pointer ${
+            vrSessionActive
+              ? 'border-cyan-400 bg-cyan-500 text-zinc-950 shadow-sm'
+              : 'border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-[#18181F] text-zinc-700 dark:text-zinc-200 hover:border-cyan-500'
+          }`}
+          title="Launch WebXR VR Immersion Session for Active 3D Viewport"
+        >
+          <Glasses className={`w-3.5 h-3.5 ${vrSessionActive ? 'text-zinc-950' : 'text-cyan-500'}`} />
+          <span className="hidden xl:inline">{vrSessionActive ? 'Exit VR' : 'VR Immersion'}</span>
         </button>
       </div>
 
@@ -864,6 +1006,31 @@ export const TopToolbar: React.FC = () => {
           )}
         </button>
 
+        {/* Telemetry-Gated Resource & Zone Scheduling */}
+        <button
+          onClick={() => openResourceSchedulingModal(null)}
+          className="hidden sm:flex items-center gap-1.5 h-9 px-2.5 sm:px-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] hover:border-violet-500 text-zinc-800 dark:text-zinc-200 text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+          title="Telemetry-Gated Resource & Zone Scheduling (Personnel & GMP Equipment)"
+        >
+          <CalendarClock className="w-3.5 h-3.5 text-violet-500" />
+          <span className="hidden xl:inline">Schedule</span>
+          {heldSchedulesCount > 0 && (
+            <span className="px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-500 font-mono text-[10px] font-bold tabular-nums">
+              {heldSchedulesCount}
+            </span>
+          )}
+        </button>
+
+        {/* Dedicated CAD / DWG / SVG -> Plan Walls OCR Tool */}
+        <button
+          onClick={() => setShowCadOcrModal(true)}
+          className="hidden md:flex items-center gap-1.5 h-9 px-2.5 sm:px-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] hover:border-cyan-500 text-zinc-800 dark:text-zinc-200 text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+          title="DWG / DXF / SVG to Plan Walls & Glass Curtain Walls using Vision OCR"
+        >
+          <ScanText className="w-3.5 h-3.5 text-cyan-400" />
+          <span className="hidden xl:inline">CAD / SVG OCR</span>
+        </button>
+
         {/* QR / Barcode Camera Scanner & Label Designer */}
         <button
           onClick={() => openQrLabelModal('scanner')}
@@ -897,10 +1064,20 @@ export const TopToolbar: React.FC = () => {
                   setShowAIPlannerModal(true);
                   setOpenMenu('none');
                 }}
-                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-violet-500/12 hover:text-violet-600 dark:hover:text-violet-300 transition-colors"
+                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-violet-500/12 hover:text-violet-600 dark:hover:text-violet-300 transition-colors cursor-pointer"
               >
                 <Wand2 className="w-4 h-4 text-violet-500" />
                 <span>AI Floor Planner Playground</span>
+              </button>
+              <button
+                onClick={() => {
+                  setShowCadOcrModal(true);
+                  setOpenMenu('none');
+                }}
+                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-cyan-500/12 hover:text-cyan-600 dark:hover:text-cyan-300 transition-colors cursor-pointer"
+              >
+                <ScanText className="w-4 h-4 text-cyan-400" />
+                <span>DWG / SVG to Walls (OCR)</span>
               </button>
               <button
                 onClick={() => {
@@ -963,6 +1140,51 @@ export const TopToolbar: React.FC = () => {
               <div className="px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
                 GMP Operations &amp; Labels
               </div>
+              <button
+                onClick={() => {
+                  openRiskModal({ mode: 'heatmap', floorId: activeFloorId });
+                  setOpenMenu('none');
+                }}
+                className="w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-amber-500/12 hover:text-amber-600 dark:hover:text-amber-400 transition-colors cursor-pointer"
+              >
+                <span className="flex items-center gap-2.5">
+                  <Flame className="w-4 h-4 text-amber-500" />
+                  <span>Facility Risk Heatmap (S×O)</span>
+                </span>
+                {openRiskCount > 0 && (
+                  <span className="px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-500 font-mono text-[9.5px] font-bold tabular-nums">
+                    {openRiskCount}
+                  </span>
+                )}
+              </button>
+              <button
+                onClick={() => {
+                  const selAsset = selected.find((s) => s.type === 'asset');
+                  openAssetPdfModal(selAsset?.id ?? null);
+                  setOpenMenu('none');
+                }}
+                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-violet-500/12 hover:text-violet-600 dark:hover:text-violet-300 transition-colors cursor-pointer"
+              >
+                <FileText className="w-4 h-4 text-violet-500" />
+                <span>Asset FMEA &amp; GMP PDF Report</span>
+              </button>
+              <button
+                onClick={() => {
+                  openResourceSchedulingModal(null);
+                  setOpenMenu('none');
+                }}
+                className="w-full flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-violet-500/12 hover:text-violet-600 dark:hover:text-violet-300 transition-colors cursor-pointer"
+              >
+                <span className="flex items-center gap-2.5">
+                  <CalendarClock className="w-4 h-4 text-violet-500" />
+                  <span>Resource &amp; Zone Scheduling</span>
+                </span>
+                {heldSchedulesCount > 0 && (
+                  <span className="px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-500 font-mono text-[9.5px] font-bold tabular-nums">
+                    {heldSchedulesCount}
+                  </span>
+                )}
+              </button>
               <button
                 onClick={() => {
                   openGmpModal({ tab: 'lines' });

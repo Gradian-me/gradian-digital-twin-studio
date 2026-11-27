@@ -1363,10 +1363,10 @@ export const PredictiveForecastPanel: React.FC<PredictiveForecastPanelProps> = (
     : aiDiagByKey['fleet'] ?? null;
 
   return (
-    <div className="flex-1 overflow-hidden flex flex-col">
+    <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y lg:overflow-hidden flex flex-col">
       {/* Top Enterprise EAM & EMS KPI Ribbon + Controls */}
       <div
-        className={`px-4 py-3 border-b flex flex-wrap items-center justify-between gap-3 shrink-0 ${
+        className={`px-3 sm:px-4 py-2.5 sm:py-3 border-b flex flex-col lg:flex-row lg:flex-wrap lg:items-center lg:justify-between gap-2.5 sm:gap-3 shrink-0 ${
           isDark ? 'bg-[#13131A] border-zinc-800' : 'bg-slate-50 border-slate-200'
         }`}
       >
@@ -1535,10 +1535,10 @@ export const PredictiveForecastPanel: React.FC<PredictiveForecastPanelProps> = (
         </div>
       </div>
 
-      {/* Main Asymmetric Workspace: Left Recharts Timeline + Line Readiness | Right AI-First EAM & EMS Inspector */}
-      <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 overflow-hidden">
+      {/* Main Asymmetric Workspace: Unified smooth scroll on mobile, independent 2-column panes on desktop */}
+      <div className="lg:flex-1 lg:min-h-0 grid grid-cols-1 lg:grid-cols-12 lg:overflow-hidden">
         {/* Left Stage */}
-        <div className="lg:col-span-8 overflow-y-auto p-4 space-y-4">
+        <div className="lg:col-span-8 lg:min-h-0 lg:overflow-y-auto p-3 sm:p-4 space-y-4">
           {/* Active Critical GxP Alerts Action Strip (only when alerts exist) */}
           {fleetAlerts.length > 0 && (
             <div
@@ -2089,13 +2089,13 @@ export const PredictiveForecastPanel: React.FC<PredictiveForecastPanelProps> = (
 
         {/* Right Column: AI-First EAM & EMS Command Inspector */}
         <div
-          className={`lg:col-span-4 border-l flex flex-col overflow-hidden ${
+          className={`lg:col-span-4 border-t lg:border-t-0 lg:border-l flex flex-col lg:min-h-0 lg:overflow-hidden ${
             isDark ? 'bg-[#121219] border-zinc-800' : 'bg-slate-50 border-slate-200'
           }`}
         >
           {/* Inspector Sub-Tabs */}
           <div
-            className={`px-3 py-2 border-b flex items-center gap-1 shrink-0 ${
+            className={`px-3 py-2 border-b flex items-center gap-1 overflow-x-auto shrink-0 ${
               isDark ? 'bg-[#16161F] border-zinc-800' : 'bg-white border-slate-200'
             }`}
           >
@@ -2110,7 +2110,7 @@ export const PredictiveForecastPanel: React.FC<PredictiveForecastPanelProps> = (
                 key={tab.id}
                 type="button"
                 onClick={() => setInspectorTab(tab.id)}
-                className={`flex-1 py-1.5 px-2 rounded-lg text-[11px] font-semibold flex items-center justify-center gap-1.5 whitespace-nowrap transition cursor-pointer ${
+                className={`flex-1 py-1.5 px-2.5 rounded-lg text-[11px] font-semibold flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 transition cursor-pointer ${
                   inspectorTab === tab.id
                     ? 'bg-violet-600 text-white'
                     : isDark
@@ -2124,7 +2124,7 @@ export const PredictiveForecastPanel: React.FC<PredictiveForecastPanelProps> = (
             ))}
           </div>
 
-          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          <div className="lg:flex-1 lg:overflow-y-auto p-3.5 sm:p-4 space-y-4">
             {activeForecast ? (
               <>
                 {/* Selected Asset Header */}

@@ -247,3 +247,29 @@ export type GmpModalTab =
   | 'wiki';
 export type QrLabelModalTab = 'scanner' | 'designer';
 
+export type ShiftWindow = 'morning-06-14' | 'swing-14-22' | 'night-22-06';
+export type AssignmentStatus = 'scheduled' | 'active' | 'telemetry-hold' | 'completed';
+
+export interface ResourceAssignment {
+  id: string;
+  roomId: string;
+  roomCode: string;
+  roomName: string;
+  floorId: string;
+  date: string; // YYYY-MM-DD
+  shift: ShiftWindow;
+  resourceKind: 'personnel' | 'equipment';
+  resourceId: string;
+  resourceCode: string;
+  resourceName: string;
+  roleOrCategory: string;
+  status: AssignmentStatus;
+  telemetryGatePassed: boolean;
+  telemetrySnapshotNote: string;
+  overrideReason?: string;
+  notes?: string;
+  createdAt: string;
+  assignedBy: string;
+}
+
+

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type {
+  AssignmentStatus,
   CronScheduleJob,
   EligibilityIssue,
   EligibleTechnician,
@@ -11,7 +12,9 @@ import type {
   ProductionLine,
   ProductionLineEligibilityResult,
   QrLabelModalTab,
+  ResourceAssignment,
   ServiceActionType,
+  ShiftWindow,
   SopDocument,
   WikiArticle,
   WorkOrder,
@@ -43,6 +46,7 @@ interface PersistedGmpState {
   sops: SopDocument[];
   wikiArticles: WikiArticle[];
   workflows?: GmpWorkflowInstance[];
+  resourceAssignments?: ResourceAssignment[];
 }
 
 function loadPersistedGmp(): Partial<PersistedGmpState> | null {
@@ -82,6 +86,7 @@ interface GmpState {
   sops: SopDocument[];
   wikiArticles: WikiArticle[];
   workflows: GmpWorkflowInstance[];
+  resourceAssignments: ResourceAssignment[];
 
   // UI & Modal navigation
   showGmpModal: boolean;
@@ -94,6 +99,9 @@ interface GmpState {
   showQrLabelModal: boolean;
   qrLabelTab: QrLabelModalTab;
   preselectedLabelIds: string[];
+
+  showResourceSchedulingModal: boolean;
+  focusedScheduleRoomId: string | null;
 
   showMiniMap: boolean;
   miniMapTarget: MiniMapJumpTarget | null;
@@ -166,6 +174,19 @@ interface GmpState {
   openQrLabelModal: (tab?: QrLabelModalTab, preselectedIds?: string[]) => void;
   closeQrLabelModal: () => void;
 
+  // Resource Scheduling & Zone Dispatch
+  openResourceSchedulingModal: (roomId?: string | null) => void;
+  closeResourceSchedulingModal: () => void;
+  assignResourceToZone: (
+    assignment: Omit<ResourceAssignment, 'id' | 'createdAt'>,
+    relocateEquipmentOnMap?: boolean
+  ) => ResourceAssignment;
+  updateResourceAssignmentStatus: (id: string, status: AssignmentStatus) => void;
+  removeResourceAssignment: (id: string) => void;
+  autoBalanceAssignmentsForTelemetry: (
+    roomTelemetryMap: Record<string, { status: 'nominal' | 'warning' | 'alarm'; summary: string }>
+  ) => { held: number; resumed: number };
+
   setShowMiniMap: (show: boolean) => void;
   jumpFromMiniMap: (x: number, z: number) => void;
 }
@@ -180,7 +201,83 @@ function persist(state: GmpState) {
     sops: state.sops,
     wikiArticles: state.wikiArticles,
     workflows: state.workflows,
+    resourceAssignments: state.resourceAssignments,
   });
+}
+
+function buildSeedResourceAssignments(
+  scene: DigitalTwinScene,
+  personnel: EligibleTechnician[]
+): ResourceAssignment[] {
+  const today = todayIso();
+  const rooms = scene.rooms;
+  if (rooms.length === 0) return [];
+
+  const pickRoom = (predicate: (r: DigitalTwinScene['rooms'][number]) => boolean, fallbackIdx: number) =>
+    rooms.find(predicate) ?? rooms[fallbackIdx % rooms.length];
+
+  const bioRoom = pickRoom((r) => /bioreactor|upstream|ferment/i.test(r.name), 0);
+  const fillRoom = pickRoom((r) => /fill|aseptic|lyo/i.test(r.name), 1);
+  const qcRoom = pickRoom((r) => /qc|lab|hplc|analyt/i.test(r.name), 2);
+  const coldRoom = pickRoom((r) => /cold|warehouse|storage/i.test(r.name), 3);
+
+  const findAssetForRoom = (roomId: string, fallbackIdx: number) =>
+    scene.assets.find((a) => a.roomId === roomId) ?? scene.assets[fallbackIdx % Math.max(1, scene.assets.length)];
+
+  const seed: ResourceAssignment[] = [];
+  const shiftList: ShiftWindow[] = ['morning-06-14', 'morning-06-14', 'swing-14-22', 'morning-06-14'];
+  const targetRooms = [bioRoom, fillRoom, qcRoom, coldRoom];
+
+  targetRooms.forEach((rm, idx) => {
+    const tech = personnel[idx % personnel.length];
+    if (rm && tech) {
+      seed.push({
+        id: `ra-seed-staff-${idx + 1}`,
+        roomId: rm.id,
+        roomCode: rm.code,
+        roomName: rm.name,
+        floorId: rm.floorId,
+        date: today,
+        shift: shiftList[idx],
+        resourceKind: 'personnel',
+        resourceId: tech.id,
+        resourceCode: tech.badgeId,
+        resourceName: tech.name,
+        roleOrCategory: tech.role,
+        status: idx === 0 ? 'active' : 'scheduled',
+        telemetryGatePassed: true,
+        telemetrySnapshotNote: `${rm.environmental.temperatureC.toFixed(1)}°C · ${rm.environmental.humidityPct}% RH · ${rm.environmental.pressurePa >= 0 ? '+' : ''}${rm.environmental.pressurePa} Pa`,
+        notes: idx === 0 ? 'Batch inoculation & live bioprocess monitoring' : 'Scheduled zone coverage & GMP log verification',
+        createdAt: new Date().toISOString(),
+        assignedBy: 'Operations Manager',
+      });
+    }
+    const asset = rm ? findAssetForRoom(rm.id, idx) : undefined;
+    if (rm && asset && idx < 3) {
+      seed.push({
+        id: `ra-seed-eq-${idx + 1}`,
+        roomId: rm.id,
+        roomCode: rm.code,
+        roomName: rm.name,
+        floorId: rm.floorId,
+        date: today,
+        shift: shiftList[idx],
+        resourceKind: 'equipment',
+        resourceId: asset.id,
+        resourceCode: asset.assetId,
+        resourceName: asset.name,
+        roleOrCategory: asset.category,
+        status: idx === 0 ? 'active' : 'scheduled',
+        telemetryGatePassed: true,
+        telemetrySnapshotNote: `${rm.environmental.temperatureC.toFixed(1)}°C · ${rm.environmental.humidityPct}% RH · ${rm.environmental.pressurePa >= 0 ? '+' : ''}${rm.environmental.pressurePa} Pa`,
+        notes: 'Primary campaign unit reserved for shift run',
+        createdAt: new Date().toISOString(),
+        assignedBy: 'Operations Manager',
+      });
+    }
+  });
+
+  return seed;
 }
 
 function buildSeedWorkflows(): GmpWorkflowInstance[] {
@@ -568,6 +665,16 @@ export const useGmpStore = create<GmpState>((set, get) => {
       ? persisted.cronJobs
       : buildSeedCronJobs(initialScene, productionLines);
 
+  const personnelList =
+    persisted?.personnel && persisted.personnel.length > 0
+      ? persisted.personnel
+      : INITIAL_ELIGIBLE_PERSONNEL;
+
+  const resourceAssignments =
+    persisted?.resourceAssignments && persisted.resourceAssignments.length > 0
+      ? persisted.resourceAssignments
+      : buildSeedResourceAssignments(initialScene, personnelList);
+
   return {
     initializedForProjectId: initialScene.id,
     complianceByAssetId,
@@ -576,10 +683,7 @@ export const useGmpStore = create<GmpState>((set, get) => {
     activeLineHighlight: null,
     workOrders,
     cronJobs,
-    personnel:
-      persisted?.personnel && persisted.personnel.length > 0
-        ? persisted.personnel
-        : INITIAL_ELIGIBLE_PERSONNEL,
+    personnel: personnelList,
     sops:
       persisted?.sops && persisted.sops.length > 0 ? persisted.sops : INITIAL_SOP_DOCUMENTS,
     wikiArticles:
@@ -590,6 +694,7 @@ export const useGmpStore = create<GmpState>((set, get) => {
       persisted?.workflows && persisted.workflows.length > 0
         ? persisted.workflows
         : buildSeedWorkflows(),
+    resourceAssignments,
 
     showGmpModal: false,
     gmpTab: 'lines',
@@ -601,6 +706,9 @@ export const useGmpStore = create<GmpState>((set, get) => {
     showQrLabelModal: false,
     qrLabelTab: 'scanner',
     preselectedLabelIds: [],
+
+    showResourceSchedulingModal: false,
+    focusedScheduleRoomId: null,
 
     showMiniMap: true,
     miniMapTarget: null,
@@ -1203,6 +1311,107 @@ export const useGmpStore = create<GmpState>((set, get) => {
       }));
     },
     closeQrLabelModal: () => set({ showQrLabelModal: false }),
+
+    openResourceSchedulingModal: (roomId = null) => {
+      get().syncWithScene(useTwinStore.getState().scene);
+      set({
+        showResourceSchedulingModal: true,
+        focusedScheduleRoomId: roomId,
+      });
+    },
+    closeResourceSchedulingModal: () => set({ showResourceSchedulingModal: false }),
+
+    assignResourceToZone: (assignment, relocateEquipmentOnMap = false) => {
+      const created: ResourceAssignment = {
+        ...assignment,
+        id: `ra-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+        createdAt: new Date().toISOString(),
+      };
+      set((s) => ({
+        resourceAssignments: [created, ...s.resourceAssignments],
+      }));
+
+      const twin = useTwinStore.getState();
+      if (relocateEquipmentOnMap && created.resourceKind === 'equipment') {
+        const targetRoom = twin.scene.rooms.find((r) => r.id === created.roomId);
+        if (targetRoom) {
+          const cx = Number((targetRoom.x + targetRoom.width * 0.5).toFixed(2));
+          const cz = Number((targetRoom.z + targetRoom.depth * 0.5).toFixed(2));
+          twin.updateAsset(created.resourceId, {
+            roomId: targetRoom.id,
+            floorId: targetRoom.floorId,
+            x: cx,
+            z: cz,
+          });
+        }
+      }
+
+      twin.recordAudit({
+        category: created.resourceKind === 'equipment' ? 'asset' : 'spatial',
+        action: `Scheduled ${created.resourceKind === 'personnel' ? 'Personnel' : 'Equipment'} to Zone`,
+        entityType: created.resourceKind === 'equipment' ? 'asset' : 'room',
+        entityId: created.resourceKind === 'equipment' ? created.resourceId : created.roomId,
+        entityName: `${created.resourceName} → ${created.roomCode}`,
+        summary: `Assigned ${created.resourceName} (${created.resourceCode}) to ${created.roomCode} (${created.roomName}) for ${created.date} (${created.shift}). Telemetry: ${created.telemetrySnapshotNote}.${created.overrideReason ? ` Override: ${created.overrideReason}` : ''}`,
+      });
+
+      twin.showToast(
+        `Assigned ${created.resourceName} to ${created.roomCode} (${created.roomName})`,
+        created.telemetryGatePassed ? 'success' : 'warning'
+      );
+
+      persist(get());
+      return created;
+    },
+
+    updateResourceAssignmentStatus: (id, status) => {
+      set((s) => ({
+        resourceAssignments: s.resourceAssignments.map((item) =>
+          item.id === id ? { ...item, status } : item
+        ),
+      }));
+      persist(get());
+    },
+
+    removeResourceAssignment: (id) => {
+      set((s) => ({
+        resourceAssignments: s.resourceAssignments.filter((item) => item.id !== id),
+      }));
+      persist(get());
+    },
+
+    autoBalanceAssignmentsForTelemetry: (roomTelemetryMap) => {
+      let held = 0;
+      let resumed = 0;
+      set((s) => ({
+        resourceAssignments: s.resourceAssignments.map((item) => {
+          if (item.status === 'completed') return item;
+          const tel = roomTelemetryMap[item.roomId];
+          if (!tel) return item;
+          if (tel.status === 'alarm' && item.status !== 'telemetry-hold' && !item.overrideReason) {
+            held += 1;
+            return {
+              ...item,
+              status: 'telemetry-hold' as const,
+              telemetryGatePassed: false,
+              telemetrySnapshotNote: tel.summary,
+            };
+          }
+          if (tel.status === 'nominal' && item.status === 'telemetry-hold') {
+            resumed += 1;
+            return {
+              ...item,
+              status: 'scheduled' as const,
+              telemetryGatePassed: true,
+              telemetrySnapshotNote: tel.summary,
+            };
+          }
+          return item;
+        }),
+      }));
+      persist(get());
+      return { held, resumed };
+    },
 
     setShowMiniMap: (showMiniMap) => set({ showMiniMap }),
     jumpFromMiniMap: (x, z) => {

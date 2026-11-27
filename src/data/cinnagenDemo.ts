@@ -2,8 +2,10 @@ import type {
   DigitalTwinScene,
   EnterpriseNode,
   Floor,
+  NetworkArchitectureState,
   Opening,
   Room,
+  SceneCamera,
   SpatialAsset,
   SpatialMetadata,
   Wall,
@@ -84,6 +86,291 @@ export function generateWallsForRoom(room: Room, existingPrefix: string): Wall[]
     layerId: 'layer-walls',
     activeFromDate: room.activeFromDate,
   }));
+}
+
+/**
+ * Guarantees every designed room on a floor has at least one walkable door opening
+ * so First-Person Walk Mode can always enter and exit every room smoothly.
+ */
+export function ensureDoorsForAllRooms(
+  rooms: Room[],
+  walls: Wall[],
+  existingOpenings: Opening[]
+): Opening[] {
+  const result = [...existingOpenings];
+  const wallById = new Map<string, Wall>();
+  walls.forEach((w) => wallById.set(w.id, w));
+
+  // Helper: check if any door opening sits spatially near a wall segment
+  const wallHasSpatialDoor = (w: Wall): boolean => {
+    const dx = w.x2 - w.x1;
+    const dz = w.z2 - w.z1;
+    const lenSq = dx * dx + dz * dz;
+    if (lenSq < 0.04) return false;
+    return result.some((op) => {
+      if (op.kind !== 'door' || op.floorId !== w.floorId) return false;
+      if (op.wallId === w.id) return true;
+      const host = wallById.get(op.wallId);
+      if (!host) return false;
+      const cx = host.x1 + (host.x2 - host.x1) * op.offsetRatio;
+      const cz = host.z1 + (host.z2 - host.z1) * op.offsetRatio;
+      const t = Math.max(0, Math.min(1, ((cx - w.x1) * dx + (cz - w.z1) * dz) / lenSq));
+      const px = w.x1 + t * dx;
+      const pz = w.z1 + t * dz;
+      return Math.hypot(cx - px, cz - pz) <= 0.45;
+    });
+  };
+
+  rooms.forEach((rm) => {
+    const rmWalls = walls.filter((w) => w.roomId === rm.id && w.floorId === rm.floorId);
+    if (rmWalls.length === 0) return;
+    if (rmWalls.some((w) => wallHasSpatialDoor(w))) return;
+
+    // Pick best interior/corridor-facing wall (prefer South or North wall facing floor center)
+    const floorRooms = rooms.filter((r) => r.floorId === rm.floorId);
+    const avgZ = floorRooms.reduce((s, r) => s + r.z + r.depth / 2, 0) / Math.max(1, floorRooms.length);
+    const roomCenterZ = rm.z + rm.depth / 2;
+    const preferredSuffix = roomCenterZ <= avgZ ? '-w3' : '-w1';
+    const hostWall =
+      rmWalls.find((w) => w.id.endsWith(preferredSuffix)) ??
+      rmWalls.find((w) => Math.hypot(w.x2 - w.x1, w.z2 - w.z1) >= 2.2) ??
+      rmWalls[0];
+
+    const isClean = rm.category === 'Cleanrooms' || rm.category === 'Pharmaceutical Manufacturing';
+    const isGlass = hostWall.presetId === 'full-glass-wall' || hostWall.presetId === 'glass-partition';
+    const isWarehouse = rm.category === 'Warehouses & Logistics';
+
+    result.push({
+      id: `op-auto-${rm.id}`,
+      floorId: rm.floorId,
+      wallId: hostWall.id,
+      kind: 'door',
+      subtype: isGlass ? 'glass-door' : isClean ? 'cleanroom-door' : isWarehouse ? 'double-door' : 'single-door',
+      name: `${rm.code} · ${rm.name} Access Door`,
+      offsetRatio: 0.48,
+      width: isWarehouse ? 1.8 : 1.3,
+      height: 2.25,
+      sillHeight: 0,
+      thickness: isGlass ? 0.08 : 0.14,
+      swingDirection: isWarehouse ? 'both' : 'right',
+      swingAngle: 90,
+      materialId: isGlass ? 'mat-glass-cleanroom' : isClean ? 'mat-cleanroom-panel' : 'mat-carbon-steel',
+      frameColor: isClean ? '#2563EB' : '#334155',
+      lockType: isClean ? 'RFID Interlock' : 'Badge Access',
+      accessControl: isClean ? 'badge' : 'none',
+      fireRating: '60 min',
+      status: 'closed',
+      layerId: 'layer-openings',
+    });
+  });
+
+  return result;
+}
+
+const COST_CENTER_BY_CATEGORY: Record<string, string> = {
+  Biopharmaceutical: 'CC-BIO-101 · Sterile Biologics Production',
+  Laboratory: 'CC-QC-204 · Quality Control & Analytical',
+  'HVAC & Utilities': 'CC-UTL-301 · Clean Utilities & GMP HVAC',
+  'IT & Data Center': 'CC-IT-401 · OT/IT Infrastructure & SCADA',
+  'Warehouse & Logistics': 'CC-GDP-501 · Cold-Chain Supply & Logistics',
+  'Furniture & Workplace': 'CC-FAC-602 · QA Workplace & Admin',
+  'Building & Safety': 'CC-EHS-701 · EHS Fire & Biosafety',
+};
+
+const SOP_IDS_BY_CATEGORY: Record<string, string[]> = {
+  Biopharmaceutical: ['sop-bio-cipsip', 'sop-chrom-oq', 'sop-lyo-cal', 'sop-all-dev'],
+  Laboratory: ['sop-hplc-pm', 'sop-all-dev'],
+  'HVAC & Utilities': ['sop-cleanroom-pq', 'sop-all-dev'],
+  'IT & Data Center': ['sop-it-rack', 'sop-all-dev'],
+  'Warehouse & Logistics': ['sop-wh-cold', 'sop-all-dev'],
+  'Furniture & Workplace': ['sop-cleanroom-pq', 'sop-all-dev'],
+  'Building & Safety': ['sop-cleanroom-pq', 'sop-all-dev'],
+};
+
+/**
+ * Guarantees every device/asset carries complete SOP links, identification,
+ * cost center, vendor service history, and owner custody history.
+ */
+export function enrichAssetHistory(asset: SpatialAsset): SpatialAsset {
+  const costCenter =
+    asset.costCenter ||
+    COST_CENTER_BY_CATEGORY[asset.category] ||
+    'CC-OPS-100 · Facility Operations';
+
+  const matchedSops =
+    asset.sopIds && asset.sopIds.length > 0
+      ? asset.sopIds
+      : asset.archetype === 'lyophilizer' || asset.archetype === 'filling-line'
+        ? ['sop-lyo-cal', 'sop-cleanroom-pq', 'sop-all-dev']
+        : asset.archetype === 'chromatography-skid' || asset.archetype === 'filtration-skid'
+          ? ['sop-chrom-oq', 'sop-bio-cipsip', 'sop-all-dev']
+          : SOP_IDS_BY_CATEGORY[asset.category] || ['sop-all-dev'];
+
+  const vendorHistory =
+    asset.vendorHistory && asset.vendorHistory.length > 0
+      ? asset.vendorHistory
+      : [
+          {
+            id: `vh-${asset.id}-1`,
+            date: asset.installationDate || '2024-10-12',
+            vendor: asset.manufacturer || 'OEM Authorized Partner',
+            action: 'OEM Delivery, Installation & FAT/SAT',
+            costUsd: Math.round((asset.capexUsd || 15000) * 0.08),
+            reference: `PO-FAT-${asset.assetId}`,
+            note: `Factory acceptance and site rigging completed for ${asset.model}.`,
+          },
+          {
+            id: `vh-${asset.id}-2`,
+            date: asset.commissioningDate || '2025-01-20',
+            vendor: `${asset.manufacturer || 'OEM'} Field Validation Services`,
+            action: 'IQ / OQ / PQ Qualification & Traceable Calibration',
+            costUsd: Math.round((asset.annualOpexUsd || 3200) * 0.35),
+            reference: `VAL-PQ-${asset.assetId}`,
+            note: 'Passed EU GMP Annex 15 & 21 CFR Part 11 verification protocol.',
+          },
+          {
+            id: `vh-${asset.id}-3`,
+            date: asset.lastMaintenance || '2026-08-14',
+            vendor: 'Gradian Certified Metrology & OEM Care',
+            action: asset.operationalStatus === 'maintenance-due' ? 'Preventive Inspection (Action Pending)' : 'Annual PM & Sensor Re-Calibration',
+            costUsd: Math.round((asset.annualOpexUsd || 3200) * 0.28),
+            reference: `WO-PM-${asset.assetId}`,
+            note: 'Verified NIST-traceable calibration tolerance and replaced wear seals/filters.',
+          },
+        ];
+
+  const ownerHistory =
+    asset.ownerHistory && asset.ownerHistory.length > 0
+      ? asset.ownerHistory
+      : [
+          {
+            id: `oh-${asset.id}-1`,
+            date: asset.installationDate || '2024-10-12',
+            owner: 'Capital Projects & Commissioning Team',
+            department: 'Site Engineering',
+            costCenter: 'CC-CAPEX-001 · Campus Expansion',
+            note: 'Initial procurement, site handover, and GMP tagging.',
+          },
+          {
+            id: `oh-${asset.id}-2`,
+            date: asset.commissioningDate || '2025-01-20',
+            owner: asset.owner || 'CinnaGen Engineering',
+            department: asset.department || 'Biologics Manufacturing',
+            costCenter,
+            note: `Operational custody assigned to ${asset.responsiblePerson || 'Area Lead'}.`,
+          },
+        ];
+
+  const hasSopDoc = asset.documents?.some((d) => d.kind === 'SOP');
+  const documents = hasSopDoc
+    ? asset.documents
+    : [
+        ...(asset.documents || []),
+        {
+          id: `d-sop-${asset.id}`,
+          title: `Standard Operating Procedure (${asset.category})`,
+          kind: 'SOP',
+          code: `SOP-${asset.assetId}`,
+        },
+      ];
+
+  return {
+    ...asset,
+    costCenter,
+    sopIds: matchedSops,
+    vendorHistory,
+    ownerHistory,
+    documents,
+    qrCode: asset.qrCode || `GRADIAN://ASSET/${asset.assetId}`,
+    equipmentId: asset.equipmentId || `EQ-${asset.assetId}`,
+  };
+}
+
+/**
+ * Guarantees every room across all floors has a valid room number code
+ * and at least one realistic 3D equipment/furniture model inside its footprint.
+ */
+export function ensureRoomsHaveCodesAndModels(scene: DigitalTwinScene): void {
+  const usedCodes = new Set(scene.rooms.map((r) => r.code?.trim()).filter(Boolean));
+  const floorRoomCounters = new Map<string, number>();
+
+  scene.rooms.forEach((rm) => {
+    const fl = scene.floors.find((f) => f.id === rm.floorId);
+    const flPrefix = (fl?.code || 'FL').replace(/[^A-Z0-9]/gi, '').toUpperCase() || 'RM';
+    const baseNum = (fl?.levelIndex ?? 0) === 0 ? 101 : 201 + ((fl?.levelIndex ?? 1) - 1) * 100;
+    const count = floorRoomCounters.get(rm.floorId) ?? 0;
+    floorRoomCounters.set(rm.floorId, count + 1);
+
+    if (!rm.code || !rm.code.trim()) {
+      let seq = baseNum + count;
+      let candidate = `${flPrefix}-${seq}`;
+      while (usedCodes.has(candidate)) {
+        seq += 1;
+        candidate = `${flPrefix}-${seq}`;
+      }
+      rm.code = candidate;
+      usedCodes.add(candidate);
+      if (rm.metadata) {
+        rm.metadata.code = candidate;
+      }
+    }
+
+    // Ensure every room in the site list has at least one 3D model inside it
+    const roomAssets = scene.assets.filter(
+      (a) =>
+        a.roomId === rm.id ||
+        (a.floorId === rm.floorId &&
+          a.x >= rm.x &&
+          a.x <= rm.x + rm.width &&
+          a.z >= rm.z &&
+          a.z <= rm.z + rm.depth)
+    );
+
+    if (roomAssets.length === 0) {
+      const cat = (rm.category || '').toLowerCase();
+      const nameL = (rm.name || '').toLowerCase();
+      const tplId =
+        nameL.includes('cold') || nameL.includes('freezer')
+          ? 'eq-cold-room-unit'
+          : nameL.includes('conference') || nameL.includes('board') || nameL.includes('audit')
+            ? 'eq-conf-table'
+            : nameL.includes('server') || nameL.includes('data') || nameL.includes('control')
+              ? 'eq-scada-console'
+              : nameL.includes('warehouse') || nameL.includes('storage') || nameL.includes('quarantine')
+                ? 'eq-pallet-rack'
+                : nameL.includes('hvac') || nameL.includes('ahu')
+                  ? 'eq-ahu'
+                  : nameL.includes('elec') || nameL.includes('ups')
+                    ? 'eq-electrical-panel'
+                    : nameL.includes('airlock') || nameL.includes('pal') || nameL.includes('gown')
+                      ? 'eq-locker'
+                      : cat.includes('lab') || cat.includes('quality')
+                        ? 'eq-lab-bench'
+                        : cat.includes('office')
+                          ? 'eq-desk'
+                          : cat.includes('cleanroom') || cat.includes('pharma')
+                            ? 'eq-bioreactor-su'
+                            : 'eq-lab-bench';
+
+      const cx = Number((rm.x + rm.width * 0.5).toFixed(2));
+      const cz = Number((rm.z + rm.depth * 0.5).toFixed(2));
+      const cleanCode = rm.code.replace(/[^A-Z0-9]/gi, '');
+      const autoAsset = enrichAssetHistory(
+        makeAsset(
+          `ast-auto-${rm.id}`,
+          rm.floorId,
+          rm.id,
+          tplId,
+          `${rm.name} Primary Station`,
+          `EQ-${cleanCode}`,
+          cx,
+          cz,
+          0
+        )
+      );
+      scene.assets.push(autoAsset);
+    }
+  });
 }
 
 function makeRoom(
@@ -248,6 +535,21 @@ function makeAsset(
     relatedProcesses: ['Biologics Campaign #2026-B4'],
     ...overrides,
   };
+}
+
+function makeEnrichedAsset(
+  id: string,
+  floorId: string,
+  roomId: string,
+  templateId: string,
+  name: string,
+  assetCode: string,
+  x: number,
+  z: number,
+  rotationY = 0,
+  overrides?: Partial<SpatialAsset>
+): SpatialAsset {
+  return enrichAssetHistory(makeAsset(id, floorId, roomId, templateId, name, assetCode, x, z, rotationY, overrides));
 }
 
 export function createCinnaGenCampusScene(): DigitalTwinScene {
@@ -473,9 +775,31 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
   const allRooms = [...roomsA0, ...roomsA1, ...roomsB0, ...roomsB1];
 
   // Generate clean room perimeter walls
+  const fullGlassWallIds = new Set([
+    'rm-a0-pack-w2',
+    'rm-a0-corridor-w2',
+    'rm-a1-conf-w1',
+    'rm-a1-qa-w1',
+    'rm-b1-rd-w1',
+  ]);
+  const fullGlassPreset = WALL_PRESETS.find((p) => p.id === 'full-glass-wall');
   const walls: Wall[] = [];
   allRooms.forEach((rm) => {
-    const rmWalls = generateWallsForRoom(rm, rm.id);
+    const rmWalls = generateWallsForRoom(rm, rm.id).map((w) =>
+      fullGlassWallIds.has(w.id) && fullGlassPreset
+        ? {
+            ...w,
+            presetId: fullGlassPreset.id,
+            thickness: fullGlassPreset.thickness,
+            materialId: fullGlassPreset.materialId,
+            color: fullGlassPreset.color,
+            opacity: fullGlassPreset.opacity,
+            isStructural: false,
+            fireRating: fullGlassPreset.fireRating,
+            acousticRatingDb: fullGlassPreset.acousticRatingDb,
+          }
+        : w
+    );
     walls.push(...rmWalls);
   });
 
@@ -493,7 +817,31 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
     { id: 'op-10', floorId: 'fl-b0', wallId: 'rm-b0-dock-w3', kind: 'door', subtype: 'warehouse-door', name: 'Loading Dock Bay 1 Shutter', offsetRatio: 0.25, width: 3.2, height: 3.4, sillHeight: 0, thickness: 0.25, swingDirection: 'slide', swingAngle: 0, materialId: 'mat-carbon-steel', frameColor: '#334155', lockType: 'Dock Interlock', accessControl: 'badge', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
     { id: 'op-11', floorId: 'fl-b0', wallId: 'rm-b0-dock-w3', kind: 'door', subtype: 'warehouse-door', name: 'Loading Dock Bay 2 Shutter', offsetRatio: 0.72, width: 3.2, height: 3.4, sillHeight: 0, thickness: 0.25, swingDirection: 'slide', swingAngle: 0, materialId: 'mat-carbon-steel', frameColor: '#334155', lockType: 'Dock Interlock', accessControl: 'badge', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
     { id: 'op-12', floorId: 'fl-b1', wallId: 'rm-b1-analytical-w3', kind: 'window', subtype: 'double-glazing', name: 'Analytical Lab Corridor Glass', offsetRatio: 0.5, width: 3.2, height: 1.4, sillHeight: 0.95, thickness: 0.12, swingDirection: 'slide', swingAngle: 0, materialId: 'mat-glass-cleanroom', frameColor: '#475569', lockType: 'Fixed', accessControl: 'none', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-13', floorId: 'fl-a0', wallId: 'rm-a0-corridor-w4', kind: 'door', subtype: 'fire-door', name: 'West Corridor Emergency Fire Exit', offsetRatio: 0.5, width: 1.25, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'left', swingAngle: 90, materialId: 'mat-carbon-steel', frameColor: '#DC2626', lockType: 'Panic Crash Bar', accessControl: 'none', fireRating: '120 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-14', floorId: 'fl-a1', wallId: 'rm-a1-conf-w1', kind: 'door', subtype: 'glass-door', name: 'Executive Audit Suite Frameless Entry', offsetRatio: 0.25, width: 1.15, height: 2.3, sillHeight: 0, thickness: 0.08, swingDirection: 'right', swingAngle: 90, materialId: 'mat-glass-cleanroom', frameColor: '#1E293B', lockType: 'RFID Glass Patch Lock', accessControl: 'badge', fireRating: 'None', status: 'closed', layerId: 'layer-openings' },
+    // Complete doorway connectivity across all Building A & B rooms so walk mode moves freely everywhere
+    { id: 'op-15', floorId: 'fl-a0', wallId: 'rm-a0-media-w1', kind: 'door', subtype: 'cleanroom-door', name: 'Media & Buffer Corridor Entry', offsetRatio: 0.52, width: 1.45, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-cleanroom-panel', frameColor: '#2563EB', lockType: 'RFID Badge', accessControl: 'badge', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-16', floorId: 'fl-a0', wallId: 'rm-a0-upstream-w2', kind: 'door', subtype: 'cleanroom-door', name: 'Upstream → Downstream Transfer Door', offsetRatio: 0.55, width: 1.35, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-cleanroom-panel', frameColor: '#2563EB', lockType: 'Interlock', accessControl: 'interlock', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-17', floorId: 'fl-a1', wallId: 'rm-a1-hvac-w3', kind: 'door', subtype: 'double-door', name: 'HVAC Plant Maintenance Double Door', offsetRatio: 0.5, width: 1.7, height: 2.3, sillHeight: 0, thickness: 0.14, swingDirection: 'both', swingAngle: 90, materialId: 'mat-carbon-steel', frameColor: '#334155', lockType: 'Badge', accessControl: 'badge', fireRating: '90 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-18', floorId: 'fl-a1', wallId: 'rm-a1-wfi-w3', kind: 'door', subtype: 'single-door', name: 'WFI Generation Suite Access Door', offsetRatio: 0.5, width: 1.3, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-cleanroom-panel', frameColor: '#2563EB', lockType: 'Badge', accessControl: 'badge', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-19', floorId: 'fl-a1', wallId: 'rm-a1-elec-w3', kind: 'door', subtype: 'fire-door', name: 'Electrical MCC & UPS Fire-Rated Door', offsetRatio: 0.45, width: 1.35, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-carbon-steel', frameColor: '#DC2626', lockType: 'Keycard + Fire Panic', accessControl: 'badge', fireRating: '120 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-20', floorId: 'fl-a1', wallId: 'rm-a1-control-w1', kind: 'door', subtype: 'security-door', name: 'SCADA & Data Center Biometric Door', offsetRatio: 0.55, width: 1.25, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-carbon-steel', frameColor: '#4F46E5', lockType: 'Biometric + RFID', accessControl: 'biometric', fireRating: '90 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-21', floorId: 'fl-a1', wallId: 'rm-a1-qa-w1', kind: 'door', subtype: 'glass-door', name: 'QA Batch Review Suite Glass Entry (A1-205)', offsetRatio: 0.45, width: 1.3, height: 2.3, sillHeight: 0, thickness: 0.08, swingDirection: 'right', swingAngle: 90, materialId: 'mat-glass-cleanroom', frameColor: '#1E293B', lockType: 'RFID Glass Lock', accessControl: 'badge', fireRating: 'None', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-22', floorId: 'fl-a1', wallId: 'rm-a1-qa-w2', kind: 'door', subtype: 'glass-door', name: 'QA → Executive Audit Connecting Door', offsetRatio: 0.5, width: 1.2, height: 2.25, sillHeight: 0, thickness: 0.08, swingDirection: 'right', swingAngle: 90, materialId: 'mat-glass-cleanroom', frameColor: '#1E293B', lockType: 'Badge', accessControl: 'badge', fireRating: 'None', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-23', floorId: 'fl-a1', wallId: 'rm-a1-control-w2', kind: 'door', subtype: 'single-door', name: 'SCADA → QA Suite Internal Door', offsetRatio: 0.42, width: 1.2, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-cleanroom-panel', frameColor: '#334155', lockType: 'Badge', accessControl: 'badge', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-24', floorId: 'fl-b0', wallId: 'rm-b0-raw-w3', kind: 'door', subtype: 'double-door', name: 'Raw Warehouse → Receiving Dock Passage', offsetRatio: 0.52, width: 2.2, height: 2.6, sillHeight: 0, thickness: 0.16, swingDirection: 'both', swingAngle: 90, materialId: 'mat-carbon-steel', frameColor: '#334155', lockType: 'Badge', accessControl: 'badge', fireRating: '90 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-25', floorId: 'fl-b0', wallId: 'rm-b0-cold-w3', kind: 'door', subtype: 'sliding-door', name: 'Cold Storage (2–8°C) Insulated Sliding Door', offsetRatio: 0.5, width: 1.9, height: 2.5, sillHeight: 0, thickness: 0.18, swingDirection: 'slide', swingAngle: 0, materialId: 'mat-cleanroom-panel', frameColor: '#0284C7', lockType: 'Thermal Interlock', accessControl: 'badge', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-26', floorId: 'fl-b0', wallId: 'rm-b0-quarantine-w3', kind: 'door', subtype: 'single-door', name: 'Quarantine & Sampling Bay Entry', offsetRatio: 0.5, width: 1.4, height: 2.3, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-carbon-steel', frameColor: '#D97706', lockType: 'QA Seal Lock', accessControl: 'badge', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-27', floorId: 'fl-b0', wallId: 'rm-b0-dispatch-w4', kind: 'door', subtype: 'double-door', name: 'Receiving ↔ Dispatch Connecting Door', offsetRatio: 0.5, width: 2.0, height: 2.5, sillHeight: 0, thickness: 0.14, swingDirection: 'both', swingAngle: 90, materialId: 'mat-carbon-steel', frameColor: '#334155', lockType: 'None', accessControl: 'none', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-28', floorId: 'fl-b1', wallId: 'rm-b1-analytical-w3', kind: 'door', subtype: 'cleanroom-door', name: 'QC Analytical Chemistry Lab Entry', offsetRatio: 0.2, width: 1.35, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-cleanroom-panel', frameColor: '#2563EB', lockType: 'Badge', accessControl: 'badge', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-29', floorId: 'fl-b1', wallId: 'rm-b1-micro-w3', kind: 'door', subtype: 'airlock-door', name: 'QC Microbiology Sterility Airlock Door', offsetRatio: 0.45, width: 1.3, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-cleanroom-panel', frameColor: '#0D9488', lockType: 'Interlock', accessControl: 'interlock', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-30', floorId: 'fl-b1', wallId: 'rm-b1-sample-w3', kind: 'door', subtype: 'single-door', name: 'Sample Receiving Entry Door', offsetRatio: 0.5, width: 1.25, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-cleanroom-panel', frameColor: '#334155', lockType: 'Badge', accessControl: 'badge', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-31', floorId: 'fl-b1', wallId: 'rm-b1-stability-w1', kind: 'door', subtype: 'cleanroom-door', name: 'ICH Stability Chamber Room Entry', offsetRatio: 0.48, width: 1.35, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-cleanroom-panel', frameColor: '#2563EB', lockType: 'Badge', accessControl: 'badge', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-32', floorId: 'fl-b1', wallId: 'rm-b1-rd-w1', kind: 'door', subtype: 'glass-door', name: 'Bioprocess R&D Lab Glass Entry', offsetRatio: 0.32, width: 1.35, height: 2.3, sillHeight: 0, thickness: 0.08, swingDirection: 'right', swingAngle: 90, materialId: 'mat-glass-cleanroom', frameColor: '#1E293B', lockType: 'Badge', accessControl: 'badge', fireRating: 'None', status: 'closed', layerId: 'layer-openings' },
   ];
+
+  // Guarantee zero isolated rooms even if custom rooms are later appended
+  const verifiedOpenings = ensureDoorsForAllRooms(allRooms, walls, openings);
 
   // Realistic intelligent assets across all 4 floors
   const assets: SpatialAsset[] = [
@@ -523,10 +871,16 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
 
     makeAsset('ast-mal-1', 'fl-a0', 'rm-a0-mal', 'eq-autoclave', 'Pass-Through Steam Autoclave', 'AUT-201', 19.8, 16.4, 0),
     makeAsset('ast-mal-2', 'fl-a0', 'rm-a0-mal', 'eq-pallet', 'Sanitized Material Pallet', 'PLT-202', 20.4, 19.4, 0),
+    makeAsset('ast-pbx-1', 'fl-a0', 'rm-a0-mal', 'eq-pass-box', 'Dynamic HEPA Pass Box PB-101 (MAL → Corridor)', 'PB-101', 17.8, 14.3, 0),
+    makeAsset('ast-pbx-2', 'fl-a0', 'rm-a0-filling', 'eq-pass-box', 'Aseptic Interlocked Pass Box PB-102 (Grade B → C)', 'PB-102', 24.8, 9.2, Math.PI),
 
     makeAsset('ast-pck-1', 'fl-a0', 'rm-a0-pack', 'eq-inspection-machine', 'Automated Vision Inspector VI-400', 'VI-501', 26.2, 16.6, 0),
     makeAsset('ast-pck-2', 'fl-a0', 'rm-a0-pack', 'eq-packaging-line', 'Serialized Cartoning Line BEC-300', 'PKG-502', 31.2, 17.4, 0),
     makeAsset('ast-saf-1', 'fl-a0', 'rm-a0-corridor', 'eq-fire-ext', 'Emergency Shower & Fire Station', 'SAF-A01', 2.4, 11.6, 0),
+    makeAsset('ast-fbx-1', 'fl-a0', 'rm-a0-corridor', 'eq-firebox', 'Corridor West Fire Hose Firebox FB-A01', 'FB-A01', 12.2, 10.35, 0),
+    makeAsset('ast-fbx-2', 'fl-a0', 'rm-a0-corridor', 'eq-firebox', 'Corridor East Fire Hose Firebox FB-A02', 'FB-A02', 28.6, 10.35, 0),
+    makeAsset('ast-fex-1', 'fl-a0', 'rm-a0-upstream', 'eq-fire-extinguisher', 'CO2 Cleanroom Fire Extinguisher FE-A01', 'FE-A01', 1.7, 9.2, 0),
+    makeAsset('ast-fex-2', 'fl-a0', 'rm-a0-pack', 'eq-fire-extinguisher', 'Packaging Bay CO2 Extinguisher FE-A02', 'FE-A02', 34.1, 14.3, Math.PI),
 
     // Building A · Level 1 (Utilities & QA)
     makeAsset('ast-ahu-1', 'fl-a1', 'rm-a1-hvac', 'eq-ahu', 'Cleanroom AHU-01 (Upstream/Downstream)', 'AHU-01', 5.0, 4.2, 0),
@@ -537,137 +891,399 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
     makeAsset('ast-wfi-3', 'fl-a1', 'rm-a1-wfi', 'eq-ro-unit', 'Purified Water RO/EDI Skid', 'PW-01', 21.4, 8.4, 0),
     makeAsset('ast-elc-1', 'fl-a1', 'rm-a1-elec', 'eq-electrical-panel', 'Main GMP Switchgear MCC-1', 'MCC-01', 29.5, 3.8, 0),
     makeAsset('ast-elc-2', 'fl-a1', 'rm-a1-elec', 'eq-ups', '250 kVA Critical Load UPS', 'UPS-01', 32.6, 7.6, 0),
-    makeAsset('ast-it-rack-1', 'fl-a1', 'rm-a1-control', 'eq-server-rack-42u', 'OT/SCADA 42U Compute Rack DC-01', 'DC-R01', 2.4, 18.6, 0, {
+    makeAsset('ast-it-rack-1', 'fl-a1', 'rm-a1-control', 'eq-server-rack-42u', 'Core Data Center 42U Rack DC-01 (MDF)', 'DC-R01', 2.4, 18.6, 0, {
       rackConfig: {
         totalUnits: 42,
+        rackRole: 'core-dc',
+        locationZone: 'Bldg A · Level 1 · SCADA & Data Center MDF',
         maxPowerKw: 12,
         coolingZone: 'Cold Aisle A1',
         subnetCidr: '10.42.10.0/24',
         devices: [
           {
             id: 'dev-sw-1',
-            name: 'Core OT Switch Nexus-9336',
+            name: 'Core OT Switch Nexus-9336 (Core-01)',
             kind: 'switch',
+            tier: 'core',
             uStart: 40,
             uHeight: 2,
             powerW: 650,
             ipAddress: '10.42.10.1',
+            macAddress: '00:1A:2B:93:36:01',
+            serialNumber: 'FDO2541CORE01',
             vlan: 'VLAN-10-OT',
             vendor: 'Cisco',
             model: 'Nexus 9336C-FX2',
             status: 'online',
+            cpuPct: 24,
+            memPct: 38,
+            tempC: 38,
+            uptimeLabel: '21d 38m',
             ports: [
-              { id: 'p-1', label: 'Eth1/1', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-10-OT', status: 'up' },
-              { id: 'p-2', label: 'Eth1/2', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-20-SCADA', status: 'up' },
-              { id: 'p-3', label: 'Eth1/3', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-30-EMS', status: 'up' },
-              { id: 'p-4', label: 'Eth1/4', kind: 'QSFP28', speedGbps: 100, vlan: 'VLAN-99-UPLINK', status: 'up' },
+              { id: 'p-1', label: 'Eth1/1', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-10-OT', status: 'up', isUplink: true, utilizationPct: 41, crcErrors: 0, opticalDbm: -2.4, connectedToLabel: 'PA-3420 FW' },
+              { id: 'p-2', label: 'Eth1/2', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-20-SCADA', status: 'up', utilizationPct: 58, crcErrors: 0, opticalDbm: -2.9, connectedToLabel: 'PVE-GMP-01' },
+              { id: 'p-3', label: 'Eth1/3', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-30-EMS', status: 'up', utilizationPct: 33, crcErrors: 0, connectedToLabel: 'EMS Cluster 02' },
+              { id: 'p-4', label: 'Eth1/4', kind: 'QSFP28', speedGbps: 100, vlan: 'VLAN-99-UPLINK', status: 'up', isUplink: true, utilizationPct: 47, crcErrors: 0, opticalDbm: -1.8, connectedToLabel: 'IDF-A0 Dist-SW' },
+              { id: 'p-5', label: 'Eth1/5', kind: 'QSFP28', speedGbps: 40, vlan: 'VLAN-99-UPLINK', status: 'up', isUplink: true, utilizationPct: 39, crcErrors: 2, opticalDbm: -3.1, connectedToLabel: 'IDF-B1 Lab Dist-SW' },
+              { id: 'p-6', label: 'Eth1/6', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-99-UPLINK', status: 'up', isUplink: true, utilizationPct: 29, crcErrors: 0, opticalDbm: -2.6, connectedToLabel: 'NET-R01 Patch Dist' },
+              { id: 'p-7', label: 'Eth1/7', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-30-EMS', status: 'up', utilizationPct: 44, crcErrors: 0, opticalDbm: -2.2, connectedToLabel: 'GMP Vault NAS' },
+              { id: 'p-8', label: 'Eth1/8', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-99-MGMT', status: 'up', utilizationPct: 6, crcErrors: 0, connectedToLabel: 'UPS-6K NMC' },
             ],
           },
           {
             id: 'dev-fw-1',
             name: 'GMP DMZ Industrial Firewall',
             kind: 'firewall',
+            tier: 'security',
             uStart: 38,
             uHeight: 2,
             powerW: 420,
             ipAddress: '10.42.10.254',
+            macAddress: '00:1B:17:34:20:FE',
+            serialNumber: 'PA3420GMP991',
             vlan: 'VLAN-99-DMZ',
             vendor: 'Palo Alto',
             model: 'PA-3420',
             status: 'online',
+            cpuPct: 12,
+            memPct: 28,
+            tempC: 41,
+            uptimeLabel: '48d 14h',
             ports: [
-              { id: 'fw-1', label: 'Mgmt', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-99-DMZ', status: 'up' },
-              { id: 'fw-2', label: 'Eth1/1', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-10-OT', status: 'up' },
+              { id: 'fw-1', label: 'Mgmt', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-99-MGMT', status: 'up', utilizationPct: 12, crcErrors: 0, connectedToLabel: 'Wireguard VPN' },
+              { id: 'fw-2', label: 'OT-Core', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-10-OT', status: 'up', isUplink: true, utilizationPct: 41, crcErrors: 0, opticalDbm: -2.5, connectedToLabel: 'Nexus Core-01' },
+              { id: 'fw-3', label: 'ISP-WAN', kind: 'RJ45', speedGbps: 2.5, vlan: 'VLAN-99-DMZ', status: 'up', isUplink: true, utilizationPct: 24, crcErrors: 0, connectedToLabel: 'Cloudflare Tunnel' },
+              { id: 'fw-4', label: 'DMZ-HA', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-99-DMZ', status: 'standby', utilizationPct: 3, crcErrors: 0, connectedToLabel: 'HA Peer' },
             ],
           },
           {
             id: 'dev-srv-1',
-            name: 'MES / Batch Historian Node 01',
+            name: 'pve-gmp-01 · Proxmox VE Cluster',
             kind: 'server',
+            tier: 'compute',
             uStart: 30,
             uHeight: 2,
             powerW: 850,
             ipAddress: '10.42.10.21',
+            macAddress: 'D4:BE:D9:76:00:21',
+            serialNumber: 'DL760HIST001',
             vlan: 'VLAN-20-SCADA',
             vendor: 'Dell EMC',
             model: 'PowerEdge R760',
             status: 'online',
+            cpuPct: 44,
+            memPct: 62,
+            tempC: 45,
+            uptimeLabel: '41d 6h',
+            hypervisorVersion: 'Proxmox VE 9.2.24',
+            workloads: [
+              { id: 'wl-101', vmid: 'VM 101', name: 'mes-batch-prod', kind: 'VM', hostTag: 'GMP-OT', status: 'up', cpuPct: 46, memPct: 68 },
+              { id: 'wl-102', vmid: 'VM 102', name: 'scada-historian', kind: 'VM', hostTag: 'SCADA', status: 'up', cpuPct: 54, memPct: 74 },
+              { id: 'wl-103', vmid: 'CT 103', name: 'lims-empower', kind: 'CT', hostTag: 'QC-Lab', status: 'up', cpuPct: 28, memPct: 49 },
+              { id: 'wl-104', vmid: 'VM 104', name: 'qms-part11-vault', kind: 'VM', hostTag: 'QA-GXP', status: 'up', cpuPct: 32, memPct: 61 },
+              { id: 'wl-105', vmid: 'CT 105', name: 'opc-ua-broker', kind: 'CT', hostTag: 'SCADA', status: 'up', cpuPct: 19, memPct: 34 },
+              { id: 'wl-106', vmid: 'CT 106', name: 'staging-mirror', kind: 'CT', hostTag: 'DR-Lab', status: 'stopped', cpuPct: 0, memPct: 0 },
+            ],
             ports: [
-              { id: 's1-1', label: 'NIC1', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-20-SCADA', status: 'up' },
-              { id: 's1-2', label: 'iDRAC', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-99-MGMT', status: 'up' },
+              { id: 's1-1', label: 'NIC1', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-20-SCADA', status: 'up', utilizationPct: 58, crcErrors: 0 },
+              { id: 's1-2', label: 'iDRAC', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-99-MGMT', status: 'up', utilizationPct: 4, crcErrors: 0 },
+            ],
+          },
+          {
+            id: 'dev-nas-1',
+            name: 'GMP Vault NAS · DXP4800',
+            kind: 'storage',
+            tier: 'compute',
+            uStart: 25,
+            uHeight: 2,
+            powerW: 340,
+            ipAddress: '10.42.10.30',
+            macAddress: 'A8:A1:59:48:00:30',
+            serialNumber: 'UGDXP4800GMP1',
+            vlan: 'VLAN-30-EMS',
+            vendor: 'UGREEN / TrueNAS',
+            model: 'DXP4800 Enterprise',
+            status: 'online',
+            cpuPct: 10,
+            memPct: 34,
+            diskPct: 73,
+            tempC: 39,
+            uptimeLabel: '64d 11h',
+            driveBays: [
+              { id: 'bay-1', slot: 1, label: 'NVMe-01', capacityLabel: '3.6 TiB', tempC: 42, health: 'healthy', usedPct: 74 },
+              { id: 'bay-2', slot: 2, label: 'NVMe-02', capacityLabel: '3.6 TiB', tempC: 38, health: 'healthy', usedPct: 71 },
+              { id: 'bay-3', slot: 3, label: 'NVMe-03', capacityLabel: '3.6 TiB', tempC: 41, health: 'healthy', usedPct: 75 },
+              { id: 'bay-4', slot: 4, label: 'NVMe-04', capacityLabel: '3.6 TiB', tempC: 37, health: 'healthy', usedPct: 72 },
+            ],
+            ports: [
+              { id: 'nas-1', label: '10G-ETH0', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-30-EMS', status: 'up', utilizationPct: 44, crcErrors: 0, connectedToLabel: 'Nexus Eth1/7' },
+              { id: 'nas-2', label: '2.5G-MGMT', kind: 'RJ45', speedGbps: 2.5, vlan: 'VLAN-99-MGMT', status: 'up', utilizationPct: 11, crcErrors: 0 },
             ],
           },
           {
             id: 'dev-srv-2',
             name: 'EMS GMP Telemetry Cluster 02',
             kind: 'server',
+            tier: 'compute',
             uStart: 28,
             uHeight: 2,
             powerW: 780,
             ipAddress: '10.42.10.22',
+            macAddress: 'D4:BE:D9:76:00:22',
+            serialNumber: 'DL760EMS002',
             vlan: 'VLAN-30-EMS',
             vendor: 'Dell EMC',
             model: 'PowerEdge R760',
             status: 'online',
+            cpuPct: 48,
+            memPct: 52,
+            tempC: 43,
+            uptimeLabel: '33d 9h',
             ports: [
-              { id: 's2-1', label: 'NIC1', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-30-EMS', status: 'up' },
+              { id: 's2-1', label: 'NIC1', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-30-EMS', status: 'up', utilizationPct: 33, crcErrors: 0 },
             ],
           },
           {
             id: 'dev-ups-1',
             name: 'Rack Dual-Conversion UPS 6kVA',
             kind: 'ups',
+            tier: 'power',
             uStart: 1,
             uHeight: 4,
             powerW: 320,
             ipAddress: '10.42.10.90',
+            macAddress: '00:C0:B7:6K:00:90',
+            serialNumber: 'APC6KRM9001',
             vlan: 'VLAN-99-MGMT',
             vendor: 'APC',
             model: 'Smart-UPS SRT6KRM',
             status: 'online',
+            cpuPct: 11,
+            memPct: 19,
+            tempC: 31,
+            uptimeLabel: '182d 4h',
             ports: [
-              { id: 'u1-1', label: 'NMC', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-99-MGMT', status: 'up' },
+              { id: 'u1-1', label: 'NMC', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-99-MGMT', status: 'up', utilizationPct: 2, crcErrors: 0 },
             ],
           },
         ],
         cables: [
-          {
-            id: 'cab-1',
-            fromDeviceId: 'dev-sw-1',
-            fromPortId: 'p-1',
-            toDeviceId: 'dev-fw-1',
-            toPortId: 'fw-2',
-            media: 'OM4 Fiber',
-            vlan: 'VLAN-10-OT',
-            color: '#06B6D4',
-            label: 'OT-CORE-UPLINK',
-          },
-          {
-            id: 'cab-2',
-            fromDeviceId: 'dev-sw-1',
-            fromPortId: 'p-2',
-            toDeviceId: 'dev-srv-1',
-            toPortId: 's1-1',
-            media: 'DAC Twinax',
-            vlan: 'VLAN-20-SCADA',
-            color: '#8B5CF6',
-            label: 'MES-HIST-10G',
-          },
-          {
-            id: 'cab-3',
-            fromDeviceId: 'dev-sw-1',
-            fromPortId: 'p-3',
-            toDeviceId: 'dev-srv-2',
-            toPortId: 's2-1',
-            media: 'Cat6A',
-            vlan: 'VLAN-30-EMS',
-            color: '#F59E0B',
-            label: 'EMS-GMP-LINK',
-          },
+          { id: 'cab-1', fromDeviceId: 'dev-sw-1', fromPortId: 'p-1', toDeviceId: 'dev-fw-1', toPortId: 'fw-2', media: 'OM4 Fiber', vlan: 'VLAN-10-OT', color: '#06B6D4', label: 'OT-CORE-UPLINK' },
+          { id: 'cab-2', fromDeviceId: 'dev-sw-1', fromPortId: 'p-2', toDeviceId: 'dev-srv-1', toPortId: 's1-1', media: 'DAC Twinax', vlan: 'VLAN-20-SCADA', color: '#8B5CF6', label: 'MES-HIST-10G' },
+          { id: 'cab-3', fromDeviceId: 'dev-sw-1', fromPortId: 'p-3', toDeviceId: 'dev-srv-2', toPortId: 's2-1', media: 'Cat6A', vlan: 'VLAN-30-EMS', color: '#F59E0B', label: 'EMS-GMP-LINK' },
+          { id: 'cab-4', fromDeviceId: 'dev-sw-1', fromPortId: 'p-7', toDeviceId: 'dev-nas-1', toPortId: 'nas-1', media: 'OM4 Fiber', vlan: 'VLAN-30-EMS', color: '#10B981', label: 'NAS-VAULT-10G' },
+          { id: 'cab-5', fromDeviceId: 'dev-sw-1', fromPortId: 'p-8', toDeviceId: 'dev-ups-1', toPortId: 'u1-1', media: 'Cat6A', vlan: 'VLAN-99-MGMT', color: '#64748B', label: 'UPS-NMC-1G' },
         ],
       },
     }),
-    makeAsset('ast-it-net-1', 'fl-a1', 'rm-a1-control', 'eq-network-rack', 'Cleanroom Fiber Patch Rack NET-01', 'NET-R01', 4.1, 18.6, 0),
+    makeAsset('ast-it-net-1', 'fl-a1', 'rm-a1-control', 'eq-network-rack-42u', 'Bldg A Level 1 Distribution Rack NET-01 (IDF-A1)', 'NET-R01', 4.1, 18.6, 0, {
+      rackConfig: {
+        totalUnits: 42,
+        rackRole: 'distribution-idf',
+        locationZone: 'Bldg A · Level 1 · QA & Control Wing',
+        maxPowerKw: 8,
+        coolingZone: 'Cold Aisle A1',
+        subnetCidr: '10.42.11.0/24',
+        devices: [
+          {
+            id: 'dev-dist-a1',
+            name: 'Bldg A-L1 Distribution Switch C9300-24S',
+            kind: 'switch',
+            tier: 'distribution',
+            uStart: 40,
+            uHeight: 1,
+            powerW: 360,
+            ipAddress: '10.42.11.1',
+            macAddress: '70:DB:98:A1:10:01',
+            serialNumber: 'FCW2541DISTA1',
+            vlan: 'VLAN-11-QA',
+            vendor: 'Cisco',
+            model: 'Catalyst 9300-24S',
+            status: 'online',
+            cpuPct: 22,
+            tempC: 36,
+            ports: [
+              { id: 'da1-up1', label: 'Te1/1/1', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-99-UPLINK', status: 'up', isUplink: true, utilizationPct: 29, crcErrors: 0, opticalDbm: -2.6, connectedToLabel: 'DC-R01 Core Eth1/6' },
+              { id: 'da1-dn1', label: 'Te1/0/1', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-11-QA', status: 'up', isUplink: true, utilizationPct: 34, crcErrors: 0, opticalDbm: -2.1, connectedToLabel: 'SW-2960-A1 Te1/0/1' },
+              { id: 'da1-dn2', label: 'Gi1/0/2', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-20-SCADA', status: 'up', utilizationPct: 18, crcErrors: 0 },
+            ],
+          },
+          {
+            id: 'dev-acc-2960-a1',
+            name: 'Access Switch Cisco 2960-X (A1-QA/SCADA)',
+            kind: 'switch',
+            tier: 'access',
+            uStart: 37,
+            uHeight: 1,
+            powerW: 240,
+            ipAddress: '10.42.11.10',
+            macAddress: 'C8:00:84:29:60:A1',
+            serialNumber: 'FOC2419C2960A1',
+            vlan: 'VLAN-11-QA',
+            vendor: 'Cisco',
+            model: 'Catalyst 2960-X 48FPS-L',
+            status: 'online',
+            cpuPct: 19,
+            tempC: 34,
+            ports: [
+              { id: 'a1-gi1', label: 'Gi1/0/1', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-11-QA', status: 'up', poeWatts: 12.4, utilizationPct: 28, crcErrors: 0, connectedToLabel: 'QA-WS-01' },
+              { id: 'a1-gi2', label: 'Gi1/0/2', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-11-QA', status: 'up', poeWatts: 8.2, utilizationPct: 21, crcErrors: 0, connectedToLabel: 'QA-VAL-02' },
+              { id: 'a1-gi3', label: 'Gi1/0/3', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-20-SCADA', status: 'up', poeWatts: 15.0, utilizationPct: 44, crcErrors: 0, connectedToLabel: 'SCADA-OP-01' },
+              { id: 'a1-gi4', label: 'Gi1/0/4', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-50-WIFI', status: 'up', poeWatts: 22.5, utilizationPct: 52, crcErrors: 0, connectedToLabel: 'AP-A1-AUDIT' },
+              { id: 'a1-te1', label: 'Te1/0/1', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-99-UPLINK', status: 'up', isUplink: true, utilizationPct: 34, crcErrors: 0, opticalDbm: -2.2, connectedToLabel: 'Dist C9300 Te1/0/1' },
+            ],
+          },
+          {
+            id: 'dev-pp-a1',
+            name: '24-Port OM4 Fiber & Cat6A Patch Panel',
+            kind: 'patch-panel',
+            tier: 'access',
+            uStart: 35,
+            uHeight: 1,
+            powerW: 0,
+            ipAddress: 'Passive',
+            vlan: 'TRUNK',
+            vendor: 'Panduit',
+            model: 'Opticom 24-LC / Cat6A',
+            status: 'online',
+            ports: [
+              { id: 'ppa1-1', label: 'LC-01', kind: 'Fiber-LC', speedGbps: 10, vlan: 'VLAN-99-UPLINK', status: 'up' },
+              { id: 'ppa1-2', label: 'RJ-01', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-11-QA', status: 'up' },
+            ],
+          },
+        ],
+        cables: [
+          { id: 'cab-a1-1', fromDeviceId: 'dev-acc-2960-a1', fromPortId: 'a1-te1', toDeviceId: 'dev-dist-a1', toPortId: 'da1-dn1', media: 'OM4 Fiber', vlan: 'VLAN-99-UPLINK', color: '#06B6D4', label: '2960-TO-DIST-10G' },
+        ],
+      },
+    }),
+    // Floor Distribution Rack (IDF) on Building A Ground Floor (GMP Production)
+    makeAsset('ast-idf-a0', 'fl-a0', 'rm-a0-corridor', 'eq-network-rack-42u', 'Bldg A Ground Floor IDF Distribution Rack (IDF-A0)', 'IDF-A0-01', 33.8, 10.6, 0, {
+      rackConfig: {
+        totalUnits: 24,
+        rackRole: 'distribution-idf',
+        locationZone: 'Bldg A · Ground Floor · Cleanroom Corridor East',
+        maxPowerKw: 6,
+        coolingZone: 'Grade C Corridor',
+        subnetCidr: '10.42.20.0/24',
+        devices: [
+          {
+            id: 'dev-dist-a0',
+            name: 'Bldg A-L0 Distribution Switch C9300X',
+            kind: 'switch',
+            tier: 'distribution',
+            uStart: 22,
+            uHeight: 1,
+            powerW: 390,
+            ipAddress: '10.42.20.1',
+            macAddress: '70:DB:98:A0:20:01',
+            serialNumber: 'FCW2541DISTA0',
+            vlan: 'VLAN-10-OT',
+            vendor: 'Cisco',
+            model: 'Catalyst 9300X-24Y',
+            status: 'online',
+            cpuPct: 28,
+            tempC: 37,
+            ports: [
+              { id: 'da0-up1', label: 'Hu1/1/1', kind: 'QSFP28', speedGbps: 100, vlan: 'VLAN-99-UPLINK', status: 'up', isUplink: true, utilizationPct: 47, crcErrors: 0, opticalDbm: -1.9, connectedToLabel: 'DC-R01 Core Eth1/4' },
+              { id: 'da0-dn1', label: 'Te1/0/1', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-10-OT', status: 'up', isUplink: true, utilizationPct: 42, crcErrors: 0, opticalDbm: -2.4, connectedToLabel: 'SW-2960-A0 Te1/0/1' },
+            ],
+          },
+          {
+            id: 'dev-acc-2960-a0',
+            name: 'Access Switch Cisco 2960-X (Production HMI/CCTV)',
+            kind: 'switch',
+            tier: 'access',
+            uStart: 19,
+            uHeight: 1,
+            powerW: 295,
+            ipAddress: '10.42.20.10',
+            macAddress: 'C8:00:84:29:60:A0',
+            serialNumber: 'FOC2419C2960A0',
+            vlan: 'VLAN-10-OT',
+            vendor: 'Cisco',
+            model: 'Catalyst 2960-X 48FPS-L',
+            status: 'online',
+            cpuPct: 35,
+            tempC: 39,
+            ports: [
+              { id: 'a0-gi1', label: 'Gi1/0/1', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-10-OT', status: 'up', poeWatts: 18.4, utilizationPct: 36, crcErrors: 0, connectedToLabel: 'HMI-UP-01' },
+              { id: 'a0-gi2', label: 'Gi1/0/2', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-10-OT', status: 'up', poeWatts: 19.2, utilizationPct: 49, crcErrors: 0, connectedToLabel: 'HMI-FILL-01' },
+              { id: 'a0-gi3', label: 'Gi1/0/3', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-60-CCTV', status: 'up', poeWatts: 14.5, utilizationPct: 61, crcErrors: 3, connectedToLabel: 'CAM-UP-01' },
+              { id: 'a0-gi4', label: 'Gi1/0/4', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-70-ACS', status: 'error', poeWatts: 6.2, utilizationPct: 88, crcErrors: 14, connectedToLabel: 'BADGE-PAL-01' },
+              { id: 'a0-te1', label: 'Te1/0/1', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-99-UPLINK', status: 'up', isUplink: true, utilizationPct: 42, crcErrors: 0, opticalDbm: -2.4, connectedToLabel: 'Dist C9300X Te1/0/1' },
+            ],
+          },
+        ],
+        cables: [
+          { id: 'cab-a0-1', fromDeviceId: 'dev-acc-2960-a0', fromPortId: 'a0-te1', toDeviceId: 'dev-dist-a0', toPortId: 'da0-dn1', media: 'OM4 Fiber', vlan: 'VLAN-99-UPLINK', color: '#06B6D4', label: 'A0-2960-DIST-10G' },
+        ],
+      },
+    }),
+    // Floor Distribution Rack (IDF) on Building B Level 1 (QC Labs)
+    makeAsset('ast-idf-b1', 'fl-b1', 'rm-b1-sample', 'eq-network-rack-42u', 'Bldg B QC Labs IDF Distribution Rack (IDF-B1)', 'IDF-B1-01', 29.6, 8.6, 0, {
+      rackConfig: {
+        totalUnits: 24,
+        rackRole: 'distribution-idf',
+        locationZone: 'Bldg B · Level 1 · QC Sample & Lab Core',
+        maxPowerKw: 6,
+        coolingZone: 'Lab HVAC Zone B1',
+        subnetCidr: '10.42.31.0/24',
+        devices: [
+          {
+            id: 'dev-dist-b1',
+            name: 'Bldg B-L1 Lab Distribution Switch C9300',
+            kind: 'switch',
+            tier: 'distribution',
+            uStart: 22,
+            uHeight: 1,
+            powerW: 340,
+            ipAddress: '10.42.31.1',
+            macAddress: '70:DB:98:B1:31:01',
+            serialNumber: 'FCW2541DISTB1',
+            vlan: 'VLAN-31-LAB',
+            vendor: 'Cisco',
+            model: 'Catalyst 9300-24S',
+            status: 'warning',
+            cpuPct: 41,
+            tempC: 44,
+            ports: [
+              { id: 'db1-up1', label: 'Fo1/1/1', kind: 'QSFP28', speedGbps: 40, vlan: 'VLAN-99-UPLINK', status: 'up', isUplink: true, utilizationPct: 39, crcErrors: 2, opticalDbm: -3.2, connectedToLabel: 'DC-R01 Core Eth1/5' },
+              { id: 'db1-dn1', label: 'Te1/0/1', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-31-LAB', status: 'up', isUplink: true, utilizationPct: 54, crcErrors: 1, opticalDbm: -2.8, connectedToLabel: 'SW-2960-B1 Te1/0/1' },
+            ],
+          },
+          {
+            id: 'dev-acc-2960-b1',
+            name: 'Access Switch Cisco 2960-X (HPLC/LIMS Lab)',
+            kind: 'switch',
+            tier: 'access',
+            uStart: 19,
+            uHeight: 1,
+            powerW: 265,
+            ipAddress: '10.42.31.10',
+            macAddress: 'C8:00:84:29:60:B1',
+            serialNumber: 'FOC2419C2960B1',
+            vlan: 'VLAN-31-LAB',
+            vendor: 'Cisco',
+            model: 'Catalyst 2960-X 48FPS-L',
+            status: 'online',
+            cpuPct: 26,
+            tempC: 35,
+            ports: [
+              { id: 'b1-gi1', label: 'Gi1/0/1', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-31-LAB', status: 'up', poeWatts: 0, utilizationPct: 64, crcErrors: 0, connectedToLabel: 'HPLC-DROP-01' },
+              { id: 'b1-gi2', label: 'Gi1/0/2', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-31-LAB', status: 'up', poeWatts: 0, utilizationPct: 58, crcErrors: 0, connectedToLabel: 'LCMS-DROP-01' },
+              { id: 'b1-gi3', label: 'Gi1/0/3', kind: 'RJ45', speedGbps: 1, vlan: 'VLAN-31-LAB', status: 'up', poeWatts: 11.4, utilizationPct: 29, crcErrors: 0, connectedToLabel: 'LIMS-WS-RD1' },
+              { id: 'b1-te1', label: 'Te1/0/1', kind: 'SFP+', speedGbps: 10, vlan: 'VLAN-99-UPLINK', status: 'up', isUplink: true, utilizationPct: 54, crcErrors: 1, opticalDbm: -2.8, connectedToLabel: 'Dist C9300 Te1/0/1' },
+            ],
+          },
+        ],
+        cables: [
+          { id: 'cab-b1-1', fromDeviceId: 'dev-acc-2960-b1', fromPortId: 'b1-te1', toDeviceId: 'dev-dist-b1', toPortId: 'db1-dn1', media: 'OM4 Fiber', vlan: 'VLAN-99-UPLINK', color: '#06B6D4', label: 'B1-2960-DIST-10G' },
+        ],
+      },
+    }),
+    makeAsset('ast-fbx-a1', 'fl-a1', 'rm-a1-elec', 'eq-firebox', 'Electrical Switchgear Firebox FB-A10', 'FB-A10', 27.6, 10.4, Math.PI),
+    makeAsset('ast-fex-a1', 'fl-a1', 'rm-a1-control', 'eq-fire-extinguisher', 'Data Center CO2 Extinguisher FE-A11', 'FE-A11', 1.6, 13.0, 0),
     makeAsset('ast-ctl-1', 'fl-a1', 'rm-a1-control', 'eq-scada-console', 'SCADA Operator Console 1', 'CTL-01', 5.2, 15.2, 0),
     makeAsset('ast-ctl-2', 'fl-a1', 'rm-a1-control', 'eq-desk', 'EMS Environmental Console 2', 'CTL-02', 9.0, 15.2, 0),
     makeAsset('ast-qa-1', 'fl-a1', 'rm-a1-qa', 'eq-desk', 'QA Release Lead Desk', 'QA-01', 15.4, 15.0, 0),
@@ -680,14 +1296,16 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
     makeAsset('ast-wh-2', 'fl-b0', 'rm-b0-raw', 'eq-pallet-rack', 'Raw Material Rack Row B', 'RCK-B1', 4.5, 7.2, 0),
     makeAsset('ast-wh-3', 'fl-b0', 'rm-b0-raw', 'eq-pallet-rack', 'Raw Material Rack Row C', 'RCK-C1', 10.6, 3.2, 0),
     makeAsset('ast-wh-4', 'fl-b0', 'rm-b0-raw', 'eq-forklift', 'Electric Reach Forklift FL-01', 'FL-01', 10.8, 8.2, Math.PI / 2),
-    makeAsset('ast-wh-5', 'fl-b0', 'rm-b0-cold', 'eq-pallet-rack', 'Cold Chain Rack 2–8°C Row 1', 'CLD-R1', 18.2, 3.8, 0),
-    makeAsset('ast-wh-6', 'fl-b0', 'rm-b0-cold', 'eq-pallet-rack', 'Cold Chain Rack 2–8°C Row 2', 'CLD-R2', 18.2, 8.2, 0),
-    makeAsset('ast-wh-7', 'fl-b0', 'rm-b0-cold', 'eq-sensor-env', 'Cold Storage Mapped Sensor', 'EMS-B0-02', 23.6, 6.0, 0),
+    makeAsset('ast-wh-5', 'fl-b0', 'rm-b0-cold', 'eq-pallet-rack', 'Cold Chain Rack 2–8°C Row 1', 'CLD-R1', 18.2, 3.4, 0),
+    makeAsset('ast-wh-6', 'fl-b0', 'rm-b0-cold', 'eq-cold-room-unit', 'Modular Walk-In Cold Room Chamber (2–8 °C)', 'CR-B01', 21.8, 8.8, Math.PI),
+    makeAsset('ast-wh-7', 'fl-b0', 'rm-b0-cold', 'eq-sensor-env', 'Cold Storage Mapped Sensor', 'EMS-B0-02', 23.8, 3.6, 0),
     makeAsset('ast-wh-8', 'fl-b0', 'rm-b0-quarantine', 'eq-pallet-rack', 'Quarantine Hold Rack Q1', 'QRN-R1', 28.0, 5.5, Math.PI / 2),
     makeAsset('ast-wh-9', 'fl-b0', 'rm-b0-dock', 'eq-conveyor', 'Inbound Receiving Conveyor', 'CNV-01', 6.0, 15.2, 0),
     makeAsset('ast-wh-10', 'fl-b0', 'rm-b0-dock', 'eq-weighing-station', 'Inbound Pallet Scale', 'SCL-01', 12.2, 15.4, 0),
     makeAsset('ast-wh-11', 'fl-b0', 'rm-b0-dispatch', 'eq-packing-station', 'Thermal Shipper Pack Station', 'PCK-B1', 21.8, 15.4, 0),
     makeAsset('ast-wh-12', 'fl-b0', 'rm-b0-dispatch', 'eq-pallet', 'Validated Cold-Pack Pallet', 'PLT-B9', 27.2, 15.5, 0),
+    makeAsset('ast-fbx-b0', 'fl-b0', 'rm-b0-dock', 'eq-firebox', 'Loading Dock Fire Hose Firebox FB-B01', 'FB-B01', 1.8, 12.6, 0),
+    makeAsset('ast-fex-b0', 'fl-b0', 'rm-b0-raw', 'eq-fire-extinguisher', 'Warehouse ABC Fire Extinguisher FE-B01', 'FE-B01', 13.8, 11.2, Math.PI),
 
     // Building B · Level 1 (QC Labs)
     makeAsset('ast-qc-1', 'fl-b1', 'rm-b1-analytical', 'eq-hplc', 'Waters ACQUITY UHPLC #1', 'HPLC-01', 4.0, 3.2, 0),
@@ -698,40 +1316,30 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
     makeAsset('ast-qc-6', 'fl-b1', 'rm-b1-micro', 'eq-biosafety-cab', 'Class II A2 Biosafety Cabinet #1', 'BSC-01', 18.0, 3.2, 0),
     makeAsset('ast-qc-7', 'fl-b1', 'rm-b1-micro', 'eq-isolator', 'Sterility Testing Isolator', 'ISO-01', 22.8, 3.8, 0),
     makeAsset('ast-qc-8', 'fl-b1', 'rm-b1-micro', 'eq-incubator', 'CO2 Bioburden Incubator Stack', 'INC-01', 18.0, 8.0, 0),
+    makeAsset('ast-qc-pbx', 'fl-b1', 'rm-b1-micro', 'eq-pass-box', 'QC Micro Sample Transfer Pass Box PB-B1', 'PB-B01', 25.0, 8.4, -Math.PI / 2),
     makeAsset('ast-qc-9', 'fl-b1', 'rm-b1-sample', 'eq-lab-fridge', 'QC Sample Refrigerator (2–8°C)', 'FRG-01', 28.4, 4.2, 0),
     makeAsset('ast-qc-10', 'fl-b1', 'rm-b1-stability', 'eq-stability-chamber', 'ICH Stability Chamber 25°C/60%RH', 'STB-01', 4.2, 14.8, 0),
     makeAsset('ast-qc-11', 'fl-b1', 'rm-b1-stability', 'eq-stability-chamber', 'ICH Accelerated Chamber 40°C/75%RH', 'STB-02', 8.2, 14.8, 0),
     makeAsset('ast-qc-12', 'fl-b1', 'rm-b1-stability', 'eq-ul-freezer', 'Master Cell Bank -80°C Freezer', 'ULT-01', 11.8, 15.0, 0),
     makeAsset('ast-qc-13', 'fl-b1', 'rm-b1-rd', 'eq-lab-bench', 'Bioprocess R&D Bench A', 'RD-B01', 19.0, 15.0, 0),
     makeAsset('ast-qc-14', 'fl-b1', 'rm-b1-rd', 'eq-pcr', 'qPCR Residual DNA Analyzer', 'PCR-01', 25.5, 14.8, 0),
-  ];
+    makeAsset('ast-qc-fex', 'fl-b1', 'rm-b1-analytical', 'eq-fire-extinguisher', 'Analytical Lab CO2 Extinguisher FE-B11', 'FE-B11', 1.7, 9.8, 0),
+    // Additional models ensuring every room across all floors has rich 3D equipment
+    makeAsset('ast-cnf-2', 'fl-a1', 'rm-a1-conf', 'eq-scada-console', 'Audit Review Presentation Console', 'CNF-02', 25.6, 19.2, Math.PI / 2),
+    makeAsset('ast-wh-8b', 'fl-b0', 'rm-b0-quarantine', 'eq-weighing-station', 'QA Quarantine Sampling Scale', 'QRN-SCL1', 27.6, 9.4, 0),
+    makeAsset('ast-qc-9b', 'fl-b1', 'rm-b1-sample', 'eq-lab-bench', 'Sample Login & Barcode Intake Bench', 'SMP-B01', 28.2, 7.6, 0),
+  ].map((a) => enrichAssetHistory(a));
 
-  const cameras = [
+  const cameras: SceneCamera[] = [
     {
       id: 'cam-1',
       floorId: 'fl-a0',
-      name: 'GMP Production Overview',
-      kind: 'perspective' as const,
-      group: 'Executive Viewpoints',
-      position: [18, 22, 34] as [number, number, number],
-      target: [18, 1.5, 11] as [number, number, number],
-      fov: 45,
-      focalLengthMm: 35,
-      coverageRadius: 14,
-      visibleCone: true,
-      layerId: 'layer-cameras',
-      status: 'online' as const,
-      resolution: '3840×2160',
-      fps: 30,
-    },
-    {
-      id: 'cam-2',
-      floorId: 'fl-a0',
-      name: 'Upstream Bioreactor Bay CCTV',
-      kind: 'security' as const,
-      group: 'GMP Monitoring',
-      position: [2.2, 3.4, 2.2] as [number, number, number],
-      target: [8.0, 1.4, 6.2] as [number, number, number],
+      roomId: 'rm-a0-upstream',
+      name: 'Upstream Bioreactor Bay CCTV (A0-101)',
+      kind: 'security',
+      group: 'GMP Production CCTV',
+      position: [1.8, 3.3, 1.8],
+      target: [7.6, 1.4, 5.6],
       fov: 68,
       focalLengthMm: 24,
       coverageRadius: 11,
@@ -739,87 +1347,666 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
       layerId: 'layer-cameras',
       ipAddress: '10.42.20.101',
       port: 554,
-      protocol: 'RTSP' as const,
+      protocol: 'RTSP',
       streamPath: '/h265/ch01/main/av_stream',
       username: 'gmp_cctv_op',
       hasCredentials: true,
       resolution: '2560×1440',
       fps: 30,
       nightVision: true,
-      status: 'recording' as const,
+      status: 'recording',
+    },
+    {
+      id: 'cam-2',
+      floorId: 'fl-a0',
+      roomId: 'rm-a0-downstream',
+      name: 'Downstream Chromatography Suite Cam (A0-102)',
+      kind: 'inspection',
+      group: 'GMP Production CCTV',
+      position: [13.8, 3.2, 8.8],
+      target: [19.2, 1.4, 4.4],
+      fov: 62,
+      focalLengthMm: 28,
+      coverageRadius: 10,
+      visibleCone: true,
+      layerId: 'layer-cameras',
+      ipAddress: '10.42.20.102',
+      port: 554,
+      protocol: 'RTSP',
+      streamPath: '/h265/ch02/main',
+      username: 'gmp_cctv_op',
+      hasCredentials: true,
+      resolution: '2560×1440',
+      fps: 30,
+      status: 'recording',
     },
     {
       id: 'cam-3',
       floorId: 'fl-a0',
-      name: 'Aseptic Filling Line Inspection Cam',
-      kind: 'inspection' as const,
-      group: 'GMP Monitoring',
-      position: [25.2, 3.1, 8.8] as [number, number, number],
-      target: [29.4, 1.5, 4.4] as [number, number, number],
-      fov: 52,
+      roomId: 'rm-a0-filling',
+      name: 'Aseptic Filling & Lyo Isolator Cam (A0-103)',
+      kind: 'inspection',
+      group: 'Grade A/B Monitoring',
+      position: [24.8, 3.1, 8.9],
+      target: [29.4, 1.5, 4.6],
+      fov: 56,
       focalLengthMm: 35,
       coverageRadius: 9,
       visibleCone: true,
       layerId: 'layer-cameras',
+      ipAddress: '10.42.20.103',
+      port: 554,
+      protocol: 'ONVIF',
+      streamPath: '/onvif/aseptic-01',
+      username: 'gmp_cctv_op',
+      hasCredentials: true,
+      resolution: '3840×2160',
+      fps: 30,
+      status: 'recording',
     },
     {
       id: 'cam-4',
-      floorId: 'fl-b1',
-      name: 'QC Analytical Lab Overview',
-      kind: 'perspective' as const,
-      group: 'Lab Viewpoints',
-      position: [16, 18, 28] as [number, number, number],
-      target: [15, 1.2, 10] as [number, number, number],
-      fov: 45,
-      focalLengthMm: 35,
-      coverageRadius: 12,
+      floorId: 'fl-a0',
+      roomId: 'rm-a0-corridor',
+      name: 'Grade C Clean Corridor East Cam (A0-104)',
+      kind: 'security',
+      group: 'Corridor & Access',
+      position: [3.2, 3.1, 11.7],
+      target: [18.0, 1.5, 11.7],
+      fov: 74,
+      focalLengthMm: 21,
+      coverageRadius: 14,
       visibleCone: true,
       layerId: 'layer-cameras',
+      ipAddress: '10.42.20.104',
+      port: 554,
+      protocol: 'RTSP',
+      streamPath: '/h265/ch04/main',
+      resolution: '2560×1440',
+      fps: 25,
+      status: 'online',
+    },
+    {
+      id: 'cam-5',
+      floorId: 'fl-a1',
+      roomId: 'rm-a1-control',
+      name: 'SCADA & Data Center MDF Rack Cam (A1-204)',
+      kind: 'security',
+      group: 'IT & SCADA Security',
+      position: [10.8, 3.2, 13.0],
+      target: [3.6, 1.4, 17.8],
+      fov: 66,
+      focalLengthMm: 24,
+      coverageRadius: 10,
+      visibleCone: true,
+      layerId: 'layer-cameras',
+      ipAddress: '10.42.10.105',
+      port: 554,
+      protocol: 'RTSP',
+      streamPath: '/h265/dc-mdf/main',
+      username: 'ot_sec_admin',
+      hasCredentials: true,
+      resolution: '3840×2160',
+      fps: 30,
+      status: 'recording',
+    },
+    {
+      id: 'cam-6',
+      floorId: 'fl-a1',
+      roomId: 'rm-a1-qa',
+      name: 'QA Batch Review & Documentation Cam (A1-205)',
+      kind: 'fixed-industrial',
+      group: 'QA & Audit Suites',
+      position: [12.8, 3.1, 12.8],
+      target: [18.5, 1.2, 16.8],
+      fov: 64,
+      focalLengthMm: 24,
+      coverageRadius: 9,
+      visibleCone: true,
+      layerId: 'layer-cameras',
+      ipAddress: '10.42.11.106',
+      port: 554,
+      protocol: 'RTSP',
+      streamPath: '/h265/qa-205/main',
+      resolution: '2560×1440',
+      fps: 30,
+      status: 'online',
+    },
+    {
+      id: 'cam-7',
+      floorId: 'fl-b0',
+      roomId: 'rm-b0-cold',
+      name: 'Cold Storage 2–8°C Vault Cam (B0-102)',
+      kind: 'security',
+      group: 'GDP Warehouse CCTV',
+      position: [16.0, 3.8, 2.0],
+      target: [20.6, 1.5, 7.6],
+      fov: 70,
+      focalLengthMm: 24,
+      coverageRadius: 11,
+      visibleCone: true,
+      layerId: 'layer-cameras',
+      ipAddress: '10.42.30.107',
+      port: 554,
+      protocol: 'RTSP',
+      streamPath: '/h265/cold-b0/main',
+      resolution: '2560×1440',
+      fps: 25,
+      nightVision: true,
+      status: 'recording',
+    },
+    {
+      id: 'cam-8',
+      floorId: 'fl-b1',
+      roomId: 'rm-b1-analytical',
+      name: 'QC Analytical HPLC/LC-MS Lab Cam (B1-201)',
+      kind: 'inspection',
+      group: 'Lab Viewpoints',
+      position: [2.0, 3.1, 9.6],
+      target: [8.2, 1.2, 4.4],
+      fov: 66,
+      focalLengthMm: 24,
+      coverageRadius: 11,
+      visibleCone: true,
+      layerId: 'layer-cameras',
+      ipAddress: '10.42.31.108',
+      port: 554,
+      protocol: 'RTSP',
+      streamPath: '/h265/qc-b1/main',
+      resolution: '3840×2160',
+      fps: 30,
+      status: 'recording',
     },
   ];
 
+  const networkArchitecture: NetworkArchitectureState = {
+    userNodes: [
+      {
+        id: 'un-qa-01',
+        code: 'NODE-QA-01',
+        name: 'QA Batch Release Workstation #1',
+        nodeKind: 'workstation',
+        floorId: 'fl-a1',
+        roomId: 'rm-a1-qa',
+        x: 15.4,
+        z: 15.0,
+        wallJackId: 'WJ-A1-205-01',
+        ipAddress: '10.42.11.41',
+        macAddress: '3C:7C:3F:A1:01:41',
+        vlan: 'VLAN-11-QA',
+        poeWatts: 12.4,
+        connectedRackId: 'ast-it-net-1',
+        connectedDeviceId: 'dev-acc-2960-a1',
+        connectedPortId: 'a1-gi1',
+        media: 'Cat6A',
+        status: 'online',
+        bandwidthMbps: 280,
+        latencyMs: 1.2,
+        packetLossPct: 0.0,
+        crcErrors: 0,
+        notes: 'Connected to Cisco 2960-X Gi1/0/1 in IDF-A1 → Core DC-R01.',
+      },
+      {
+        id: 'un-qa-02',
+        code: 'NODE-VAL-02',
+        name: 'Validation Lead Workstation #2',
+        nodeKind: 'workstation',
+        floorId: 'fl-a1',
+        roomId: 'rm-a1-qa',
+        x: 19.8,
+        z: 15.0,
+        wallJackId: 'WJ-A1-205-02',
+        ipAddress: '10.42.11.42',
+        macAddress: '3C:7C:3F:A1:01:42',
+        vlan: 'VLAN-11-QA',
+        poeWatts: 8.2,
+        connectedRackId: 'ast-it-net-1',
+        connectedDeviceId: 'dev-acc-2960-a1',
+        connectedPortId: 'a1-gi2',
+        media: 'Cat6A',
+        status: 'online',
+        bandwidthMbps: 210,
+        latencyMs: 1.4,
+        packetLossPct: 0.0,
+        crcErrors: 0,
+      },
+      {
+        id: 'un-scada-01',
+        code: 'NODE-SCADA-01',
+        name: 'SCADA Operator Terminal #1',
+        nodeKind: 'hmi-panel',
+        floorId: 'fl-a1',
+        roomId: 'rm-a1-control',
+        x: 5.2,
+        z: 15.2,
+        wallJackId: 'WJ-A1-204-03',
+        ipAddress: '10.42.20.51',
+        macAddress: '3C:7C:3F:A1:04:51',
+        vlan: 'VLAN-20-SCADA',
+        poeWatts: 15.0,
+        connectedRackId: 'ast-it-net-1',
+        connectedDeviceId: 'dev-acc-2960-a1',
+        connectedPortId: 'a1-gi3',
+        media: 'PoE++ Cat6A',
+        status: 'online',
+        bandwidthMbps: 440,
+        latencyMs: 0.9,
+        packetLossPct: 0.0,
+        crcErrors: 0,
+      },
+      {
+        id: 'un-ap-a1',
+        code: 'AP-A1-AUDIT',
+        name: 'Cisco Catalyst 9136 Wi-Fi 6E AP (Audit)',
+        nodeKind: 'wifi-ap',
+        floorId: 'fl-a1',
+        roomId: 'rm-a1-conf',
+        x: 29.5,
+        z: 16.5,
+        wallJackId: 'WJ-A1-206-AP1',
+        ipAddress: '10.42.50.14',
+        macAddress: 'F4:CF:E2:91:36:14',
+        vlan: 'VLAN-50-WIFI',
+        poeWatts: 22.5,
+        connectedRackId: 'ast-it-net-1',
+        connectedDeviceId: 'dev-acc-2960-a1',
+        connectedPortId: 'a1-gi4',
+        media: 'PoE++ Cat6A',
+        status: 'online',
+        bandwidthMbps: 520,
+        latencyMs: 2.1,
+        packetLossPct: 0.01,
+        crcErrors: 0,
+      },
+      {
+        id: 'un-hmi-up',
+        code: 'HMI-UP-01',
+        name: 'Bioreactor BR-2001 Cleanroom HMI',
+        nodeKind: 'hmi-panel',
+        floorId: 'fl-a0',
+        roomId: 'rm-a0-upstream',
+        x: 5.6,
+        z: 6.4,
+        wallJackId: 'WJ-A0-101-01',
+        ipAddress: '10.42.20.61',
+        macAddress: '00:1B:1B:A0:01:61',
+        vlan: 'VLAN-10-OT',
+        poeWatts: 18.4,
+        connectedRackId: 'ast-idf-a0',
+        connectedDeviceId: 'dev-acc-2960-a0',
+        connectedPortId: 'a0-gi1',
+        media: 'PoE++ Cat6A',
+        status: 'online',
+        bandwidthMbps: 360,
+        latencyMs: 1.1,
+        packetLossPct: 0.0,
+        crcErrors: 0,
+      },
+      {
+        id: 'un-hmi-fil',
+        code: 'HMI-FILL-01',
+        name: 'Aseptic Filler ALF-5000 PLC Drop',
+        nodeKind: 'hmi-panel',
+        floorId: 'fl-a0',
+        roomId: 'rm-a0-filling',
+        x: 28.4,
+        z: 6.2,
+        wallJackId: 'WJ-A0-103-02',
+        ipAddress: '10.42.20.62',
+        macAddress: '00:1B:1B:A0:03:62',
+        vlan: 'VLAN-10-OT',
+        poeWatts: 19.2,
+        connectedRackId: 'ast-idf-a0',
+        connectedDeviceId: 'dev-acc-2960-a0',
+        connectedPortId: 'a0-gi2',
+        media: 'PoE++ Cat6A',
+        status: 'online',
+        bandwidthMbps: 490,
+        latencyMs: 0.8,
+        packetLossPct: 0.0,
+        crcErrors: 0,
+      },
+      {
+        id: 'un-badge-pal',
+        code: 'BADGE-PAL-01',
+        name: 'PAL Biometric Interlock Reader',
+        nodeKind: 'badge-reader',
+        floorId: 'fl-a0',
+        roomId: 'rm-a0-pal',
+        x: 14.0,
+        z: 14.2,
+        wallJackId: 'WJ-A0-106-04',
+        ipAddress: '10.42.70.18',
+        macAddress: 'A4:14:37:70:00:18',
+        vlan: 'VLAN-70-ACS',
+        poeWatts: 6.2,
+        connectedRackId: 'ast-idf-a0',
+        connectedDeviceId: 'dev-acc-2960-a0',
+        connectedPortId: 'a0-gi4',
+        media: 'Cat6A',
+        status: 'error',
+        bandwidthMbps: 48,
+        latencyMs: 19.4,
+        packetLossPct: 2.8,
+        crcErrors: 14,
+        notes: 'Intermittent CRC error burst detected on 2960-X Gi1/0/4 — inspect RJ45 termination.',
+      },
+      {
+        id: 'un-hplc-01',
+        code: 'HPLC-DROP-01',
+        name: 'Waters UHPLC #1 Empower CDS Drop',
+        nodeKind: 'hplc-drop',
+        floorId: 'fl-b1',
+        roomId: 'rm-b1-analytical',
+        x: 4.0,
+        z: 4.4,
+        wallJackId: 'WJ-B1-201-01',
+        ipAddress: '10.42.31.71',
+        macAddress: '00:50:C2:B1:01:71',
+        vlan: 'VLAN-31-LAB',
+        poeWatts: 0,
+        connectedRackId: 'ast-idf-b1',
+        connectedDeviceId: 'dev-acc-2960-b1',
+        connectedPortId: 'b1-gi1',
+        media: 'Cat6A',
+        status: 'online',
+        bandwidthMbps: 640,
+        latencyMs: 1.6,
+        packetLossPct: 0.0,
+        crcErrors: 0,
+      },
+      {
+        id: 'un-lcms-01',
+        code: 'LCMS-DROP-01',
+        name: 'Agilent LC-MS/MS Data Acquisition Drop',
+        nodeKind: 'hplc-drop',
+        floorId: 'fl-b1',
+        roomId: 'rm-b1-analytical',
+        x: 11.4,
+        z: 4.6,
+        wallJackId: 'WJ-B1-201-02',
+        ipAddress: '10.42.31.72',
+        macAddress: '00:50:C2:B1:01:72',
+        vlan: 'VLAN-31-LAB',
+        poeWatts: 0,
+        connectedRackId: 'ast-idf-b1',
+        connectedDeviceId: 'dev-acc-2960-b1',
+        connectedPortId: 'b1-gi2',
+        media: 'Cat6A',
+        status: 'online',
+        bandwidthMbps: 580,
+        latencyMs: 1.5,
+        packetLossPct: 0.0,
+        crcErrors: 0,
+      },
+    ],
+    interRackLinks: [
+      {
+        id: 'irl-a0-core',
+        label: 'TRUNK-IDF-A0 → DC-CORE-01 (100G OS2)',
+        tier: 'dist-to-core',
+        fromRackId: 'ast-idf-a0',
+        fromDeviceId: 'dev-dist-a0',
+        fromPortId: 'da0-up1',
+        toRackId: 'ast-it-rack-1',
+        toDeviceId: 'dev-sw-1',
+        toPortId: 'p-4',
+        media: 'OS2 Single-Mode',
+        speedGbps: 100,
+        vlanTrunk: 'VLAN 10,20,60,70,99',
+        status: 'up',
+        utilizationPct: 47,
+        opticalRxDbm: -1.9,
+        crcErrors: 0,
+      },
+      {
+        id: 'irl-a1-core',
+        label: 'TRUNK-IDF-A1 → DC-CORE-01 (10G OM4)',
+        tier: 'dist-to-core',
+        fromRackId: 'ast-it-net-1',
+        fromDeviceId: 'dev-dist-a1',
+        fromPortId: 'da1-up1',
+        toRackId: 'ast-it-rack-1',
+        toDeviceId: 'dev-sw-1',
+        toPortId: 'p-6',
+        media: 'OM4 Fiber',
+        speedGbps: 10,
+        vlanTrunk: 'VLAN 11,20,50,99',
+        status: 'up',
+        utilizationPct: 29,
+        opticalRxDbm: -2.6,
+        crcErrors: 0,
+      },
+      {
+        id: 'irl-b1-core',
+        label: 'TRUNK-IDF-B1 → DC-CORE-01 (40G OS2 Campus Fiber)',
+        tier: 'dist-to-core',
+        fromRackId: 'ast-idf-b1',
+        fromDeviceId: 'dev-dist-b1',
+        fromPortId: 'db1-up1',
+        toRackId: 'ast-it-rack-1',
+        toDeviceId: 'dev-sw-1',
+        toPortId: 'p-5',
+        media: 'OS2 Single-Mode',
+        speedGbps: 40,
+        vlanTrunk: 'VLAN 31,99',
+        status: 'degraded',
+        utilizationPct: 39,
+        opticalRxDbm: -3.2,
+        crcErrors: 2,
+      },
+    ],
+    monitoringApis: [
+      {
+        id: 'mon-prom-1',
+        name: 'Campus Prometheus SNMP Exporter',
+        provider: 'Prometheus',
+        endpointUrl: 'https://monitor.cinnagen.local:9090/api/v1/query',
+        authType: 'bearer',
+        pollIntervalSec: 15,
+        enabled: true,
+        lastStatus: 'connected',
+        lastCheckedAt: 'Just now',
+        mappedMetrics: ['ifHCInOctets', 'ifInErrors', 'poeWatts', 'opticalRxDbm'],
+      },
+      {
+        id: 'mon-netbox-1',
+        name: 'NetBox Enterprise DCIM Sync',
+        provider: 'NetBox',
+        endpointUrl: 'https://netbox.cinnagen.local/api/dcim/racks/',
+        authType: 'api-key',
+        pollIntervalSec: 60,
+        enabled: false,
+        lastStatus: 'idle',
+        mappedMetrics: ['racks', 'devices', 'interfaces', 'cables', 'vlans'],
+      },
+      {
+        id: 'mon-cisco-1',
+        name: 'Cisco Catalyst Center / DNA Assurance',
+        provider: 'Cisco Catalyst Center',
+        endpointUrl: 'https://dnac.cinnagen.local/dna/intent/api/v1/network-device',
+        authType: 'bearer',
+        pollIntervalSec: 30,
+        enabled: false,
+        lastStatus: 'idle',
+        mappedMetrics: ['switchHealth', 'clientLatency', 'portCrcErrors', 'uplinkStatus'],
+      },
+    ],
+    topologyMap: {
+      diagramName: 'cinnagen-dc-live-map',
+      snapToGrid: true,
+      showLegend: true,
+      vlans: [
+        { id: 'v-10', vlanTag: 'VLAN-10-OT', name: 'GMP Production OT', subnet: '10.42.10.0/24', color: '#10B981', visible: true },
+        { id: 'v-20', vlanTag: 'VLAN-20-SCADA', name: 'SCADA & Historian', subnet: '10.42.20.0/24', color: '#8B5CF6', visible: true },
+        { id: 'v-30', vlanTag: 'VLAN-30-EMS', name: 'EMS & Vault Storage', subnet: '10.42.30.0/24', color: '#06B6D4', visible: true },
+        { id: 'v-31', vlanTag: 'VLAN-31-LAB', name: 'QC Lab & Empower', subnet: '10.42.31.0/24', color: '#3B82F6', visible: true },
+        { id: 'v-11', vlanTag: 'VLAN-11-QA', name: 'QA Batch Release', subnet: '10.42.11.0/24', color: '#14B8A6', visible: true },
+        { id: 'v-50', vlanTag: 'VLAN-50-WIFI', name: 'Campus Wi-Fi 6E', subnet: '10.42.50.0/24', color: '#F59E0B', visible: true },
+        { id: 'v-70', vlanTag: 'VLAN-70-ACS', name: 'Access Control / CCTV', subnet: '10.42.70.0/24', color: '#EC4899', visible: true },
+        { id: 'v-99', vlanTag: 'VLAN-99-UPLINK', name: 'Fiber Trunk & DMZ', subnet: '10.42.99.0/24', color: '#38BDF8', visible: true },
+      ],
+      nodePositions: {
+        'custom:vpn-wg': { x: 60, y: 40 },
+        'custom:tunnel-cf': { x: 60, y: 185 },
+        'dev:dev-fw-1': { x: 420, y: 40 },
+        'dev:dev-sw-1': { x: 340, y: 215 },
+        'dev:dev-nas-1': { x: 870, y: 430 },
+        'dev:dev-srv-1': { x: 260, y: 690 },
+        'dev:dev-srv-2': { x: 60, y: 455 },
+        'dev:dev-dist-a1': { x: 60, y: 690 },
+        'dev:dev-acc-2960-a1': { x: 60, y: 890 },
+        'dev:dev-dist-a0': { x: 460, y: 435 },
+        'dev:dev-acc-2960-a0': { x: 870, y: 710 },
+        'dev:dev-dist-b1': { x: 960, y: 215 },
+        'dev:dev-acc-2960-b1': { x: 1020, y: 40 },
+        'un:un-hmi-up': { x: 870, y: 920 },
+        'un:un-badge-pal': { x: 1120, y: 920 },
+        'un:un-ap-a1': { x: 360, y: 950 },
+        'un:un-hplc-01': { x: 1270, y: 225 },
+      },
+      boxes: [
+        {
+          id: 'frame-dmz',
+          kind: 'frame',
+          title: 'Remote Access & DMZ Perimeter',
+          subtitle: 'Zero-Trust Edge',
+          x: 32,
+          y: 12,
+          width: 310,
+          height: 300,
+          color: '#F59E0B',
+        },
+        {
+          id: 'frame-mdf',
+          kind: 'frame',
+          title: 'MDF Core Data Center · A1-204',
+          subtitle: 'DC-R01 · Cold Aisle A1',
+          x: 368,
+          y: 12,
+          width: 970,
+          height: 360,
+          color: '#06B6D4',
+          roomId: 'rm-a1-control',
+        },
+      ],
+      texts: [
+        {
+          id: 'txt-core-note',
+          text: '100G OS2 Campus Backbone · Click any switch power toggle to test outage cascade',
+          x: 380,
+          y: 388,
+          color: '#94A3B8',
+          fontSize: 11,
+        },
+      ],
+      tables: [],
+      customNodes: [
+        {
+          id: 'vpn-wg',
+          kind: 'vpn',
+          badge: 'Wireguard',
+          name: 'Mgmt Remote Access',
+          subtitle: 'VPN Peer · 10.42.99.2',
+          ipAddress: '10.42.99.2',
+          vlan: 'VLAN-99-UPLINK',
+          status: 'online',
+          x: 60,
+          y: 40,
+          latencyMs: 0.3,
+          packetLossPct: 0.0,
+          uptimeLabel: '32d 4h',
+        },
+        {
+          id: 'tunnel-cf',
+          kind: 'tunnel',
+          badge: 'Cloudflare',
+          name: 'Cloudflare Tunnel',
+          subtitle: 'Zero-Trust Vendor Portal',
+          ipAddress: '198.51.100.14',
+          vlan: 'VLAN-99-UPLINK',
+          status: 'online',
+          x: 60,
+          y: 185,
+          latencyMs: 4.1,
+          packetLossPct: 0.0,
+          uptimeLabel: '19d 8h',
+        },
+      ],
+      customCables: [
+        {
+          id: 'cc-wg-fw',
+          fromNodeId: 'custom:vpn-wg',
+          toNodeId: 'dev:dev-fw-1',
+          toPortId: 'fw-1',
+          label: 'WG-MGMT',
+          speedLabel: '1G VPN',
+          vlan: 'VLAN-99-UPLINK',
+          color: '#10B981',
+          style: 'dashed',
+          status: 'up',
+        },
+        {
+          id: 'cc-cf-fw',
+          fromNodeId: 'custom:tunnel-cf',
+          toNodeId: 'dev:dev-fw-1',
+          toPortId: 'fw-3',
+          label: 'CF-EDGE',
+          speedLabel: '2.5G Tunnel',
+          vlan: 'VLAN-99-UPLINK',
+          color: '#F59E0B',
+          style: 'dashed',
+          status: 'up',
+        },
+      ],
+    },
+  };
+
   const flows = [
+    // ── Building A · Level 0 (A0-101 .. A0-108) ──
     {
       id: 'flw-pers-1',
       floorId: 'fl-a0',
-      name: 'Unidirectional Personnel Gowning Flow',
+      name: 'Unidirectional Personnel Gowning Flow (PAL → Core)',
       flowType: 'personnel' as const,
       points: [
         { x: 14, z: 20.5 },
         { x: 14, z: 12.0 },
         { x: 6.5, z: 12.0 },
-        { x: 6.5, z: 8.5 },
+        { x: 6.5, z: 6.5 },
+        { x: 18.5, z: 6.5 },
+        { x: 29.0, z: 6.5 },
       ],
       color: '#10B981',
       flowRateLabel: '18 operators / shift',
       capacityLabel: 'Max 24 concurrent',
       cleanlinessClass: 'clean' as const,
-      restrictions: 'Grade C/B gowning qualification required',
+      restrictions: 'Grade C/B gowning qualification required (A0-106 → A0-104 → A0-101/102/103)',
       layerId: 'layer-flows',
     },
     {
       id: 'flw-mat-1',
       floorId: 'fl-a0',
-      name: 'Upstream → Downstream → Fill-Finish Product Flow',
+      name: 'Media → Upstream → Downstream → Fill-Finish → Packaging',
       flowType: 'product' as const,
       points: [
-        { x: 5.5, z: 16.5 },
+        { x: 5.5, z: 17.5 },
         { x: 5.5, z: 5.5 },
         { x: 17.5, z: 5.5 },
         { x: 28.5, z: 5.5 },
-        { x: 29.5, z: 16.8 },
+        { x: 29.5, z: 17.0 },
       ],
       color: '#2563EB',
       flowRateLabel: '2,000 L / batch',
       capacityLabel: '42 batches / yr',
       cleanlinessClass: 'clean' as const,
-      restrictions: 'Closed single-use transfer manifolds',
+      restrictions: 'Closed single-use transfer manifolds (A0-105 → A0-101 → A0-102 → A0-103 → A0-108)',
       layerId: 'layer-flows',
     },
     {
       id: 'flw-wst-1',
       floorId: 'fl-a0',
-      name: 'Biowaste & Spent Single-Use Exit Route',
+      name: 'Biowaste & Spent Single-Use Exit Route (MAL)',
       flowType: 'waste' as const,
       points: [
         { x: 22.0, z: 8.5 },
@@ -830,13 +2017,13 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
       flowRateLabel: '320 kg / batch',
       capacityLabel: 'Autoclave cycle 90 min',
       cleanlinessClass: 'dirty' as const,
-      restrictions: 'Double-bagged autoclaved before exit',
+      restrictions: 'Double-bagged autoclaved before exit via A0-107 MAL',
       layerId: 'layer-flows',
     },
     {
       id: 'flw-air-1',
       floorId: 'fl-a0',
-      name: 'Positive Pressure Cascade (+45 → +30 → +15 Pa)',
+      name: 'A0 Positive Pressure Cascade (+45 → +30 → +15 Pa)',
       flowType: 'airflow' as const,
       points: [
         { x: 29.5, z: 3.0 },
@@ -848,7 +2035,250 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
       flowRateLabel: '35,000 m³/h HEPA',
       capacityLabel: 'ΔP ≥ 15 Pa per grade',
       cleanlinessClass: 'clean' as const,
-      restrictions: 'Continuous EMS differential pressure alarm',
+      restrictions: 'Continuous EMS differential pressure alarm (AHU-01/02)',
+      layerId: 'layer-flows',
+    },
+    {
+      id: 'flw-a0-emg',
+      floorId: 'fl-a0',
+      name: 'A0 Emergency Egress & Clean Corridor Escape',
+      flowType: 'evacuation' as const,
+      points: [
+        { x: 29.5, z: 17.5 },
+        { x: 29.5, z: 11.8 },
+        { x: 14.0, z: 11.8 },
+        { x: 3.0, z: 11.8 },
+      ],
+      color: '#F59E0B',
+      flowRateLabel: '< 45s egress time',
+      capacityLabel: 'Break-glass interlock override',
+      cleanlinessClass: 'emergency' as const,
+      restrictions: 'Unobstructed 1.8m Grade C corridor egress (A0-108 → A0-104)',
+      layerId: 'layer-flows',
+    },
+
+    // ── Building A · Level 1 (A1-201 .. A1-206) ──
+    {
+      id: 'flw-a1-hvac-dist',
+      floorId: 'fl-a1',
+      name: 'Central AHU Supply & Return Trunk Routing',
+      flowType: 'airflow' as const,
+      points: [
+        { x: 8.5, z: 5.5 },
+        { x: 8.5, z: 11.2 },
+        { x: 18.5, z: 11.2 },
+        { x: 29.5, z: 11.2 },
+      ],
+      color: '#06B6D4',
+      flowRateLabel: '64,000 m³/h main header',
+      capacityLabel: 'AHU-01 / AHU-02 / AHU-03',
+      cleanlinessClass: 'clean' as const,
+      restrictions: 'H14 HEPA bank + automated VFD pressure modulation (A1-201)',
+      layerId: 'layer-flows',
+    },
+    {
+      id: 'flw-a1-wfi-loop',
+      floorId: 'fl-a1',
+      name: 'WFI & Clean Steam Distribution Loop (80 °C)',
+      flowType: 'utility' as const,
+      points: [
+        { x: 21.5, z: 6.0 },
+        { x: 14.0, z: 6.0 },
+        { x: 14.0, z: 11.0 },
+        { x: 21.5, z: 11.0 },
+        { x: 21.5, z: 6.0 },
+      ],
+      color: '#38BDF8',
+      flowRateLabel: '3,200 L/h @ 1.8 m/s',
+      capacityLabel: '316L electropolished Ra ≤ 0.4µm',
+      cleanlinessClass: 'clean' as const,
+      restrictions: 'Continuous ozone & TOC < 500 ppb monitoring (A1-202 → A0 risers)',
+      layerId: 'layer-flows',
+    },
+    {
+      id: 'flw-a1-power-scada',
+      floorId: 'fl-a1',
+      name: 'Redundant UPS Power & OT Fiber Backbone',
+      flowType: 'utility' as const,
+      points: [
+        { x: 31.0, z: 6.0 },
+        { x: 31.0, z: 11.3 },
+        { x: 6.5, z: 11.3 },
+        { x: 6.5, z: 16.5 },
+      ],
+      color: '#F59E0B',
+      flowRateLabel: '2 × 400 kVA Dual Bus',
+      capacityLabel: 'N+1 UPS + 10G SCADA ring',
+      cleanlinessClass: 'bidirectional' as const,
+      restrictions: 'Segregated OT VLAN-30 conduit (A1-203 MCC → A1-204 SCADA)',
+      layerId: 'layer-flows',
+    },
+    {
+      id: 'flw-a1-qa-pers',
+      floorId: 'fl-a1',
+      name: 'QA Batch Review, SCADA & Audit Circulation',
+      flowType: 'personnel' as const,
+      points: [
+        { x: 6.5, z: 16.5 },
+        { x: 18.0, z: 16.5 },
+        { x: 29.5, z: 16.5 },
+        { x: 29.5, z: 11.5 },
+        { x: 8.5, z: 11.5 },
+      ],
+      color: '#10B981',
+      flowRateLabel: '32 QA / Eng staff',
+      capacityLabel: 'Badge-controlled CNC access',
+      cleanlinessClass: 'bidirectional' as const,
+      restrictions: 'Direct QA oversight path (A1-204 → A1-205 → A1-206 → Utility Spine)',
+      layerId: 'layer-flows',
+    },
+
+    // ── Building B · Level 0 (B0-101 .. B0-105) ──
+    {
+      id: 'flw-b0-inbound',
+      floorId: 'fl-b0',
+      name: 'Inbound Raw Material → Quarantine → GDP Storage',
+      flowType: 'material' as const,
+      points: [
+        { x: 8.5, z: 16.5 },
+        { x: 8.5, z: 11.5 },
+        { x: 28.0, z: 11.5 },
+        { x: 28.0, z: 6.5 },
+        { x: 8.0, z: 6.5 },
+      ],
+      color: '#8B5CF6',
+      flowRateLabel: '28 pallets / day',
+      capacityLabel: 'WMS barcode quarantine lock',
+      cleanlinessClass: 'bidirectional' as const,
+      restrictions: 'QA release sticker required before transfer (B0-104 → B0-103 → B0-101)',
+      layerId: 'layer-flows',
+    },
+    {
+      id: 'flw-b0-coldchain',
+      floorId: 'fl-b0',
+      name: 'Cold-Chain Biologics (2–8 °C) Storage → Dispatch',
+      flowType: 'product' as const,
+      points: [
+        { x: 20.0, z: 6.5 },
+        { x: 20.0, z: 12.0 },
+        { x: 24.0, z: 15.5 },
+      ],
+      color: '#2563EB',
+      flowRateLabel: '14 cryo/reefer shippers / day',
+      capacityLabel: 'Max 12 min ambient staging',
+      cleanlinessClass: 'clean' as const,
+      restrictions: 'Validated 2–8 °C thermal blankets & NFC loggers (B0-102 → B0-105)',
+      layerId: 'layer-flows',
+    },
+    {
+      id: 'flw-b0-forklift',
+      floorId: 'fl-b0',
+      name: 'Electric Forklift & Operator Safety Aisle',
+      flowType: 'personnel' as const,
+      points: [
+        { x: 4.0, z: 15.5 },
+        { x: 16.0, z: 15.5 },
+        { x: 16.0, z: 11.5 },
+        { x: 4.0, z: 11.5 },
+        { x: 4.0, z: 6.5 },
+      ],
+      color: '#10B981',
+      flowRateLabel: '4 AGV / reach trucks',
+      capacityLabel: 'Max 8 km/h warehouse limit',
+      cleanlinessClass: 'bidirectional' as const,
+      restrictions: 'High-vis PPE & separated pedestrian walkway (B0-104 ↔ B0-101)',
+      layerId: 'layer-flows',
+    },
+    {
+      id: 'flw-b0-cold-air',
+      floorId: 'fl-b0',
+      name: 'Glycol Evaporator Cold Air Recirculation (2–8 °C)',
+      flowType: 'airflow' as const,
+      points: [
+        { x: 16.5, z: 3.0 },
+        { x: 23.5, z: 3.0 },
+        { x: 23.5, z: 9.5 },
+        { x: 16.5, z: 9.5 },
+      ],
+      color: '#06B6D4',
+      flowRateLabel: '12,400 m³/h @ 4.5 °C',
+      capacityLabel: '±1.0 °C mapped uniformity',
+      cleanlinessClass: 'clean' as const,
+      restrictions: 'Dual redundant glycol coil bank CHW-COLD (B0-102)',
+      layerId: 'layer-flows',
+    },
+
+    // ── Building B · Level 1 (B1-201 .. B1-205) ──
+    {
+      id: 'flw-b1-sample',
+      floorId: 'fl-b1',
+      name: 'QC Sample Intake → Micro / Analytical / Stability',
+      flowType: 'material' as const,
+      points: [
+        { x: 28.5, z: 6.0 },
+        { x: 20.5, z: 6.0 },
+        { x: 8.0, z: 6.0 },
+        { x: 8.0, z: 15.2 },
+      ],
+      color: '#8B5CF6',
+      flowRateLabel: '140 LIMS samples / day',
+      capacityLabel: '21 CFR Part 11 chain-of-custody',
+      cleanlinessClass: 'clean' as const,
+      restrictions: 'Sealed bio-transport pouches (B1-203 → B1-202 → B1-201 → B1-204)',
+      layerId: 'layer-flows',
+    },
+    {
+      id: 'flw-b1-rd-tech',
+      floorId: 'fl-b1',
+      name: 'Bioprocess R&D → Analytical Characterization Flow',
+      flowType: 'personnel' as const,
+      points: [
+        { x: 22.5, z: 15.2 },
+        { x: 22.5, z: 11.2 },
+        { x: 10.5, z: 11.2 },
+        { x: 10.5, z: 6.0 },
+      ],
+      color: '#10B981',
+      flowRateLabel: '22 scientists / shift',
+      capacityLabel: 'Lab coat & BSL-2 eye protection',
+      cleanlinessClass: 'clean' as const,
+      restrictions: 'Separate BSL-2 micro gowning (B1-205 → B1-201)',
+      layerId: 'layer-flows',
+    },
+    {
+      id: 'flw-b1-lab-waste',
+      floorId: 'fl-b1',
+      name: 'Biohazard & HPLC Solvent Waste Extraction',
+      flowType: 'waste' as const,
+      points: [
+        { x: 19.5, z: 8.5 },
+        { x: 25.0, z: 11.2 },
+        { x: 28.5, z: 11.2 },
+        { x: 28.5, z: 15.5 },
+      ],
+      color: '#EF4444',
+      flowRateLabel: '85 L solvent + 40 kg biohazard / wk',
+      capacityLabel: 'UN-certified flameproof drums',
+      cleanlinessClass: 'dirty' as const,
+      restrictions: 'Segregated biohazard & acetonitrile waste (B1-202/201 → B1-203/205 exit)',
+      layerId: 'layer-flows',
+    },
+    {
+      id: 'flw-b1-hvac',
+      floorId: 'fl-b1',
+      name: 'BSL-2 Negative Exhaust & Lab Fume Hood Makeup Air',
+      flowType: 'airflow' as const,
+      points: [
+        { x: 6.5, z: 3.5 },
+        { x: 20.5, z: 3.5 },
+        { x: 20.5, z: 15.0 },
+        { x: 7.5, z: 15.0 },
+      ],
+      color: '#06B6D4',
+      flowRateLabel: '22,000 m³/h 100% single-pass',
+      capacityLabel: 'B1-202 @ -15 Pa BSL-2 negative',
+      cleanlinessClass: 'clean' as const,
+      restrictions: 'AHU-03 HEPA bag-in/bag-out exhaust (B1-201..205)',
       layerId: 'layer-flows',
     },
   ];
@@ -882,7 +2312,7 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
       { id: 'zn-2', roomId: 'rm-a0-pal', floorId: 'fl-a0', name: 'Pressure Cascade +20 Pa', code: 'ZN-PC1', zoneType: 'pressure-cascade', x: 11.4, z: 14, width: 5.2, depth: 6.5, color: '#22D3EE' },
     ],
     walls,
-    openings,
+    openings: verifiedOpenings,
     assets,
     cameras,
     references: [],
@@ -892,6 +2322,7 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
     customMaterials: [],
     customSpaceTypes: [],
     customObjects: [],
+    networkArchitecture,
   };
 }
 
@@ -1003,6 +2434,8 @@ export function createTemplateScene(
       makeAsset('a3', 'fl-1', 'rm-2', 'eq-mixing-tank', 'Formulation Tank FT-01', 'AF-FT01', 18.2, 5.5, 0),
       makeAsset('a4', 'fl-1', 'rm-2', 'eq-filtration-skid', 'Sterile Filtration Skid', 'AF-SF01', 22.4, 5.5, 0),
       makeAsset('a5', 'fl-1', 'rm-5', 'eq-autoclave', 'Barrier Autoclave AUT-01', 'AF-AUT01', 20.0, 14.0, 0),
+      makeAsset('a6', 'fl-1', 'rm-4', 'eq-pass-box', 'Dynamic HEPA Pass Box PB-01', 'AF-PB01', 10.8, 12.2, 0),
+      makeAsset('a7', 'fl-1', 'rm-3', 'eq-fire-extinguisher', 'Cleanroom CO2 Extinguisher FE-01', 'AF-FE01', 2.8, 15.8, 0),
     ];
   } else if (templateKind === 'qc-lab') {
     base.name = customName || 'QC Analytical & Microbiology Lab';
@@ -1025,6 +2458,10 @@ export function createTemplateScene(
       makeAsset('q5', 'fl-1', 'rm-2', 'eq-isolator', 'Sterility Isolator', 'ISO-01', 23.0, 4.5, 0),
       makeAsset('q6', 'fl-1', 'rm-3', 'eq-stability-chamber', 'Stability Chamber 25°C', 'STB-01', 5.5, 14.5, 0),
       makeAsset('q7', 'fl-1', 'rm-3', 'eq-ul-freezer', '-80°C Reference Freezer', 'ULT-01', 10.5, 14.5, 0),
+      makeAsset('q8', 'fl-1', 'rm-2', 'eq-pass-box', 'Microbiology Transfer Pass Box', 'QC-PB01', 16.0, 9.8, 0),
+      makeAsset('q9', 'fl-1', 'rm-1', 'eq-fire-extinguisher', 'Lab CO2 Fire Extinguisher', 'QC-FE01', 2.8, 10.2, 0),
+      makeAsset('q10', 'fl-1', 'rm-4', 'eq-desk', 'QA Batch Review & LIMS Desk', 'QC-QA01', 18.6, 14.2, 0),
+      makeAsset('q11', 'fl-1', 'rm-4', 'eq-lab-bench', 'Sample Prep & Retention Bench', 'QC-SP01', 23.4, 14.6, 0),
     ];
   } else if (templateKind === 'cold-warehouse') {
     base.name = customName || 'GDP Cold-Chain Distribution Hub';
@@ -1042,11 +2479,45 @@ export function createTemplateScene(
       makeAsset('w1', 'fl-1', 'rm-1', 'eq-pallet-rack', 'Ambient Rack A', 'RCK-01', 5.5, 4.5, 0),
       makeAsset('w2', 'fl-1', 'rm-1', 'eq-pallet-rack', 'Ambient Rack B', 'RCK-02', 5.5, 8.5, 0),
       makeAsset('w3', 'fl-1', 'rm-1', 'eq-forklift', 'Electric Reach Truck', 'FL-01', 12.0, 7.0, Math.PI / 2),
-      makeAsset('w4', 'fl-1', 'rm-2', 'eq-pallet-rack', 'Cold Chain Rack 1', 'CLD-01', 20.5, 5.0, 0),
-      makeAsset('w5', 'fl-1', 'rm-2', 'eq-pallet-rack', 'Cold Chain Rack 2', 'CLD-02', 20.5, 9.0, 0),
+      makeAsset('w4', 'fl-1', 'rm-2', 'eq-pallet-rack', 'Cold Chain Rack 1', 'CLD-01', 20.5, 4.5, 0),
+      makeAsset('w5', 'fl-1', 'rm-2', 'eq-cold-room-unit', 'Walk-In Cold Room Chamber (2–8 °C)', 'CLD-CR01', 22.8, 9.2, Math.PI),
       makeAsset('w6', 'fl-1', 'rm-3', 'eq-conveyor', 'Outbound Staging Conveyor', 'CNV-01', 10.0, 15.0, 0),
+      makeAsset('w7', 'fl-1', 'rm-3', 'eq-firebox', 'Dock Fire Hose Firebox', 'WH-FB01', 3.0, 12.5, 0),
+      makeAsset('w8', 'fl-1', 'rm-1', 'eq-fire-extinguisher', 'Warehouse Extinguisher', 'WH-FE01', 15.0, 11.2, Math.PI),
     ];
   }
 
+  if (base.rooms.length > 0) {
+    base.openings = ensureDoorsForAllRooms(base.rooms, base.walls, base.openings);
+    // Anchor default camera to first room so it always shows meaningful interior content
+    const firstRm = base.rooms[0];
+    base.cameras = [
+      {
+        id: 'cam-rm-1',
+        floorId: firstRm.floorId,
+        roomId: firstRm.id,
+        name: `${firstRm.code} · ${firstRm.name} Cam`,
+        kind: 'security',
+        group: 'Facility CCTV',
+        position: [firstRm.x + 0.9, 3.1, firstRm.z + 0.9],
+        target: [firstRm.x + firstRm.width * 0.55, 1.3, firstRm.z + firstRm.depth * 0.55],
+        fov: 66,
+        focalLengthMm: 24,
+        coverageRadius: 11,
+        visibleCone: true,
+        layerId: 'layer-cameras',
+        ipAddress: '10.42.20.101',
+        port: 554,
+        protocol: 'RTSP',
+        streamPath: '/h265/ch01/main',
+        resolution: '2560×1440',
+        fps: 30,
+        status: 'recording',
+      },
+    ];
+  }
+
+  base.assets = base.assets.map((a) => enrichAssetHistory(a));
+  ensureRoomsHaveCodesAndModels(base);
   return base;
 }

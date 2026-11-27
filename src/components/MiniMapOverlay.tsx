@@ -12,13 +12,15 @@ import { useTwinStore } from '../store/useTwinStore';
 import { useGmpStore } from '../store/useGmpStore';
 
 export const MiniMapOverlay: React.FC = () => {
-  const { scene, activeFloorId, selected, theme } = useTwinStore();
+  const { scene, activeFloorId, selected, theme, firstPersonMode } = useTwinStore();
   const { showMiniMap, setShowMiniMap, jumpFromMiniMap, activeLineHighlight, miniMapTarget } =
     useGmpStore();
 
-  const [collapsed, setCollapsed] = useState(false);
-  // Default offset from top-right of <main> workspace
-  const [pos, setPos] = useState<{ x: number; y: number }>({ x: 14, y: 54 });
+  const [collapsed, setCollapsed] = useState(
+    () => typeof window !== 'undefined' && window.innerWidth < 1280
+  );
+  // Default offset from bottom-right of <main> workspace, cleanly above Sensors & Map dock
+  const [pos, setPos] = useState<{ x: number; y: number }>({ x: 14, y: 58 });
   const [draggingWidget, setDraggingWidget] = useState(false);
   const [navDragging, setNavDragging] = useState(false);
   const [hoverWorld, setHoverWorld] = useState<{ x: number; z: number } | null>(null);
@@ -77,7 +79,7 @@ export const MiniMapOverlay: React.FC = () => {
     };
   }, [activeFloor, floorRooms, floorAssets]);
 
-  if (!activeFloor) return null;
+  if (!activeFloor || firstPersonMode) return null;
 
   if (!showMiniMap) {
     return (
@@ -85,7 +87,7 @@ export const MiniMapOverlay: React.FC = () => {
         type="button"
         onClick={() => setShowMiniMap(true)}
         title="Show Birds-Eye Mini-Map"
-        className={`absolute top-14 right-3 z-20 flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[11px] font-semibold shadow-lg border transition cursor-pointer ${
+        className={`absolute bottom-14 right-3 z-20 flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[11px] font-semibold shadow-lg border transition cursor-pointer ${
           isDark
             ? 'bg-[#14141A]/95 border-zinc-700/80 text-zinc-200 hover:border-violet-500/60 hover:text-violet-300'
             : 'bg-white/95 border-slate-200 text-slate-700 hover:border-violet-400 hover:text-violet-700'
@@ -114,10 +116,10 @@ export const MiniMapOverlay: React.FC = () => {
     if (!draggingWidget || !dragStartRef.current) return;
     const dx = e.clientX - dragStartRef.current.startX;
     const dy = e.clientY - dragStartRef.current.startY;
-    // Right-anchored x offset (moving left increases right offset)
-    const nextRight = Math.max(8, Math.min(window.innerWidth - 260, dragStartRef.current.origX - dx));
-    const nextTop = Math.max(8, Math.min(window.innerHeight - 240, dragStartRef.current.origY + dy));
-    setPos({ x: nextRight, y: nextTop });
+    // Bottom-right anchored offset (moving left increases right, moving up increases bottom)
+    const nextRight = Math.max(8, Math.min(window.innerWidth - 250, dragStartRef.current.origX - dx));
+    const nextBottom = Math.max(54, Math.min(window.innerHeight - 230, dragStartRef.current.origY - dy));
+    setPos({ x: nextRight, y: nextBottom });
   };
 
   const handleHeaderPointerUp = (e: React.PointerEvent) => {
@@ -193,7 +195,7 @@ export const MiniMapOverlay: React.FC = () => {
 
   return (
     <div
-      style={{ right: `${pos.x}px`, top: `${pos.y}px` }}
+      style={{ right: `${pos.x}px`, bottom: `${pos.y}px` }}
       className={`absolute z-20 select-none rounded-2xl border shadow-2xl transition-shadow ${
         isDark
           ? 'bg-[#111116]/95 border-zinc-700/80 text-zinc-100 shadow-black/60'

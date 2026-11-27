@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo } from 'react';
 import {
+  Activity,
   AlertTriangle,
   Calendar,
   ChevronDown,
@@ -12,22 +13,57 @@ import {
   Pause,
   Play,
   RotateCcw,
+  Wrench,
 } from 'lucide-react';
 import { useTwinStore } from '../store/useTwinStore';
+import { useTelemetryStore } from '../store/useTelemetryStore';
+import { useGmpStore } from '../store/useGmpStore';
 import { formatArea, formatCurrency, formatLength } from '../utils/spatial';
+import {
+  computeAssetFailurePredictions,
+  type MaintenanceMilestone,
+} from '../utils/predictiveMaintenance';
 
 const MIN_TS = new Date('2024-01-01').getTime();
-const MAX_TS = new Date('2027-06-30').getTime();
+const DEFAULT_MAX_TS = new Date('2027-12-31').getTime();
 
-function dateToPct(dateStr: string): number {
+function dateToPct(dateStr: string, maxTs: number): number {
   const ts = new Date(dateStr).getTime();
   if (Number.isNaN(ts)) return 100;
-  return Math.max(0, Math.min(100, ((ts - MIN_TS) / (MAX_TS - MIN_TS)) * 100));
+  return Math.max(0, Math.min(100, ((ts - MIN_TS) / Math.max(1, maxTs - MIN_TS)) * 100));
 }
 
-function pctToDate(pct: number): string {
-  const ts = MIN_TS + (Math.max(0, Math.min(100, pct)) / 100) * (MAX_TS - MIN_TS);
+function pctToDate(pct: number, maxTs: number): string {
+  const ts = MIN_TS + (Math.max(0, Math.min(100, pct)) / 100) * (maxTs - MIN_TS);
   return new Date(ts).toISOString().slice(0, 10);
+}
+
+function milestoneTone(sev: MaintenanceMilestone['severity']) {
+  if (sev === 'critical') {
+    return {
+      pin: 'bg-rose-500 border-white dark:border-zinc-950',
+      chipActive: 'border-rose-500 bg-rose-600 text-white',
+      chipIdle: 'border-rose-500/40 bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20',
+      text: 'text-rose-500 dark:text-rose-400',
+      glyph: '✖',
+    };
+  }
+  if (sev === 'warning') {
+    return {
+      pin: 'bg-amber-500 border-white dark:border-zinc-950',
+      chipActive: 'border-amber-500 bg-amber-500 text-zinc-950',
+      chipIdle: 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20',
+      text: 'text-amber-600 dark:text-amber-400',
+      glyph: '▲',
+    };
+  }
+  return {
+    pin: 'bg-cyan-500 border-white dark:border-zinc-950',
+    chipActive: 'border-cyan-500 bg-cyan-600 text-white',
+    chipIdle: 'border-cyan-500/40 bg-cyan-500/10 text-cyan-700 dark:text-cyan-400 hover:bg-cyan-500/20',
+    text: 'text-cyan-600 dark:text-cyan-400',
+    glyph: '◆',
+  };
 }
 
 export const BottomTimelineBar: React.FC = () => {
@@ -56,6 +92,58 @@ export const BottomTimelineBar: React.FC = () => {
   const setRightPanelOpen = useTwinStore((s) => s.setRightPanelOpen);
   const setRightTab = useTwinStore((s) => s.setRightTab);
   const toggleCanvasBackdrop = useTwinStore((s) => s.toggleCanvasBackdrop);
+  const drillInto = useTwinStore((s) => s.drillInto);
+  const selectEntity = useTwinStore((s) => s.selectEntity);
+  const setActiveFloor = useTwinStore((s) => s.setActiveFloor);
+  const showToast = useTwinStore((s) => s.showToast);
+
+  // Live telemetry sensor history & predictive Maintenance Milestones
+  const sensors = useTelemetryStore((s) => s.sensors);
+  const readings = useTelemetryStore((s) => s.readings);
+  const showMaintenanceMilestones = useTelemetryStore((s) => s.showMaintenanceMilestones);
+  const setShowMaintenanceMilestones = useTelemetryStore((s) => s.setShowMaintenanceMilestones);
+  const activeMilestoneAssetId = useTelemetryStore((s) => s.activeMilestoneAssetId);
+  const setActiveMilestoneAssetId = useTelemetryStore((s) => s.setActiveMilestoneAssetId);
+  const openDashboard = useTelemetryStore((s) => s.openDashboard);
+
+  const complianceByAssetId = useGmpStore((s) => s.complianceByAssetId);
+  const createWorkOrder = useGmpStore((s) => s.createWorkOrder);
+  const personnel = useGmpStore((s) => s.personnel);
+
+  const maintenanceMilestones = useMemo(
+    () => computeAssetFailurePredictions(sensors, readings, scene.assets, complianceByAssetId),
+    [sensors, readings, scene.assets, complianceByAssetId]
+  );
+
+  // Prominent upcoming milestones to pin on the timeline (up to 8 nearest predicted failure dates)
+  const timelineMilestones = useMemo(
+    () => maintenanceMilestones.slice(0, 8),
+    [maintenanceMilestones]
+  );
+
+  const urgentMilestoneCount = useMemo(
+    () => maintenanceMilestones.filter((m) => m.severity === 'critical' || m.severity === 'warning').length,
+    [maintenanceMilestones]
+  );
+
+  const maxTs = useMemo(() => {
+    let hi = DEFAULT_MAX_TS;
+    for (const m of timelineMilestones) {
+      const ts = new Date(m.predictedFailureDate).getTime() + 30 * 86_400_000;
+      if (!Number.isNaN(ts) && ts > hi) hi = ts;
+    }
+    return hi;
+  }, [timelineMilestones]);
+
+  const maxDateIso = useMemo(() => new Date(maxTs).toISOString().slice(0, 10), [maxTs]);
+
+  const activeMilestone = useMemo(() => {
+    if (activeMilestoneAssetId) {
+      const byId = maintenanceMilestones.find((m) => m.assetId === activeMilestoneAssetId);
+      if (byId) return byId;
+    }
+    return timelineMilestones.find((m) => m.predictedFailureDate === timelineDate) ?? null;
+  }, [activeMilestoneAssetId, maintenanceMilestones, timelineMilestones, timelineDate]);
 
   // Playback loop when 5D timeline is playing
   useEffect(() => {
@@ -64,15 +152,15 @@ export const BottomTimelineBar: React.FC = () => {
       const current = new Date(useTwinStore.getState().timelineDate).getTime();
       const stepDays = 14 * useTwinStore.getState().timelineSpeed;
       const nextTs = current + stepDays * 86_400_000;
-      if (nextTs >= MAX_TS) {
-        setTimelineDate(new Date(MAX_TS).toISOString().slice(0, 10));
+      if (nextTs >= maxTs) {
+        setTimelineDate(new Date(maxTs).toISOString().slice(0, 10));
         setTimelinePlaying(false);
       } else {
         setTimelineDate(new Date(nextTs).toISOString().slice(0, 10));
       }
     }, 350);
     return () => window.clearInterval(interval);
-  }, [timelinePlaying, setTimelineDate, setTimelinePlaying]);
+  }, [timelinePlaying, maxTs, setTimelineDate, setTimelinePlaying]);
 
   const floorStats = useMemo(() => {
     const floorRooms = scene.rooms.filter((r) => r.floorId === activeFloorId);
@@ -115,20 +203,53 @@ export const BottomTimelineBar: React.FC = () => {
     (v) => v.severity === 'critical' || v.severity === 'error'
   ).length;
 
+  const handleSelectMilestone = (m: MaintenanceMilestone) => {
+    setTimelinePlaying(false);
+    setTimelineDate(m.predictedFailureDate);
+    setActiveMilestoneAssetId(m.assetId);
+    setActiveFloor(m.floorId);
+    selectEntity({ type: 'asset', id: m.assetId });
+    drillInto('asset', m.assetId);
+  };
+
+  const handleScheduleMilestonePm = (m: MaintenanceMilestone) => {
+    const tech = personnel[0];
+    const wo = createWorkOrder({
+      title: `Predictive PM — ${m.assetCode} (${m.driverMetricLabel})`,
+      description: `Scheduled from 5D Timeline Maintenance Milestone.\nPredicted failure: ${m.predictedFailureDate} (${m.daysUntilFailure}d, ${m.confidencePct}% confidence).\nDriver: ${m.driverSensorTag} (${m.currentValue} ${m.unit} → Alarm ${m.alarmThreshold} ${m.unit}).`,
+      serviceType: 'maintenance',
+      targetKind: 'asset',
+      targetId: m.assetId,
+      targetName: `${m.assetCode} · ${m.assetName}`,
+      targetCategory: m.category,
+      assigneeId: tech?.id ?? 'tech-01',
+      assigneeName: tech?.name ?? 'Reliability Engineer',
+      priority: m.severity === 'critical' ? 'critical' : m.severity === 'warning' ? 'high' : 'medium',
+      status: 'open',
+      lastServiceDate: new Date().toISOString().slice(0, 10),
+      dueDate: m.recommendedServiceDate,
+      estimatedHours: 3,
+      checklist: [
+        { id: `tl-pm-1-${Date.now()}`, text: m.recommendedAction, done: false },
+      ],
+    });
+    showToast(`Created Predictive PM ${wo.woNumber} for ${m.assetCode} (due ${m.recommendedServiceDate})`, 'success');
+  };
+
   return (
     <footer className="bg-white dark:bg-[#111114] border-t border-zinc-200 dark:border-zinc-800 shrink-0 z-20">
       {/* Expandable 5D Digital Twin Timeline Drawer */}
       {bottomTimelineOpen && (
-        <div className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/90 dark:bg-[#0D0D10] space-y-2.5">
+        <div className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/95 dark:bg-[#0D0D10] space-y-2.5 max-h-[42vh] overflow-y-auto">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs font-semibold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
                 <Clock className="w-3.5 h-3.5 text-violet-500" />
-                5D Lifecycle Timeline
+                5D Lifecycle &amp; Maintenance Timeline
               </span>
               <button
                 onClick={() => setTimelinePlaying(!timelinePlaying)}
-                className="flex items-center gap-1 px-2.5 py-1 rounded bg-violet-600 hover:bg-violet-500 text-white text-xs font-medium whitespace-nowrap"
+                className="flex items-center gap-1 px-2.5 py-1 rounded bg-violet-600 hover:bg-violet-500 text-white text-xs font-medium whitespace-nowrap cursor-pointer"
               >
                 {timelinePlaying ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
                 {timelinePlaying ? 'Pause' : 'Play'}
@@ -136,9 +257,10 @@ export const BottomTimelineBar: React.FC = () => {
               <button
                 onClick={() => {
                   setTimelinePlaying(false);
+                  setActiveMilestoneAssetId(null);
                   setTimelineDate('2024-03-01');
                 }}
-                className="p-1 rounded border border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-[#22222C]"
+                className="p-1 rounded border border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-[#22222C] cursor-pointer"
                 title="Reset timeline to project start"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
@@ -158,13 +280,13 @@ export const BottomTimelineBar: React.FC = () => {
                 aria-label="Current 5D Date"
                 value={timelineDate}
                 min="2024-01-01"
-                max="2027-06-30"
+                max={maxDateIso}
                 onChange={(e) => setTimelineDate(e.target.value)}
                 className="h-6 px-2 rounded text-[11px] font-mono bg-white dark:bg-[#1C1C24] border border-slate-300 dark:border-zinc-700"
               />
               <button
                 onClick={() => setCompareDate(compareDate ? null : '2025-06-01')}
-                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium border whitespace-nowrap ${
+                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium border whitespace-nowrap cursor-pointer ${
                   compareDate
                     ? 'border-violet-500 bg-violet-500/10 text-violet-600 dark:text-violet-400'
                     : 'border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-slate-300'
@@ -179,11 +301,30 @@ export const BottomTimelineBar: React.FC = () => {
                   aria-label="Comparison Baseline Date"
                   value={compareDate}
                   min="2024-01-01"
-                  max="2027-06-30"
+                  max={maxDateIso}
                   onChange={(e) => setCompareDate(e.target.value)}
                   className="h-6 px-2 rounded text-[11px] font-mono bg-white dark:bg-[#1C1C24] border border-blue-400 dark:border-blue-600"
                 />
               )}
+              <button
+                onClick={() => setShowMaintenanceMilestones(!showMaintenanceMilestones)}
+                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium border whitespace-nowrap cursor-pointer ${
+                  showMaintenanceMilestones
+                    ? 'border-amber-500/60 bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                    : 'border-slate-300 dark:border-zinc-700 text-slate-500 dark:text-slate-400'
+                }`}
+                title="Toggle Predictive Maintenance Milestones from Telemetry Sensor History"
+              >
+                <Wrench className="w-3 h-3" />
+                <span>Maintenance Milestones ({timelineMilestones.length})</span>
+              </button>
+              <button
+                onClick={() => openDashboard({ tab: 'predictive' })}
+                className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium border border-zinc-200 dark:border-zinc-700 hover:border-violet-500 text-zinc-700 dark:text-zinc-200 whitespace-nowrap cursor-pointer"
+              >
+                <Activity className="w-3 h-3 text-violet-500" />
+                <span>Predictive Telemetry</span>
+              </button>
             </div>
 
             {/* 5D Operational & Cost Metrics */}
@@ -235,28 +376,61 @@ export const BottomTimelineBar: React.FC = () => {
             </div>
           </div>
 
-          {/* Scrubber Track + Milestone Pins */}
-          <div className="space-y-1.5">
-            <input
-              type="range"
-              aria-label="5D Timeline Scrubber"
-              min={0}
-              max={100}
-              step={0.5}
-              value={dateToPct(timelineDate)}
-              onChange={(e) => setTimelineDate(pctToDate(Number(e.target.value)))}
-              className="w-full accent-blue-600"
-            />
-            <div className="flex flex-wrap items-center gap-2">
+          {/* Scrubber Track + Overlaid Predictive Maintenance Milestone Diamond Pins */}
+          <div className="space-y-2">
+            <div className="relative pt-3.5">
+              {/* Maintenance Milestone Pins positioned accurately along the timeline */}
+              {showMaintenanceMilestones && timelineMilestones.length > 0 && (
+                <div className="absolute inset-x-1 top-0 h-3.5 pointer-events-none">
+                  {timelineMilestones.map((m) => {
+                    const leftPct = dateToPct(m.predictedFailureDate, maxTs);
+                    const tone = milestoneTone(m.severity);
+                    const isFocused = activeMilestone?.assetId === m.assetId;
+                    return (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => handleSelectMilestone(m)}
+                        style={{ left: `${leftPct}%` }}
+                        title={`Maintenance Milestone · ${m.assetCode} (${m.assetName}) · Predicted Failure ${m.predictedFailureDate} (${m.daysUntilFailure}d) · Driver ${m.driverSensorTag}`}
+                        className={`pointer-events-auto absolute top-0.5 -translate-x-1/2 w-2.5 h-2.5 rotate-45 border cursor-pointer transition-transform ${tone.pin} ${
+                          isFocused ? 'scale-125 ring-2 ring-violet-500' : 'hover:scale-125'
+                        }`}
+                      />
+                    );
+                  })}
+                </div>
+              )}
+
+              <input
+                type="range"
+                aria-label="5D Timeline Scrubber"
+                min={0}
+                max={100}
+                step={0.25}
+                value={dateToPct(timelineDate, maxTs)}
+                onChange={(e) => setTimelineDate(pctToDate(Number(e.target.value), maxTs))}
+                className="w-full accent-violet-600"
+              />
+            </div>
+
+            {/* Facility Phase Milestones */}
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[10.5px] font-medium text-zinc-500 dark:text-zinc-400 mr-1">
+                Phases:
+              </span>
               {scene.timelineEvents.map((ev) => {
                 const isActive = timelineDate >= ev.date;
                 return (
                   <button
                     key={ev.id}
-                    onClick={() => setTimelineDate(ev.date)}
+                    onClick={() => {
+                      setActiveMilestoneAssetId(null);
+                      setTimelineDate(ev.date);
+                    }}
                     title={`${ev.date}: ${ev.description}`}
-                    className={`px-2 py-0.5 rounded text-[11px] border transition-colors whitespace-nowrap ${
-                      timelineDate === ev.date
+                    className={`px-2 py-0.5 rounded text-[11px] border transition-colors whitespace-nowrap cursor-pointer ${
+                      timelineDate === ev.date && !activeMilestone
                         ? 'border-violet-500 bg-violet-600 text-white'
                         : isActive
                           ? 'border-slate-300 dark:border-zinc-700 bg-white dark:bg-[#1C1C24] text-slate-800 dark:text-slate-200'
@@ -269,6 +443,87 @@ export const BottomTimelineBar: React.FC = () => {
                 );
               })}
             </div>
+
+            {/* Predictive Maintenance Milestones Row */}
+            {showMaintenanceMilestones && timelineMilestones.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-zinc-200/70 dark:border-zinc-800/70">
+                <span className="text-[10.5px] font-semibold text-amber-600 dark:text-amber-400 flex items-center gap-1 mr-1">
+                  <Wrench className="w-3 h-3" />
+                  Maintenance Milestones:
+                </span>
+                {timelineMilestones.map((m) => {
+                  const tone = milestoneTone(m.severity);
+                  const isSel = activeMilestone?.assetId === m.assetId;
+                  return (
+                    <button
+                      key={m.id}
+                      type="button"
+                      onClick={() => handleSelectMilestone(m)}
+                      title={`Predicted Failure ${m.predictedFailureDate} (${m.daysUntilFailure}d) · ${m.driverSensorTag}: ${m.currentValue}${m.unit} vs ${m.alarmThreshold}${m.unit} alarm · ${m.confidencePct}% confidence`}
+                      className={`px-2 py-0.5 rounded text-[11px] border transition-colors whitespace-nowrap font-mono tabular-nums cursor-pointer ${
+                        isSel ? tone.chipActive : tone.chipIdle
+                      }`}
+                    >
+                      <span className="mr-1">{tone.glyph}</span>
+                      <span className="font-semibold">{m.assetCode}</span>
+                      <span className="mx-1 opacity-70">·</span>
+                      <span>{m.predictedFailureDate.slice(5)}</span>
+                      <span className="ml-1 opacity-75">({m.daysUntilFailure}d)</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Selected Maintenance Milestone Engineering Readout */}
+            {showMaintenanceMilestones && activeMilestone && (() => {
+              const tone = milestoneTone(activeMilestone.severity);
+              return (
+                <div className="px-3 py-2 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#14141C] flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 min-w-0">
+                    <span className={`font-mono font-bold ${tone.text}`}>
+                      {tone.glyph} {activeMilestone.assetCode}
+                    </span>
+                    <span className="font-semibold text-zinc-900 dark:text-zinc-100 truncate">
+                      {activeMilestone.assetName}
+                    </span>
+                    <span className="text-zinc-400">·</span>
+                    <span className="font-mono tabular-nums text-zinc-600 dark:text-zinc-300">
+                      Predicted Failure {activeMilestone.predictedFailureDate} ({activeMilestone.daysUntilFailure}d)
+                    </span>
+                    <span className="text-zinc-400">·</span>
+                    <span className="font-mono tabular-nums text-zinc-500 dark:text-zinc-400">
+                      {activeMilestone.driverSensorTag}: {activeMilestone.currentValue}
+                      {activeMilestone.unit} / Limit {activeMilestone.alarmThreshold}
+                      {activeMilestone.unit} ({activeMilestone.confidencePct}% conf.)
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActiveMilestoneAssetId(activeMilestone.assetId);
+                        openDashboard({
+                          tab: 'predictive',
+                          assetId: activeMilestone.assetId,
+                          sensorId: activeMilestone.driverSensorId,
+                        });
+                      }}
+                      className="px-2.5 py-1 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:border-violet-500 text-zinc-700 dark:text-zinc-200 font-medium cursor-pointer"
+                    >
+                      Inspect Forecast
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleScheduleMilestonePm(activeMilestone)}
+                      className="px-2.5 py-1 rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-semibold cursor-pointer"
+                    >
+                      Schedule PM
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}
@@ -319,8 +574,31 @@ export const BottomTimelineBar: React.FC = () => {
           )}
         </div>
 
-        {/* Right: Warnings, 5D Drawer Toggle, Canvas Backdrop, Right Panel Toggle */}
+        {/* Right: Warnings, Maintenance Milestones, 5D Drawer Toggle, Canvas Backdrop, Right Panel Toggle */}
         <div className="flex items-center gap-2 shrink-0">
+          {timelineMilestones.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                setShowMaintenanceMilestones(true);
+                setBottomTimelineOpen(true);
+              }}
+              className={`hidden sm:flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 whitespace-nowrap cursor-pointer ${
+                urgentMilestoneCount > 0
+                  ? 'text-amber-600 dark:text-amber-400 font-medium'
+                  : 'text-zinc-600 dark:text-zinc-300'
+              }`}
+              title="View Predictive Maintenance Milestones on 5D Timeline"
+            >
+              <Wrench className="w-3 h-3" />
+              <span className="font-mono tabular-nums">
+                {urgentMilestoneCount > 0
+                  ? `${urgentMilestoneCount} maint. due`
+                  : `${timelineMilestones.length} milestones`}
+              </span>
+            </button>
+          )}
+
           <button
             onClick={() => setRightTab('validation')}
             className={`flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 whitespace-nowrap ${
@@ -338,7 +616,7 @@ export const BottomTimelineBar: React.FC = () => {
 
           <button
             onClick={() => setBottomTimelineOpen(!bottomTimelineOpen)}
-            className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-medium whitespace-nowrap ${
+            className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-medium whitespace-nowrap cursor-pointer ${
               bottomTimelineOpen
                 ? 'border-emerald-500 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
                 : 'border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-300'

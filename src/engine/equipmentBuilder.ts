@@ -2,19 +2,98 @@ import * as THREE from 'three';
 import type { SpatialAsset } from '../types/twin';
 
 // Shared lightweight reusable PBR materials for composite industrial equipment sub-details
-const MAT_DARK_STEEL = new THREE.MeshStandardMaterial({ color: '#1F2028', roughness: 0.44, metalness: 0.72 });
-const MAT_BRUSHED_STEEL = new THREE.MeshStandardMaterial({ color: '#CBD5E1', roughness: 0.24, metalness: 0.86 });
-const MAT_CHROME = new THREE.MeshStandardMaterial({ color: '#F1F5F9', roughness: 0.12, metalness: 0.96 });
-const MAT_COPPER_FITTING = new THREE.MeshStandardMaterial({ color: '#D97706', roughness: 0.28, metalness: 0.85 });
-const MAT_GLASS = new THREE.MeshStandardMaterial({ color: '#C4B5FD', roughness: 0.06, metalness: 0.12, transparent: true, opacity: 0.34, depthWrite: false });
-const MAT_MEDIA_FLUID = new THREE.MeshStandardMaterial({ color: '#F59E0B', emissive: '#B45309', emissiveIntensity: 0.22, roughness: 0.15, metalness: 0.08, transparent: true, opacity: 0.65 });
-const MAT_SCREEN = new THREE.MeshStandardMaterial({ color: '#8B5CF6', emissive: '#6D28D9', emissiveIntensity: 0.65, roughness: 0.18, metalness: 0.12 });
-const MAT_ACCENT_BLUE = new THREE.MeshStandardMaterial({ color: '#7C3AED', roughness: 0.38, metalness: 0.35 });
-const MAT_ACCENT_AMBER = new THREE.MeshStandardMaterial({ color: '#F59E0B', roughness: 0.42, metalness: 0.3 });
-const MAT_ACCENT_RED = new THREE.MeshStandardMaterial({ color: '#DC2626', roughness: 0.42, metalness: 0.2 });
-const MAT_ACCENT_GREEN = new THREE.MeshStandardMaterial({ color: '#10B981', roughness: 0.42, metalness: 0.22 });
+const MAT_DARK_STEEL = new THREE.MeshStandardMaterial({ color: '#1C1E26', roughness: 0.42, metalness: 0.76 });
+const MAT_BRUSHED_STEEL = new THREE.MeshStandardMaterial({ color: '#D4DCE6', roughness: 0.22, metalness: 0.88 });
+const MAT_CHROME = new THREE.MeshPhysicalMaterial({
+  color: '#F4F7FA',
+  roughness: 0.11,
+  metalness: 0.95,
+  clearcoat: 0.65,
+  clearcoatRoughness: 0.08,
+});
+const MAT_COPPER_FITTING = new THREE.MeshStandardMaterial({ color: '#D97706', roughness: 0.26, metalness: 0.88 });
+const MAT_GLASS = new THREE.MeshPhysicalMaterial({
+  color: '#D8F1FF',
+  roughness: 0.05,
+  metalness: 0.04,
+  ior: 1.52,
+  reflectivity: 0.92,
+  clearcoat: 1.0,
+  clearcoatRoughness: 0.04,
+  transparent: true,
+  opacity: 0.34,
+  depthWrite: false,
+});
+const MAT_MEDIA_FLUID = new THREE.MeshStandardMaterial({
+  color: '#F59E0B',
+  emissive: '#D97706',
+  emissiveIntensity: 0.34,
+  roughness: 0.14,
+  metalness: 0.06,
+  transparent: true,
+  opacity: 0.72,
+});
+const MAT_SCREEN = new THREE.MeshStandardMaterial({
+  color: '#A78BFA',
+  emissive: '#7C3AED',
+  emissiveIntensity: 0.92,
+  roughness: 0.14,
+  metalness: 0.1,
+});
+const MAT_ACCENT_BLUE = new THREE.MeshStandardMaterial({ color: '#7C3AED', roughness: 0.36, metalness: 0.38 });
+const MAT_ACCENT_AMBER = new THREE.MeshStandardMaterial({
+  color: '#F59E0B',
+  emissive: '#B45309',
+  emissiveIntensity: 0.38,
+  roughness: 0.34,
+  metalness: 0.26,
+});
+const MAT_ACCENT_RED = new THREE.MeshStandardMaterial({
+  color: '#DC2626',
+  emissive: '#991B1B',
+  emissiveIntensity: 0.32,
+  roughness: 0.38,
+  metalness: 0.22,
+});
+const MAT_ACCENT_GREEN = new THREE.MeshStandardMaterial({
+  color: '#10B981',
+  emissive: '#059669',
+  emissiveIntensity: 0.55,
+  roughness: 0.32,
+  metalness: 0.2,
+});
 const MAT_RUBBER = new THREE.MeshStandardMaterial({ color: '#141418', roughness: 0.88, metalness: 0.06 });
 const MAT_PALLET_BOX = new THREE.MeshStandardMaterial({ color: '#D4B483', roughness: 0.78, metalness: 0.02 });
+
+let cachedContactShadowMat: THREE.MeshBasicMaterial | null = null;
+function getContactShadowMaterial(): THREE.MeshBasicMaterial {
+  if (cachedContactShadowMat) return cachedContactShadowMat;
+  let tex: THREE.CanvasTexture | null = null;
+  if (typeof document !== 'undefined') {
+    const c = document.createElement('canvas');
+    c.width = 64;
+    c.height = 64;
+    const ctx = c.getContext('2d');
+    if (ctx) {
+      const grad = ctx.createRadialGradient(32, 32, 6, 32, 32, 30);
+      grad.addColorStop(0, 'rgba(0,0,0,0.42)');
+      grad.addColorStop(0.65, 'rgba(0,0,0,0.18)');
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, 64, 64);
+      tex = new THREE.CanvasTexture(c);
+    }
+  }
+  cachedContactShadowMat = new THREE.MeshBasicMaterial({
+    map: tex ?? undefined,
+    color: '#000000',
+    transparent: true,
+    opacity: 0.62,
+    depthWrite: false,
+  });
+  return cachedContactShadowMat;
+}
+const SHARED_SHADOW_GEO = new THREE.PlaneGeometry(1, 1);
 
 function addMesh(
   group: THREE.Group,
@@ -416,10 +495,133 @@ export function buildProceduralEquipmentGroup(
 
     case 'safety-station': {
       addMesh(group, new THREE.BoxGeometry(W, 0.08, D), MAT_DARK_STEEL, 0, 0.04, 0);
-      addMesh(group, new THREE.CylinderGeometry(0.04, 0.04, H * 0.92, 10), MAT_ACCENT_GREEN, 0, H * 0.46, 0);
-      addMesh(group, new THREE.CylinderGeometry(0.18, 0.14, 0.12, 14), MAT_CHROME, 0, 1.0, 0.22);
-      addMesh(group, new THREE.ConeGeometry(0.18, 0.14, 14), MAT_ACCENT_GREEN, 0, H * 0.88, 0.22);
-      addMesh(group, new THREE.CylinderGeometry(0.09, 0.09, 0.52, 12), MAT_ACCENT_RED, W * 0.28, 0.34, 0);
+      addMesh(group, new THREE.CylinderGeometry(0.04, 0.04, H * 0.92, 12), MAT_ACCENT_GREEN, 0, H * 0.46, 0);
+      addMesh(group, new THREE.CylinderGeometry(0.18, 0.14, 0.12, 16), MAT_CHROME, 0, 1.0, 0.22);
+      addMesh(group, new THREE.ConeGeometry(0.18, 0.14, 16), MAT_ACCENT_GREEN, 0, H * 0.88, 0.22);
+      // Companion CO2 extinguisher in floor cradle
+      addMesh(group, new THREE.CylinderGeometry(0.095, 0.095, 0.56, 16), MAT_ACCENT_RED, W * 0.28, 0.36, 0);
+      addMesh(group, new THREE.SphereGeometry(0.095, 14, 10, 0, Math.PI * 2, 0, Math.PI / 2), MAT_ACCENT_RED, W * 0.28, 0.64, 0);
+      addMesh(group, new THREE.CylinderGeometry(0.025, 0.028, 0.08, 10), MAT_COPPER_FITTING, W * 0.28, 0.74, 0);
+      break;
+    }
+
+    case 'fire-extinguisher': {
+      const r = Math.min(W, D) * 0.34;
+      const bodyH = H * 0.64;
+      // Stainless floor cradle + black rubber anti-slip base skirt
+      addMesh(group, new THREE.CylinderGeometry(r * 1.18, r * 1.24, 0.04, 20), MAT_BRUSHED_STEEL, 0, 0.02, 0);
+      addMesh(group, new THREE.CylinderGeometry(r * 1.04, r * 1.06, 0.07, 20), MAT_RUBBER, 0, 0.075, 0);
+      // Glossy crimson cylinder + hemispherical dome shoulder
+      addMesh(group, new THREE.CylinderGeometry(r, r, bodyH, 24), MAT_ACCENT_RED, 0, 0.09 + bodyH / 2, 0);
+      addMesh(group, new THREE.SphereGeometry(r, 20, 12, 0, Math.PI * 2, 0, Math.PI / 2), MAT_ACCENT_RED, 0, 0.09 + bodyH, 0);
+      // White/black compliance inspection band around upper torso
+      addMesh(group, new THREE.CylinderGeometry(r * 1.015, r * 1.015, bodyH * 0.26, 22), MAT_CHROME, 0, 0.09 + bodyH * 0.62, 0);
+      // Brass valve neck + green pressure gauge dial + squeeze lever & carry handle
+      const neckY = 0.09 + bodyH + r * 0.92;
+      addMesh(group, new THREE.CylinderGeometry(r * 0.28, r * 0.32, 0.09, 14), MAT_COPPER_FITTING, 0, neckY + 0.04, 0);
+      addMesh(group, new THREE.CylinderGeometry(0.024, 0.024, 0.018, 14), MAT_ACCENT_GREEN, 0, neckY + 0.045, r * 0.36, Math.PI / 2, 0, 0);
+      addMesh(group, new THREE.BoxGeometry(0.024, 0.02, r * 1.45), MAT_DARK_STEEL, 0, neckY + 0.095, -r * 0.45, 0.22, 0, 0);
+      addMesh(group, new THREE.BoxGeometry(0.022, 0.016, r * 1.3), MAT_CHROME, 0, neckY + 0.055, -r * 0.42);
+      // Yellow safety pull-pin ring
+      addMesh(group, new THREE.TorusGeometry(0.018, 0.004, 8, 16), MAT_ACCENT_AMBER, r * 0.28, neckY + 0.06, 0);
+      // Black rubber discharge hose + flared CO2 snow horn
+      addMesh(group, new THREE.CylinderGeometry(0.016, 0.016, bodyH * 0.62, 10), MAT_RUBBER, r * 0.92, 0.09 + bodyH * 0.68, r * 0.16, 0, 0, -0.14);
+      addMesh(group, new THREE.CylinderGeometry(0.042, 0.018, 0.19, 14), MAT_RUBBER, r * 1.02, 0.09 + bodyH * 0.26, r * 0.24, 0.15, 0, 0);
+      break;
+    }
+
+    case 'firebox-cabinet': {
+      // Recessed powder-coated crimson firebox cabinet housing
+      addMesh(group, new THREE.BoxGeometry(W, H, D * 0.86), MAT_ACCENT_RED, 0, H / 2, -D * 0.06);
+      // Recessed dark interior cavity visible through the viewing glass
+      addMesh(group, new THREE.BoxGeometry(W * 0.84, H * 0.78, D * 0.65), MAT_DARK_STEEL, 0, H * 0.47, D * 0.02);
+      // Coiled crimson fire hose reel on central brass spindle (upper/left bay)
+      const reelR = Math.min(W * 0.28, H * 0.2);
+      addMesh(group, new THREE.CylinderGeometry(reelR, reelR, 0.09, 24), MAT_ACCENT_RED, -W * 0.12, H * 0.58, D * 0.08, Math.PI / 2, 0, 0);
+      addMesh(group, new THREE.TorusGeometry(reelR * 0.72, 0.032, 10, 24), MAT_RUBBER, -W * 0.12, H * 0.58, D * 0.12);
+      addMesh(group, new THREE.CylinderGeometry(0.04, 0.04, 0.14, 14), MAT_COPPER_FITTING, -W * 0.12, H * 0.58, D * 0.13, Math.PI / 2, 0, 0);
+      // Brass shutoff valve + chrome fog nozzle clipped on right side
+      addMesh(group, new THREE.CylinderGeometry(0.028, 0.036, 0.22, 12), MAT_COPPER_FITTING, W * 0.24, H * 0.64, D * 0.14);
+      // Secondary internal extinguisher in lower bay
+      addMesh(group, new THREE.CylinderGeometry(0.075, 0.075, H * 0.3, 16), MAT_ACCENT_RED, W * 0.22, H * 0.24, D * 0.08);
+      addMesh(group, new THREE.CylinderGeometry(0.02, 0.02, 0.06, 10), MAT_COPPER_FITTING, W * 0.22, H * 0.41, D * 0.08);
+      // Beveled front perimeter door frame + clear safety glazing + stainless pull latch
+      addMesh(group, new THREE.BoxGeometry(W * 0.96, 0.12, 0.04), MAT_ACCENT_RED, 0, H - 0.08, D * 0.41);
+      addMesh(group, new THREE.BoxGeometry(W * 0.96, 0.1, 0.04), MAT_ACCENT_RED, 0, 0.06, D * 0.41);
+      addMesh(group, new THREE.BoxGeometry(0.07, H * 0.88, 0.04), MAT_ACCENT_RED, -W * 0.45, H * 0.5, D * 0.41);
+      addMesh(group, new THREE.BoxGeometry(0.07, H * 0.88, 0.04), MAT_ACCENT_RED, W * 0.45, H * 0.5, D * 0.41);
+      addMesh(group, new THREE.BoxGeometry(W * 0.82, H * 0.78, 0.016), MAT_GLASS, 0, H * 0.48, D * 0.415);
+      addMesh(group, new THREE.BoxGeometry(0.035, 0.18, 0.055), MAT_CHROME, W * 0.39, H * 0.5, D * 0.44);
+      // Illuminated white/crimson FIRE header plaque
+      addMesh(group, new THREE.BoxGeometry(W * 0.56, 0.075, 0.03), MAT_CHROME, 0, H - 0.075, D * 0.435);
+      break;
+    }
+
+    case 'pass-box': {
+      const standH = H * 0.38;
+      const boxH = H * 0.46;
+      const plenumH = H * 0.16;
+      // 4 tubular 316L stainless cleanroom stand legs + cross-brace
+      for (const lx of [-W * 0.42, W * 0.42]) {
+        for (const lz of [-D * 0.38, D * 0.38]) {
+          addMesh(group, new THREE.CylinderGeometry(0.03, 0.03, standH, 12), MAT_BRUSHED_STEEL, lx, standH / 2, lz);
+        }
+      }
+      addMesh(group, new THREE.BoxGeometry(W * 0.86, 0.035, 0.035), MAT_BRUSHED_STEEL, 0, standH * 0.28, -D * 0.36);
+      addMesh(group, new THREE.BoxGeometry(W * 0.86, 0.035, 0.035), MAT_BRUSHED_STEEL, 0, standH * 0.28, D * 0.36);
+      // Main double-walled 316L transfer chamber shell
+      addMesh(group, new THREE.BoxGeometry(W, 0.08, D), MAT_BRUSHED_STEEL, 0, standH + 0.04, 0);
+      addMesh(group, new THREE.BoxGeometry(0.09, boxH, D), MAT_BRUSHED_STEEL, -W * 0.455, standH + boxH / 2, 0);
+      addMesh(group, new THREE.BoxGeometry(0.09, boxH, D), MAT_BRUSHED_STEEL, W * 0.455, standH + boxH / 2, 0);
+      // Perforated internal transfer deck + UV-C germicidal violet bar inside top of chamber
+      addMesh(group, new THREE.BoxGeometry(W * 0.8, 0.025, D * 0.82), MAT_CHROME, 0, standH + 0.12, 0);
+      addMesh(group, new THREE.CylinderGeometry(0.018, 0.018, W * 0.68, 12), MAT_SCREEN, 0, standH + boxH - 0.06, 0, 0, 0, Math.PI / 2);
+      // Top HEPA H14 fan-filter plenum + analog Magnehelic ΔP gauge + interlock status LEDs
+      addMesh(group, new THREE.BoxGeometry(W * 1.02, plenumH, D * 1.02), bodyMat, 0, standH + boxH + plenumH / 2, 0);
+      addMesh(group, new THREE.CylinderGeometry(0.065, 0.065, 0.03, 18), MAT_CHROME, -W * 0.24, standH + boxH + plenumH * 0.5, D * 0.515, Math.PI / 2, 0, 0);
+      addMesh(group, new THREE.BoxGeometry(0.24, 0.09, 0.03), MAT_DARK_STEEL, W * 0.16, standH + boxH + plenumH * 0.5, D * 0.51);
+      addMesh(group, new THREE.BoxGeometry(0.06, 0.03, 0.035), MAT_ACCENT_GREEN, W * 0.1, standH + boxH + plenumH * 0.5, D * 0.515);
+      addMesh(group, new THREE.BoxGeometry(0.06, 0.03, 0.035), MAT_ACCENT_AMBER, W * 0.22, standH + boxH + plenumH * 0.5, D * 0.515);
+      // Front & rear flush-glazed interlocked doors + stainless D-handles
+      for (const sz of [-1, 1]) {
+        addMesh(group, new THREE.BoxGeometry(W * 0.82, boxH * 0.86, 0.022), MAT_GLASS, 0, standH + boxH / 2, sz * (D * 0.49));
+        addMesh(group, new THREE.BoxGeometry(0.03, 0.22, 0.05), MAT_CHROME, W * 0.36, standH + boxH / 2, sz * (D * 0.525));
+      }
+      break;
+    }
+
+    case 'cold-room-unit': {
+      // Diamond-plate entry threshold floor + white PIR insulated cam-lock chamber
+      addMesh(group, new THREE.BoxGeometry(W * 1.02, 0.07, D * 1.02), MAT_BRUSHED_STEEL, 0, 0.035, 0);
+      addMesh(group, new THREE.BoxGeometry(W, H - 0.12, D), bodyMat, 0, 0.07 + (H - 0.12) / 2, 0);
+      // Stainless vertical cam-lock corner trim strips
+      for (const sx of [-1, 1]) {
+        for (const sz of [-1, 1]) {
+          addMesh(group, new THREE.BoxGeometry(0.08, H - 0.08, 0.08), MAT_BRUSHED_STEEL, sx * (W / 2 - 0.02), H / 2, sz * (D / 2 - 0.02));
+        }
+      }
+      // Heavy insulated hinged cold-room door + rubber perimeter gasket + heated viewing window
+      const doorW = Math.min(1.18, W * 0.38);
+      const doorH = Math.min(2.15, H * 0.82);
+      const doorX = -W * 0.14;
+      addMesh(group, new THREE.BoxGeometry(doorW + 0.06, doorH + 0.06, 0.05), MAT_RUBBER, doorX, 0.07 + doorH / 2, D / 2 + 0.015);
+      addMesh(group, new THREE.BoxGeometry(doorW, doorH, 0.07), MAT_CHROME, doorX, 0.07 + doorH / 2, D / 2 + 0.035);
+      addMesh(group, new THREE.BoxGeometry(doorW * 0.46, doorH * 0.32, 0.085), MAT_GLASS, doorX, 0.07 + doorH * 0.64, D / 2 + 0.038);
+      // Heavy cam-lift chrome lever latch + green illuminated panic release badge
+      addMesh(group, new THREE.BoxGeometry(0.06, 0.28, 0.1), MAT_DARK_STEEL, doorX + doorW * 0.38, 0.07 + doorH * 0.48, D / 2 + 0.08);
+      addMesh(group, new THREE.BoxGeometry(0.04, 0.16, 0.06), MAT_CHROME, doorX + doorW * 0.38, 0.07 + doorH * 0.48, D / 2 + 0.12);
+      // Exterior digital 2–8 °C thermostat controller + alarm beacon on right fascia
+      const ctrlX = W * 0.28;
+      addMesh(group, new THREE.BoxGeometry(0.38, 0.52, 0.08), MAT_DARK_STEEL, ctrlX, H * 0.62, D / 2 + 0.04);
+      addMesh(group, new THREE.BoxGeometry(0.28, 0.16, 0.09), MAT_SCREEN, ctrlX, H * 0.69, D / 2 + 0.045);
+      addMesh(group, new THREE.CylinderGeometry(0.035, 0.035, 0.04, 14), MAT_ACCENT_GREEN, ctrlX - 0.08, H * 0.54, D / 2 + 0.08, Math.PI / 2, 0, 0);
+      addMesh(group, new THREE.CylinderGeometry(0.035, 0.035, 0.04, 14), MAT_ACCENT_BLUE, ctrlX + 0.08, H * 0.54, D / 2 + 0.08, Math.PI / 2, 0, 0);
+      // Roof-mounted monoblock refrigeration condensing unit + axial fan grille + copper lines
+      addMesh(group, new THREE.BoxGeometry(W * 0.46, 0.42, D * 0.38), MAT_DARK_STEEL, W * 0.18, H + 0.16, -D * 0.16);
+      addMesh(group, new THREE.CylinderGeometry(0.26, 0.26, 0.06, 18), MAT_CHROME, W * 0.18, H + 0.16, -D * 0.16 + D * 0.195, Math.PI / 2, 0, 0);
+      addMesh(group, new THREE.CylinderGeometry(0.02, 0.02, 0.42, 10), MAT_COPPER_FITTING, W * 0.44, H + 0.14, -D * 0.1);
+      // Entry threshold diamond ramp
+      addMesh(group, new THREE.BoxGeometry(doorW * 1.05, 0.04, 0.26), MAT_BRUSHED_STEEL, doorX, 0.02, D / 2 + 0.14, 0.14, 0, 0);
       break;
     }
 
@@ -572,6 +774,14 @@ export function buildProceduralEquipmentGroup(
       break;
     }
   }
+
+  // Soft grounded contact shadow plane under asset (zero shadow-map cost, crisp spatial grounding)
+  const shadowPlane = new THREE.Mesh(SHARED_SHADOW_GEO, getContactShadowMaterial());
+  shadowPlane.rotation.x = -Math.PI / 2;
+  shadowPlane.position.y = 0.008;
+  shadowPlane.scale.set(W * 1.24, D * 1.24, 1);
+  shadowPlane.renderOrder = 1;
+  group.add(shadowPlane);
 
   // Selection outline ring on floor when selected
   if (isSelected) {

@@ -465,10 +465,12 @@ interface AclState {
   groups: AclGroup[];
   users: AclUserMember[];
   rules: AclResourceRule[];
+  activeAclUserId: string | null;
 
   showAclModal: boolean;
   aclTab: AclModalTab;
 
+  setActiveAclUserId: (userId: string | null) => void;
   syncAuthUser: (
     authUser: { uid: string; displayName: string | null; email: string | null; photoURL: string | null } | null,
     isOnline: boolean
@@ -521,9 +523,12 @@ export const useAclStore = create<AclState>((set, get) => {
     groups: persisted?.groups?.length ? persisted.groups : INITIAL_GROUPS,
     users: persisted?.users?.length ? persisted.users : INITIAL_USERS,
     rules: persisted?.rules?.length ? persisted.rules : INITIAL_ACL_RULES,
+    activeAclUserId: null,
 
     showAclModal: false,
     aclTab: 'users',
+
+    setActiveAclUserId: (userId) => set({ activeAclUserId: userId }),
 
     syncAuthUser: (authUser, isOnline) => {
       const cur = get();
@@ -719,3 +724,22 @@ export const useAclStore = create<AclState>((set, get) => {
     setAclTab: (tab) => set({ aclTab: tab }),
   };
 });
+
+export function getActiveAclUser(state: { users: AclUserMember[]; activeAclUserId: string | null }): AclUserMember | undefined {
+  if (state.activeAclUserId) {
+    const explicit = state.users.find((u) => u.id === state.activeAclUserId);
+    if (explicit) return explicit;
+  }
+  return state.users.find((u) => u.isCurrentUser);
+}
+
+export function canCurrentUserEditSpatial(): boolean {
+  const st = useAclStore.getState();
+  const activeUser = getActiveAclUser(st);
+  // If no explicit persona is impersonated and no signed-in ACL record is restricted, default to editable
+  if (!activeUser) return true;
+  if (activeUser.status === 'suspended') return false;
+  const eff = computeEffectivePermissions(activeUser, st.roles, st.groups);
+  return eff.includes('spatial.edit');
+}
+

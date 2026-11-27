@@ -1,5 +1,17 @@
 export type UnitSystem = 'metric' | 'imperial';
 
+export type WorkspaceMode = 'design' | 'view';
+
+export type FacilityCategoryFilter =
+  | 'all'
+  | 'IT'
+  | 'PRODUCTION'
+  | 'LABORATORY'
+  | 'VALIDATION'
+  | 'UTILITIES'
+  | 'SAFETY'
+  | 'WAREHOUSE';
+
 export type ViewMode = '2d' | '3d-perspective' | '3d-ortho' | 'split';
 
 export type OrthoPreset =
@@ -112,6 +124,38 @@ export type CleanroomGrade =
   | 'CNC (Controlled)'
   | 'Unclassified';
 
+export type HvacAirflowMode =
+  | 'positive-cascade'
+  | 'negative-containment'
+  | 'laminar-udaf'
+  | 'balanced'
+  | 'cold-recirc';
+
+export type HvacHepaClass =
+  | 'ULPA U15'
+  | 'HEPA H14'
+  | 'HEPA H13'
+  | 'MERV-14'
+  | 'MERV-11';
+
+export type HvacSystemStatus = 'online' | 'running' | 'setback' | 'standby' | 'maintenance' | 'alarm';
+
+export interface RoomHvacConfig {
+  ahuId: string;
+  ahuName: string;
+  hepaClass: HvacHepaClass;
+  airflowMode: HvacAirflowMode;
+  airChangesPerHour: number;
+  targetPressurePa: number;
+  supplyTempC: number;
+  damperPct: number;
+  diffuserCount: number;
+  exhaustPct: number;
+  status: HvacSystemStatus;
+  systemStatus: HvacSystemStatus;
+  showDucts: boolean;
+}
+
 export interface EnvironmentalSpecs {
   cleanroomGrade: CleanroomGrade;
   pressurePa: number;
@@ -119,6 +163,7 @@ export interface EnvironmentalSpecs {
   temperatureC: number;
   humidityPct: number;
   monitoringRequired: boolean;
+  hvac?: RoomHvacConfig;
 }
 
 export interface Room {
@@ -171,6 +216,7 @@ export type WallPresetId =
   | 'concrete'
   | 'brick'
   | 'glass-partition'
+  | 'full-glass-wall'
   | 'cleanroom-panel'
   | 'fire-rated'
   | 'insulated-sandwich'
@@ -296,6 +342,10 @@ export type EquipmentArchetype =
   | 'fluid-bed-dryer'
   | 'granulator'
   | 'agv-robot'
+  | 'fire-extinguisher'
+  | 'firebox-cabinet'
+  | 'pass-box'
+  | 'cold-room-unit'
   | 'generic-equipment';
 
 export interface RackPort {
@@ -304,21 +354,61 @@ export interface RackPort {
   kind: 'RJ45' | 'SFP+' | 'QSFP28' | 'Fiber-LC' | 'Console' | 'Power-C13';
   speedGbps: number;
   vlan: string;
-  status: 'up' | 'down' | 'standby';
+  status: 'up' | 'down' | 'standby' | 'error';
+  isUplink?: boolean;
+  poeWatts?: number;
+  utilizationPct?: number;
+  crcErrors?: number;
+  opticalDbm?: number;
+  connectedToLabel?: string;
+}
+
+export interface RackDeviceDriveBay {
+  id: string;
+  slot: number;
+  label: string;
+  capacityLabel: string;
+  tempC: number;
+  health: 'healthy' | 'warning' | 'failed';
+  usedPct?: number;
+}
+
+export interface RackDeviceWorkload {
+  id: string;
+  vmid: string;
+  name: string;
+  kind: 'VM' | 'CT';
+  hostTag: string;
+  status: 'up' | 'stopped' | 'degraded';
+  cpuPct: number;
+  memPct: number;
 }
 
 export interface RackDevice {
   id: string;
   name: string;
   kind: 'server' | 'switch' | 'router' | 'firewall' | 'patch-panel' | 'storage' | 'ups' | 'pdu' | 'scada' | 'kvm';
+  tier?: 'core' | 'distribution' | 'access' | 'compute' | 'security' | 'power';
   uStart: number; // 1..42
   uHeight: number; // 1..6
   powerW: number;
   ipAddress: string;
+  macAddress?: string;
+  serialNumber?: string;
   vlan: string;
   vendor: string;
   model: string;
   status: 'online' | 'warning' | 'offline';
+  cpuPct?: number;
+  memPct?: number;
+  diskPct?: number;
+  tempC?: number;
+  uptimeLabel?: string;
+  latencyMs?: number;
+  packetLossPct?: number;
+  hypervisorVersion?: string;
+  driveBays?: RackDeviceDriveBay[];
+  workloads?: RackDeviceWorkload[];
   ports: RackPort[];
 }
 
@@ -336,11 +426,176 @@ export interface RackPatchCable {
 
 export interface RackDesignConfig {
   totalUnits: number; // default 42
+  rackRole?: 'core-dc' | 'distribution-idf' | 'access-closet' | 'server-compute';
+  locationZone?: string;
   maxPowerKw: number;
   coolingZone: string;
   subnetCidr: string;
   devices: RackDevice[];
   cables: RackPatchCable[];
+}
+
+export type NetworkUserNodeKind =
+  | 'workstation'
+  | 'hmi-panel'
+  | 'hplc-drop'
+  | 'wifi-ap'
+  | 'ip-phone'
+  | 'cctv-cam'
+  | 'badge-reader'
+  | 'iot-gateway';
+
+export interface NetworkUserNode {
+  id: string;
+  code: string;
+  name: string;
+  nodeKind: NetworkUserNodeKind;
+  floorId: string;
+  roomId?: string;
+  x: number;
+  z: number;
+  wallJackId: string;
+  ipAddress: string;
+  macAddress: string;
+  vlan: string;
+  poeWatts: number;
+  connectedRackId: string;
+  connectedDeviceId: string;
+  connectedPortId: string;
+  media: 'Cat6A' | 'OM4 Fiber' | 'PoE++ Cat6A';
+  status: 'online' | 'degraded' | 'error' | 'offline';
+  bandwidthMbps: number;
+  latencyMs: number;
+  packetLossPct: number;
+  crcErrors: number;
+  notes?: string;
+}
+
+export interface NetworkInterRackLink {
+  id: string;
+  label: string;
+  tier: 'access-to-dist' | 'dist-to-core' | 'core-to-core';
+  fromRackId: string;
+  fromDeviceId: string;
+  fromPortId: string;
+  toRackId: string;
+  toDeviceId: string;
+  toPortId: string;
+  media: 'OM4 Fiber' | 'OS2 Single-Mode' | 'DAC Twinax' | 'Cat6A';
+  speedGbps: number;
+  vlanTrunk: string;
+  status: 'up' | 'degraded' | 'down';
+  utilizationPct: number;
+  opticalRxDbm: number;
+  crcErrors: number;
+}
+
+export interface MonitoringApiConnector {
+  id: string;
+  name: string;
+  provider: 'SNMPv3' | 'Prometheus' | 'Zabbix' | 'NetBox' | 'Cisco Catalyst Center' | 'Custom REST';
+  endpointUrl: string;
+  authType: 'bearer' | 'api-key' | 'snmp-v3' | 'none';
+  pollIntervalSec: number;
+  enabled: boolean;
+  lastStatus: 'idle' | 'connected' | 'error';
+  lastCheckedAt?: string;
+  mappedMetrics: string[];
+}
+
+export interface TopologyVlan {
+  id: string;
+  vlanTag: string;
+  name: string;
+  subnet: string;
+  color: string;
+  visible: boolean;
+}
+
+export interface TopologyBox {
+  id: string;
+  kind: 'box' | 'frame';
+  title: string;
+  subtitle?: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  color: string;
+  roomId?: string;
+}
+
+export interface TopologyTextNote {
+  id: string;
+  text: string;
+  x: number;
+  y: number;
+  color: string;
+  fontSize: number;
+}
+
+export interface TopologyTableCard {
+  id: string;
+  title: string;
+  x: number;
+  y: number;
+  tableKind: 'vlans' | 'ports' | 'custom';
+  headers: string[];
+  rows: string[][];
+}
+
+export interface TopologyCustomNode {
+  id: string;
+  kind: 'vpn' | 'tunnel' | 'wan' | 'ap' | 'controller' | 'switch' | 'nas' | 'hypervisor';
+  badge: string;
+  name: string;
+  subtitle?: string;
+  ipAddress: string;
+  vlan: string;
+  status: 'online' | 'warning' | 'offline';
+  x: number;
+  y: number;
+  latencyMs?: number;
+  packetLossPct?: number;
+  uptimeLabel?: string;
+  cpuPct?: number;
+  memPct?: number;
+  diskPct?: number;
+  ports?: RackPort[];
+}
+
+export interface TopologyCustomCable {
+  id: string;
+  fromNodeId: string;
+  fromPortId?: string;
+  toNodeId: string;
+  toPortId?: string;
+  label: string;
+  speedLabel: string;
+  vlan: string;
+  color: string;
+  style: 'solid' | 'dashed';
+  status: 'up' | 'degraded' | 'down';
+}
+
+export interface TopologyMapState {
+  diagramName: string;
+  snapToGrid: boolean;
+  showLegend: boolean;
+  vlans: TopologyVlan[];
+  nodePositions: Record<string, { x: number; y: number }>;
+  boxes: TopologyBox[];
+  texts: TopologyTextNote[];
+  tables: TopologyTableCard[];
+  customNodes: TopologyCustomNode[];
+  customCables: TopologyCustomCable[];
+}
+
+export interface NetworkArchitectureState {
+  userNodes: NetworkUserNode[];
+  interRackLinks: NetworkInterRackLink[];
+  monitoringApis: MonitoringApiConnector[];
+  topologyMap?: TopologyMapState;
 }
 
 export interface SpatialAsset {
@@ -415,9 +670,31 @@ export interface SpatialAsset {
   qrCode: string;
   relatedSystems: string[];
   relatedProcesses: string[];
+  // Identification, SOP & Governance History
+  costCenter?: string;
+  sopIds?: string[];
+  vendorHistory?: {
+    id: string;
+    date: string;
+    vendor: string;
+    action: string;
+    costUsd?: number;
+    reference?: string;
+    note: string;
+  }[];
+  ownerHistory?: {
+    id: string;
+    date: string;
+    owner: string;
+    department: string;
+    costCenter: string;
+    note: string;
+  }[];
   // Optional IT / Data Center Rack & Network Design configuration
   rackConfig?: RackDesignConfig;
 }
+
+export type EntityInfoTarget = { type: 'asset' | 'room'; id: string } | null;
 
 export type SpaceCategory =
   | 'Pharmaceutical Manufacturing'
@@ -543,6 +820,7 @@ export type CameraStreamProtocol = 'RTSP' | 'HLS' | 'MJPEG' | 'ONVIF' | 'WebRTC'
 export interface SceneCamera {
   id: string;
   floorId: string;
+  roomId?: string;
   name: string;
   kind: CameraKind;
   group: string;
@@ -752,4 +1030,40 @@ export interface DigitalTwinScene {
   customMaterials: MaterialDef[];
   customSpaceTypes: SpaceTypeTemplate[];
   customObjects: ObjectLibraryItem[];
+  networkArchitecture?: NetworkArchitectureState;
 }
+
+export interface NetworkTraceHop {
+  id: string;
+  label: string;
+  sublabel: string;
+  kind: 'user-node' | 'port' | 'switch' | 'access-switch' | 'rack' | 'core' | 'core-switch';
+  x: number;
+  z: number;
+  floorId: string;
+  elevation: number;
+  roomId?: string;
+  assetId?: string;
+  rackId?: string;
+  nodeId?: string;
+  portLabel?: string;
+  vlan?: string;
+  speedLabel?: string;
+  status?: 'ok' | 'warn' | 'error';
+}
+
+export interface NetworkTraceOverlay {
+  id: string;
+  title: string;
+  subtitle: string;
+  floorId: string;
+  buildingId: string;
+  targetAssetId?: string;
+  targetNodeId?: string;
+  sourcePortLabel?: string;
+  vlan?: string;
+  media?: string;
+  status: 'nominal' | 'warning' | 'degraded' | 'error';
+  hops: NetworkTraceHop[];
+}
+

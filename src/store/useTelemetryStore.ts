@@ -66,10 +66,12 @@ interface TelemetryState {
 
   // Detailed Dashboard view state (in-app overlay or standalone new tab)
   dashboardOpen: boolean;
-  dashboardTab: 'trends' | 'equipment' | 'define' | 'relationships';
+  dashboardTab: 'trends' | 'equipment' | 'predictive' | 'define' | 'relationships';
   dashboardFocusAssetId: string | null;
   dashboardFocusSensorId: string | null;
   dashboardFocusRoomId: string | null;
+  showMaintenanceMilestones: boolean;
+  activeMilestoneAssetId: string | null;
 
   // Actions
   setHeatmapMetric: (metric: HeatmapMetric) => void;
@@ -104,6 +106,8 @@ interface TelemetryState {
     roomId?: string | null;
     tab?: TelemetryState['dashboardTab'];
   }) => string;
+  setShowMaintenanceMilestones: (show: boolean) => void;
+  setActiveMilestoneAssetId: (assetId: string | null) => void;
 }
 
 export const useTelemetryStore = create<TelemetryState>((set, get) => ({
@@ -126,6 +130,8 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => ({
   dashboardFocusAssetId: null,
   dashboardFocusSensorId: null,
   dashboardFocusRoomId: null,
+  showMaintenanceMilestones: true,
+  activeMilestoneAssetId: null,
 
   setHeatmapMetric: (metric) =>
     set((s) => ({
@@ -138,6 +144,8 @@ export const useTelemetryStore = create<TelemetryState>((set, get) => ({
     set({ heatmapOpacity: Math.max(0.15, Math.min(0.95, opacity)) }),
 
   setShow3DSensorPins: (show) => set({ show3DSensorPins: show }),
+  setShowMaintenanceMilestones: (show) => set({ showMaintenanceMilestones: show }),
+  setActiveMilestoneAssetId: (assetId) => set({ activeMilestoneAssetId: assetId }),
 
   toggleStream: () => set((s) => ({ streamRunning: !s.streamRunning })),
 

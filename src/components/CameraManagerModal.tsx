@@ -3,11 +3,14 @@ import {
   ArrowLeft,
   Camera,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Compass,
   Crosshair,
   Eye,
   KeyRound,
   Lock,
+  MapPin,
   Moon,
   Plus,
   Radio,
@@ -22,8 +25,9 @@ import {
   ZoomOut,
 } from 'lucide-react';
 import { useTwinStore } from '../store/useTwinStore';
+import { useAclStore, computeEffectivePermissions, getActiveAclUser } from '../store/useAclStore';
 import { fetchApiJson } from '../utils/safeJson';
-import type { CameraKind, CameraStreamProtocol, SceneCamera } from '../types/twin';
+import type { CameraKind, CameraStreamProtocol, Room, SceneCamera, SpatialAsset } from '../types/twin';
 
 function calcYawPitchFromVec(pos: [number, number, number], target: [number, number, number]) {
   const dx = target[0] - pos[0];
@@ -55,10 +59,12 @@ function targetFromYawPitch(
 const LiveCctvCanvas: React.FC<{
   camera: SceneCamera;
   floorName: string;
+  room: Room | null;
+  roomAssets: SpatialAsset[];
   nightVision: boolean;
   ptzZoom: number;
   ptzPan: number;
-}> = ({ camera, floorName, nightVision, ptzZoom, ptzPan }) => {
+}> = ({ camera, floorName, room, roomAssets, nightVision, ptzZoom, ptzPan }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
@@ -73,95 +79,163 @@ const LiveCctvCanvas: React.FC<{
       const h = canvas.height;
       const sec = t * 0.001;
 
-      // Industrial surveillance background
+      // Industrial surveillance background tinted by room environment
       const grad = ctx.createLinearGradient(0, 0, 0, h);
       if (nightVision) {
         grad.addColorStop(0, '#04120c');
         grad.addColorStop(0.55, '#092418');
         grad.addColorStop(1, '#04140d');
       } else {
-        grad.addColorStop(0, '#10121a');
-        grad.addColorStop(0.55, '#191d29');
-        grad.addColorStop(1, '#0e1017');
+        grad.addColorStop(0, '#0e111a');
+        grad.addColorStop(0.52, '#181e2c');
+        grad.addColorStop(1, '#0c0f17');
       }
       ctx.fillStyle = grad;
       ctx.fillRect(0, 0, w, h);
 
       ctx.save();
-      ctx.translate(w / 2 + ptzPan * 20, h / 2);
+      ctx.translate(w / 2 + ptzPan * 22, h / 2);
       ctx.scale(ptzZoom, ptzZoom);
       ctx.translate(-w / 2, -h / 2);
 
-      // Perspective cleanroom corridor grid lines
-      const horizonY = h * 0.42;
-      const vanishX = w * 0.5 + Math.sin(sec * 0.25) * 14;
-      ctx.strokeStyle = nightVision ? 'rgba(52,211,153,0.18)' : 'rgba(139,92,246,0.22)';
+      // Perspective room floor & walls based on mounted room dimensions
+      const horizonY = h * 0.4;
+      const vanishX = w * 0.5 + Math.sin(sec * 0.22) * 10;
+      ctx.strokeStyle = nightVision ? 'rgba(52,211,153,0.18)' : 'rgba(139,92,246,0.24)';
       ctx.lineWidth = 1;
       for (let i = -6; i <= 6; i++) {
         ctx.beginPath();
-        ctx.moveTo(vanishX + i * 22, horizonY);
+        ctx.moveTo(vanishX + i * 24, horizonY);
         ctx.lineTo(vanishX + i * 115, h);
         ctx.stroke();
       }
       for (let r = 1; r <= 6; r++) {
-        const yy = horizonY + Math.pow(r / 6, 1.8) * (h - horizonY);
+        const yy = horizonY + Math.pow(r / 6, 1.75) * (h - horizonY);
         ctx.beginPath();
         ctx.moveTo(0, yy);
         ctx.lineTo(w, yy);
         ctx.stroke();
       }
 
-      // Stylized silhouettes of cleanroom vessels / racks
-      const baseColor = nightVision ? 'rgba(16,185,129,0.26)' : 'rgba(148,163,184,0.22)';
-      const strokeColor = nightVision ? 'rgba(110,231,183,0.55)' : 'rgba(196,181,253,0.5)';
-      const tanks = [
-        { x: w * 0.22, y: h * 0.36, rw: 56, rh: 108, label: 'BR-2001' },
-        { x: w * 0.44, y: h * 0.34, rw: 62, rh: 118, label: 'BR-2002' },
-        { x: w * 0.72, y: h * 0.4, rw: 82, rh: 92, label: 'SKID-301' },
-      ];
-      tanks.forEach((tk, idx) => {
+      // Back room wall header & cleanroom lighting strip
+      ctx.fillStyle = nightVision ? 'rgba(16,185,129,0.08)' : 'rgba(255,255,255,0.04)';
+      ctx.fillRect(w * 0.08, h * 0.14, w * 0.84, horizonY - h * 0.14);
+      ctx.strokeStyle = nightVision ? 'rgba(52,211,153,0.28)' : 'rgba(148,163,184,0.24)';
+      ctx.strokeRect(w * 0.08, h * 0.14, w * 0.84, horizonY - h * 0.14);
+
+      // Overhead cleanroom LED troffer bars
+      ctx.fillStyle = nightVision ? 'rgba(110,231,183,0.28)' : 'rgba(224,242,254,0.35)';
+      ctx.fillRect(w * 0.22, h * 0.16, w * 0.18, 4);
+      ctx.fillRect(w * 0.6, h * 0.16, w * 0.18, 4);
+
+      // Render REAL equipment inside the camera's mounted room
+      const baseColor = nightVision ? 'rgba(16,185,129,0.25)' : 'rgba(148,163,184,0.20)';
+      const strokeColor = nightVision ? 'rgba(110,231,183,0.6)' : 'rgba(196,181,253,0.58)';
+      const itemsToRender =
+        roomAssets.length > 0
+          ? roomAssets.slice(0, 6).map((a, idx, arr) => {
+              const frac = arr.length === 1 ? 0.5 : (idx + 0.6) / (arr.length + 0.2);
+              const rw = Math.max(54, Math.min(104, a.width * 34));
+              const rh = Math.max(66, Math.min(126, a.height * 46));
+              return {
+                x: w * 0.1 + frac * (w * 0.72) - rw / 2,
+                y: horizonY + 18 + (idx % 2) * 18 - rh * 0.45,
+                rw,
+                rh,
+                label: a.assetId || a.name.slice(0, 10),
+                sub: a.operationalStatus.toUpperCase(),
+                isAlarm: a.operationalStatus === 'maintenance-due' || a.operationalStatus === 'offline',
+                isRack: Boolean(a.rackConfig) || a.archetype === 'server-rack' || a.archetype === 'network-rack',
+              };
+            })
+          : [
+              {
+                x: w * 0.26,
+                y: h * 0.38,
+                rw: 90,
+                rh: 94,
+                label: room?.code ?? 'ZONE',
+                sub: room?.environmental?.cleanroomGrade?.split(' ')[0] ?? 'GMP',
+                isAlarm: false,
+                isRack: false,
+              },
+              {
+                x: w * 0.58,
+                y: h * 0.4,
+                rw: 86,
+                rh: 86,
+                label: 'HVAC-MON',
+                sub: 'ONLINE',
+                isAlarm: false,
+                isRack: false,
+              },
+            ];
+
+      itemsToRender.forEach((tk, idx) => {
         ctx.fillStyle = baseColor;
-        ctx.strokeStyle = strokeColor;
+        ctx.strokeStyle = tk.isAlarm ? '#F59E0B' : strokeColor;
         ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.roundRect(tk.x, tk.y, tk.rw, tk.rh, 10);
+        ctx.roundRect(tk.x, tk.y, tk.rw, tk.rh, 8);
         ctx.fill();
         ctx.stroke();
 
-        // Blinking telemetry LED
-        const ledOn = Math.sin(sec * 3 + idx * 1.4) > -0.2;
-        ctx.fillStyle = ledOn ? (nightVision ? '#34D399' : '#22C55E') : '#334155';
-        ctx.beginPath();
-        ctx.arc(tk.x + tk.rw - 12, tk.y + 14, 3.5, 0, Math.PI * 2);
-        ctx.fill();
+        // If IT Rack, draw blinking switch LEDs!
+        if (tk.isRack) {
+          for (let row = 0; row < 5; row++) {
+            const ledBlink = Math.sin(sec * 7 + row * 1.9 + idx) > -0.15;
+            ctx.fillStyle = ledBlink ? '#06B6D4' : '#22C55E';
+            ctx.fillRect(tk.x + 10, tk.y + 16 + row * 12, tk.rw - 24, 5);
+            ctx.fillStyle = ledBlink ? '#34D399' : '#1E293B';
+            ctx.beginPath();
+            ctx.arc(tk.x + tk.rw - 9, tk.y + 18.5 + row * 12, 2.2, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        } else {
+          // Equipment status LED
+          const ledOn = Math.sin(sec * 3 + idx * 1.4) > -0.2;
+          ctx.fillStyle = tk.isAlarm
+            ? '#F59E0B'
+            : ledOn
+              ? nightVision
+                ? '#34D399'
+                : '#22C55E'
+              : '#334155';
+          ctx.beginPath();
+          ctx.arc(tk.x + tk.rw - 11, tk.y + 13, 3.2, 0, Math.PI * 2);
+          ctx.fill();
+        }
 
-        ctx.fillStyle = nightVision ? '#A7F3D0' : '#E2E8F0';
-        ctx.font = '600 10px monospace';
-        ctx.fillText(tk.label, tk.x + 8, tk.y + tk.rh - 10);
+        ctx.fillStyle = nightVision ? '#A7F3D0' : '#F1F5F9';
+        ctx.font = '700 9.5px monospace';
+        ctx.fillText(tk.label.slice(0, 11), tk.x + 7, tk.y + tk.rh - 18);
+        ctx.fillStyle = tk.isAlarm ? '#FBBF24' : '#94A3B8';
+        ctx.font = '600 8px monospace';
+        ctx.fillText(tk.sub.slice(0, 11), tk.x + 7, tk.y + tk.rh - 7);
       });
 
-      // Moving AI motion detection bounding box (simulated operator / AGV)
-      const mx = w * 0.3 + ((sec * 24) % (w * 0.42));
-      const my = h * 0.54;
+      // Moving AI vision bounding box
+      const mx = w * 0.24 + ((sec * 20) % (w * 0.48));
+      const my = h * 0.56;
       ctx.strokeStyle = nightVision ? '#34D399' : '#F59E0B';
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(mx, my, 46, 78);
-      ctx.fillStyle = nightVision ? 'rgba(16,185,129,0.2)' : 'rgba(245,158,11,0.18)';
-      ctx.fillRect(mx, my - 15, 72, 15);
+      ctx.lineWidth = 1.4;
+      ctx.strokeRect(mx, my, 44, 72);
+      ctx.fillStyle = nightVision ? 'rgba(16,185,129,0.22)' : 'rgba(245,158,11,0.2)';
+      ctx.fillRect(mx, my - 14, 76, 14);
       ctx.fillStyle = nightVision ? '#A7F3D0' : '#FDE68A';
-      ctx.font = '700 9px monospace';
+      ctx.font = '700 8.5px monospace';
       ctx.fillText('GMP-OP 98%', mx + 3, my - 4);
 
       ctx.restore();
 
       // Subtle scanlines
-      ctx.fillStyle = 'rgba(0,0,0,0.14)';
+      ctx.fillStyle = 'rgba(0,0,0,0.13)';
       for (let y = 0; y < h; y += 4) {
         ctx.fillRect(0, y, w, 1);
       }
 
       // Crosshair reticle
-      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.strokeStyle = 'rgba(255,255,255,0.22)';
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(w / 2 - 14, h / 2);
@@ -170,9 +244,9 @@ const LiveCctvCanvas: React.FC<{
       ctx.lineTo(w / 2, h / 2 + 14);
       ctx.stroke();
 
-      // OSD Stamp
-      ctx.fillStyle = 'rgba(9,9,11,0.72)';
-      ctx.fillRect(10, 10, 260, 22);
+      // Top-Left OSD Stamp with Mounted Room Code
+      ctx.fillStyle = 'rgba(9,9,11,0.78)';
+      ctx.fillRect(10, 10, 310, 22);
       ctx.fillStyle = '#EF4444';
       if (Math.floor(sec * 2) % 2 === 0) {
         ctx.beginPath();
@@ -180,21 +254,36 @@ const LiveCctvCanvas: React.FC<{
         ctx.fill();
       }
       ctx.fillStyle = '#F4F4F5';
-      ctx.font = '700 10.5px monospace';
+      ctx.font = '700 10px monospace';
+      const roomTag = room ? `[${room.code}] ` : '';
       ctx.fillText(
-        `REC · ${camera.name.slice(0, 22).toUpperCase()}`,
+        `REC · ${roomTag}${camera.name.slice(0, 24).toUpperCase()}`,
         32,
         24.5
       );
 
+      // Top-Right Timestamp + Room Environmental Telemetry
       const nowStr = new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
-      ctx.fillStyle = 'rgba(9,9,11,0.72)';
-      ctx.fillRect(w - 196, 10, 186, 22);
+      ctx.fillStyle = 'rgba(9,9,11,0.78)';
+      ctx.fillRect(w - 204, 10, 194, 22);
       ctx.fillStyle = nightVision ? '#6EE7B7' : '#C4B5FD';
-      ctx.font = '600 10.5px monospace';
-      ctx.fillText(nowStr, w - 188, 24.5);
+      ctx.font = '600 10px monospace';
+      ctx.fillText(nowStr, w - 196, 24.5);
 
-      ctx.fillStyle = 'rgba(9,9,11,0.72)';
+      if (room?.environmental) {
+        ctx.fillStyle = 'rgba(9,9,11,0.76)';
+        ctx.fillRect(10, 36, 275, 19);
+        ctx.fillStyle = '#34D399';
+        ctx.font = '600 9.5px monospace';
+        ctx.fillText(
+          `${room.name.slice(0, 18)} · ${room.environmental.temperatureC}°C · ${room.environmental.humidityPct}%RH · ${room.environmental.pressurePa >= 0 ? '+' : ''}${room.environmental.pressurePa}Pa`,
+          16,
+          49
+        );
+      }
+
+      // Bottom Stream Bar
+      ctx.fillStyle = 'rgba(9,9,11,0.78)';
       ctx.fillRect(10, h - 30, w - 20, 20);
       ctx.fillStyle = '#A1A1AA';
       ctx.font = '500 10px monospace';
@@ -202,7 +291,7 @@ const LiveCctvCanvas: React.FC<{
         ? `${camera.protocol ?? 'RTSP'}://${camera.ipAddress}:${camera.port ?? 554}${camera.streamPath ?? '/stream1'}`
         : `LOCAL-TWIN-CAM · ${floorName}`;
       ctx.fillText(
-        `${streamInfo}   |   FOV ${camera.fov}°   |   ${camera.resolution ?? '2560×1440'} @ ${camera.fps ?? 30}fps   |   ZOOM ${ptzZoom.toFixed(1)}×`,
+        `${streamInfo}   |   ${roomAssets.length} ASSETS   |   FOV ${camera.fov}°   |   ZOOM ${ptzZoom.toFixed(1)}×`,
         16,
         h - 16.5
       );
@@ -212,9 +301,8 @@ const LiveCctvCanvas: React.FC<{
 
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [camera, floorName, nightVision, ptzZoom, ptzPan]);
+  }, [camera, floorName, room, roomAssets, nightVision, ptzZoom, ptzPan]);
 
-  // If user configured an http/https MJPEG or image stream, render an overlay fallback
   const isDirectHttpStream =
     camera.ipAddress &&
     (camera.protocol === 'MJPEG' || camera.protocol === 'HLS') &&
@@ -249,6 +337,20 @@ export const CameraManagerModal: React.FC = () => {
   const setViewMode = useTwinStore((s) => s.setViewMode);
   const showToast = useTwinStore((s) => s.showToast);
 
+  const workspaceMode = useTwinStore((s) => s.workspaceMode);
+  const aclUsers = useAclStore((s) => s.users);
+  const aclRoles = useAclStore((s) => s.roles);
+  const aclGroups = useAclStore((s) => s.groups);
+  const activeAclUserId = useAclStore((s) => s.activeAclUserId);
+
+  const canEdit = useMemo(() => {
+    if (workspaceMode === 'view') return false;
+    const activeUser = getActiveAclUser({ users: aclUsers, activeAclUserId });
+    if (!activeUser) return true;
+    if (activeUser.status === 'suspended') return false;
+    return computeEffectivePermissions(activeUser, aclRoles, aclGroups).includes('spatial.edit');
+  }, [workspaceMode, aclUsers, aclRoles, aclGroups, activeAclUserId]);
+
   const [search, setSearch] = useState('');
   const [selectedId, setSelectedId] = useState<string>('');
   const [viewTab, setViewTab] = useState<'live' | 'config'>('live');
@@ -266,24 +368,38 @@ export const CameraManagerModal: React.FC = () => {
     return scene.cameras.filter((c) => {
       if (!q) return true;
       const fl = scene.floors.find((f) => f.id === c.floorId);
+      const rm = c.roomId ? scene.rooms.find((r) => r.id === c.roomId) : undefined;
       return (
         c.name.toLowerCase().includes(q) ||
         c.kind.toLowerCase().includes(q) ||
         (c.ipAddress ?? '').toLowerCase().includes(q) ||
-        (fl?.name ?? '').toLowerCase().includes(q)
+        (fl?.name ?? '').toLowerCase().includes(q) ||
+        (rm?.name ?? '').toLowerCase().includes(q) ||
+        (rm?.code ?? '').toLowerCase().includes(q)
       );
     });
-  }, [scene.cameras, scene.floors, search]);
+  }, [scene.cameras, scene.floors, scene.rooms, search]);
 
+  const selectCamera = (camId: string, nextTab?: 'live' | 'config') => {
+    setSelectedId(camId);
+    openLiveCamera(camId);
+    setConnStatus(null);
+    setPtzZoom(1);
+    setPtzPan(0);
+    if (nextTab) setViewTab(nextTab);
+  };
+
+  // Sync only when modal opens or external activeLiveCameraId changes (NOT when local selectedId changes!)
   useEffect(() => {
     if (!showCameraManager) return;
     if (activeLiveCameraId && scene.cameras.some((c) => c.id === activeLiveCameraId)) {
       setSelectedId(activeLiveCameraId);
-      setViewTab('live');
-    } else if (!selectedId || !scene.cameras.some((c) => c.id === selectedId)) {
-      setSelectedId(scene.cameras[0]?.id ?? '');
+    } else if (scene.cameras.length > 0) {
+      setSelectedId((prev) =>
+        prev && scene.cameras.some((c) => c.id === prev) ? prev : scene.cameras[0].id
+      );
     }
-  }, [showCameraManager, activeLiveCameraId, scene.cameras, selectedId]);
+  }, [showCameraManager, activeLiveCameraId, scene.cameras]);
 
   // ArrowUp / ArrowDown keyboard navigation across camera list
   useEffect(() => {
@@ -298,14 +414,14 @@ export const CameraManagerModal: React.FC = () => {
       }
       if (filteredCameras.length === 0) return;
       const idx = filteredCameras.findIndex((c) => c.id === selectedId);
-      if (e.key === 'ArrowDown') {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
         e.preventDefault();
         const next = filteredCameras[(idx + 1) % filteredCameras.length];
-        setSelectedId(next.id);
-      } else if (e.key === 'ArrowUp') {
+        selectCamera(next.id);
+      } else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
         e.preventDefault();
         const next = filteredCameras[(idx - 1 + filteredCameras.length) % filteredCameras.length];
-        setSelectedId(next.id);
+        selectCamera(next.id);
       }
     };
     window.addEventListener('keydown', onKey);
@@ -315,7 +431,32 @@ export const CameraManagerModal: React.FC = () => {
   if (!showCameraManager) return null;
 
   const activeCam = scene.cameras.find((c) => c.id === selectedId) ?? filteredCameras[0] ?? null;
+  const activeCamIndex = activeCam ? filteredCameras.findIndex((c) => c.id === activeCam.id) : -1;
   const activeFloor = activeCam ? scene.floors.find((f) => f.id === activeCam.floorId) : null;
+  const activeRoom = activeCam
+    ? (activeCam.roomId ? scene.rooms.find((r) => r.id === activeCam.roomId) : undefined) ??
+      scene.rooms.find(
+        (r) =>
+          r.floorId === activeCam.floorId &&
+          activeCam.target[0] >= r.x &&
+          activeCam.target[0] <= r.x + r.width &&
+          activeCam.target[2] >= r.z &&
+          activeCam.target[2] <= r.z + r.depth
+      ) ??
+      null
+    : null;
+  const activeRoomAssets = activeRoom
+    ? scene.assets.filter(
+        (a) =>
+          a.floorId === activeRoom.floorId &&
+          (a.roomId === activeRoom.id ||
+            (a.x >= activeRoom.x &&
+              a.x <= activeRoom.x + activeRoom.width &&
+              a.z >= activeRoom.z &&
+              a.z <= activeRoom.z + activeRoom.depth))
+      )
+    : [];
+
   const orient = activeCam
     ? calcYawPitchFromVec(activeCam.position, activeCam.target)
     : { yawDeg: 0, pitchDeg: -15, dist: 10 };
@@ -333,17 +474,48 @@ export const CameraManagerModal: React.FC = () => {
     handleClose();
   };
 
+  const snapCameraToRoom = (camId: string, roomId: string) => {
+    const rm = scene.rooms.find((r) => r.id === roomId);
+    if (!rm) return;
+    const fl = scene.floors.find((f) => f.id === rm.floorId);
+    const elev = fl?.elevation ?? 0;
+    const px = Number((rm.x + Math.min(0.85, rm.width * 0.14)).toFixed(2));
+    const pz = Number((rm.z + Math.min(0.85, rm.depth * 0.14)).toFixed(2));
+    const py = Number((elev + Math.min(2.9, rm.height - 0.55)).toFixed(2));
+    const tx = Number((rm.x + rm.width * 0.56).toFixed(2));
+    const tz = Number((rm.z + rm.depth * 0.56).toFixed(2));
+    const ty = Number((elev + 1.25).toFixed(2));
+    updateCamera(camId, {
+      floorId: rm.floorId,
+      roomId: rm.id,
+      position: [px, py, pz],
+      target: [tx, ty, tz],
+    });
+  };
+
   const handleAddCamera = () => {
-    const fl = scene.floors.find((f) => f.id === activeFloorId) ?? scene.floors[0];
-    const cx = fl ? Number((fl.width * 0.25).toFixed(1)) : 6;
-    const cz = fl ? Number((fl.depth * 0.25).toFixed(1)) : 6;
+    if (!canEdit) {
+      showToast('Read-only mode: switch to Design Mode to add cameras.', 'warning');
+      return;
+    }
+    const floorRooms = scene.rooms.filter((r) => r.floorId === activeFloorId);
+    const targetRoom = floorRooms[scene.cameras.length % Math.max(1, floorRooms.length)] ?? scene.rooms[0];
+    const fl = scene.floors.find((f) => f.id === (targetRoom?.floorId ?? activeFloorId)) ?? scene.floors[0];
+    const elev = fl?.elevation ?? 0;
+    const px = targetRoom ? Number((targetRoom.x + Math.min(0.85, targetRoom.width * 0.14)).toFixed(2)) : 4;
+    const pz = targetRoom ? Number((targetRoom.z + Math.min(0.85, targetRoom.depth * 0.14)).toFixed(2)) : 4;
+    const tx = targetRoom ? Number((targetRoom.x + targetRoom.width * 0.55).toFixed(2)) : 9;
+    const tz = targetRoom ? Number((targetRoom.z + targetRoom.depth * 0.55).toFixed(2)) : 9;
     const created = addCamera({
       floorId: fl?.id ?? activeFloorId,
-      name: `CCTV Security Cam ${scene.cameras.length + 1}`,
+      roomId: targetRoom?.id,
+      name: targetRoom
+        ? `${targetRoom.code} ${targetRoom.name.slice(0, 18)} Cam`
+        : `CCTV Security Cam ${scene.cameras.length + 1}`,
       kind: 'security',
       group: 'IP Surveillance',
-      position: [cx, 3.2, cz],
-      target: [cx + 6, 1.4, cz + 5],
+      position: [px, Number((elev + 2.85).toFixed(2)), pz],
+      target: [tx, Number((elev + 1.25).toFixed(2)), tz],
       fov: 68,
       focalLengthMm: 24,
       coverageRadius: 11,
@@ -359,8 +531,7 @@ export const CameraManagerModal: React.FC = () => {
       nightVision: false,
       status: 'online',
     });
-    setSelectedId(created.id);
-    setViewTab('config');
+    selectCamera(created.id, 'config');
   };
 
   const handleSaveArgon2Password = async () => {
@@ -451,13 +622,20 @@ export const CameraManagerModal: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            <button
-              onClick={handleAddCamera}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold transition-colors"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              New Camera
-            </button>
+            {canEdit ? (
+              <button
+                onClick={handleAddCamera}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold transition-colors"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                New Camera
+              </button>
+            ) : (
+              <span className="flex items-center gap-1 px-2.5 py-1 rounded-xl bg-amber-500/15 border border-amber-500/35 text-amber-500 text-[11px] font-semibold">
+                <Lock className="w-3 h-3" />
+                View Only
+              </span>
+            )}
             <button
               onClick={handleClose}
               className="p-2 rounded-xl text-zinc-400 hover:text-zinc-900 dark:hover:text-white hover:bg-zinc-200/60 dark:hover:bg-zinc-800"
@@ -490,14 +668,12 @@ export const CameraManagerModal: React.FC = () => {
             <div className="flex-1 overflow-y-auto p-2.5 space-y-1.5">
               {filteredCameras.map((cam) => {
                 const fl = scene.floors.find((f) => f.id === cam.floorId);
+                const rm = cam.roomId ? scene.rooms.find((r) => r.id === cam.roomId) : undefined;
                 const isSel = cam.id === activeCam?.id;
                 return (
                   <div
                     key={cam.id}
-                    onClick={() => {
-                      setSelectedId(cam.id);
-                      setConnStatus(null);
-                    }}
+                    onClick={() => selectCamera(cam.id)}
                     className={`p-3 rounded-2xl border cursor-pointer transition-all space-y-2 ${
                       isSel
                         ? 'border-violet-500 bg-violet-500/10 dark:bg-violet-500/12 shadow-xs'
@@ -510,7 +686,7 @@ export const CameraManagerModal: React.FC = () => {
                           <span
                             className={`w-2 h-2 rounded-full shrink-0 ${
                               cam.status === 'recording'
-                                ? 'bg-rose-500 animate-pulse'
+                                ? 'bg-rose-500'
                                 : cam.status === 'offline'
                                   ? 'bg-zinc-500'
                                   : 'bg-emerald-500'
@@ -519,7 +695,10 @@ export const CameraManagerModal: React.FC = () => {
                           {cam.name}
                         </div>
                         <div className="text-[10px] text-zinc-500 dark:text-zinc-400 truncate mt-0.5 font-mono">
-                          {fl?.code ?? cam.floorId} · FOV {cam.fov}° · {cam.ipAddress ?? '3D Viewpoint'}
+                          {fl?.code ?? cam.floorId} {rm ? `· ${rm.code} ${rm.name}` : '· Unassigned'}
+                        </div>
+                        <div className="text-[10px] text-zinc-400 dark:text-zinc-500 truncate font-mono">
+                          FOV {cam.fov}° · {cam.ipAddress ?? '3D Viewpoint'}
                         </div>
                       </div>
                       {cam.hasCredentials && (
@@ -536,8 +715,7 @@ export const CameraManagerModal: React.FC = () => {
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          setSelectedId(cam.id);
-                          setViewTab('live');
+                          selectCamera(cam.id, 'live');
                         }}
                         className="flex-1 flex items-center justify-center gap-1 py-1 rounded-lg bg-zinc-100 dark:bg-[#1E1E28] hover:bg-violet-600 hover:text-white text-[10.5px] font-medium transition-colors"
                       >
@@ -591,7 +769,35 @@ export const CameraManagerModal: React.FC = () => {
                     </button>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1.5">
+                    {filteredCameras.length > 1 && (
+                      <div className="flex items-center gap-1 mr-1 bg-zinc-100 dark:bg-[#1B1B24] rounded-xl p-0.5 border border-zinc-200 dark:border-zinc-800">
+                        <button
+                          onClick={() => {
+                            const prevIdx =
+                              (activeCamIndex - 1 + filteredCameras.length) % filteredCameras.length;
+                            selectCamera(filteredCameras[prevIdx].id);
+                          }}
+                          className="p-1.5 rounded-lg hover:bg-violet-600 hover:text-white text-zinc-600 dark:text-zinc-300 transition-colors"
+                          title="Previous Camera (← / ↑)"
+                        >
+                          <ChevronLeft className="w-3.5 h-3.5" />
+                        </button>
+                        <span className="px-1.5 text-[10.5px] font-mono tabular-nums text-zinc-500">
+                          {activeCamIndex + 1}/{filteredCameras.length}
+                        </span>
+                        <button
+                          onClick={() => {
+                            const nextIdx = (activeCamIndex + 1) % filteredCameras.length;
+                            selectCamera(filteredCameras[nextIdx].id);
+                          }}
+                          className="p-1.5 rounded-lg hover:bg-violet-600 hover:text-white text-zinc-600 dark:text-zinc-300 transition-colors"
+                          title="Next Camera (→ / ↓)"
+                        >
+                          <ChevronRight className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    )}
                     <button
                       onClick={() => handleGoTo3D(activeCam)}
                       className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 text-xs font-semibold transition-colors"
@@ -599,16 +805,19 @@ export const CameraManagerModal: React.FC = () => {
                       <Eye className="w-3.5 h-3.5" />
                       Jump to 3D Camera
                     </button>
-                    <button
-                      onClick={() => {
-                        deleteCamera(activeCam.id);
-                        setSelectedId('');
-                      }}
-                      className="p-1.5 rounded-xl border border-rose-500/30 text-rose-500 hover:bg-rose-500/10"
-                      title="Delete Camera"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+                    {canEdit && (
+                      <button
+                        onClick={() => {
+                          deleteCamera(activeCam.id);
+                          setSelectedId('');
+                          openLiveCamera(null);
+                        }}
+                        className="p-1.5 rounded-xl border border-rose-500/30 text-rose-500 hover:bg-rose-500/10"
+                        title="Delete Camera"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -618,6 +827,8 @@ export const CameraManagerModal: React.FC = () => {
                       <LiveCctvCanvas
                         camera={activeCam}
                         floorName={activeFloor?.name ?? activeCam.floorId}
+                        room={activeRoom}
+                        roomAssets={activeRoomAssets}
                         nightVision={Boolean(activeCam.nightVision)}
                         ptzZoom={ptzZoom}
                         ptzPan={ptzPan}
@@ -726,17 +937,19 @@ export const CameraManagerModal: React.FC = () => {
                           <div className="sm:col-span-2">
                             <label className="text-[10px] font-medium text-zinc-500 block mb-1">Camera Name</label>
                             <input
+                              disabled={!canEdit}
                               value={activeCam.name}
                               onChange={(e) => updateCamera(activeCam.id, { name: e.target.value })}
-                              className="w-full px-3 py-1.5 text-xs rounded-xl bg-white dark:bg-[#111116] border border-zinc-200 dark:border-zinc-700"
+                              className="w-full px-3 py-1.5 text-xs rounded-xl bg-white dark:bg-[#111116] border border-zinc-200 dark:border-zinc-700 disabled:opacity-60"
                             />
                           </div>
                           <div>
                             <label className="text-[10px] font-medium text-zinc-500 block mb-1">Type</label>
                             <select
+                              disabled={!canEdit}
                               value={activeCam.kind}
                               onChange={(e) => updateCamera(activeCam.id, { kind: e.target.value as CameraKind })}
-                              className="w-full px-3 py-1.5 text-xs rounded-xl bg-white dark:bg-[#111116] border border-zinc-200 dark:border-zinc-700"
+                              className="w-full px-3 py-1.5 text-xs rounded-xl bg-white dark:bg-[#111116] border border-zinc-200 dark:border-zinc-700 disabled:opacity-60"
                             >
                               <option value="security">Security IP CCTV</option>
                               <option value="fixed-industrial">Fixed Industrial</option>
@@ -745,6 +958,42 @@ export const CameraManagerModal: React.FC = () => {
                               <option value="first-person">First-Person</option>
                             </select>
                           </div>
+                        </div>
+
+                        {/* Mounted Room Auto-Snap Selector */}
+                        <div className="flex flex-col sm:flex-row sm:items-end gap-2.5 p-3 rounded-xl bg-white dark:bg-[#111116] border border-zinc-200 dark:border-zinc-800">
+                          <div className="flex-1 min-w-0">
+                            <label className="text-[10px] font-medium text-zinc-500 flex items-center gap-1 mb-1">
+                              <MapPin className="w-3 h-3 text-violet-500" />
+                              Mounted Room (Auto-Positions Camera Inside Room)
+                            </label>
+                            <select
+                              disabled={!canEdit}
+                              value={activeRoom?.id ?? ''}
+                              onChange={(e) => {
+                                if (e.target.value) snapCameraToRoom(activeCam.id, e.target.value);
+                              }}
+                              className="w-full px-3 py-1.5 text-xs rounded-xl bg-zinc-50 dark:bg-[#17171F] border border-zinc-200 dark:border-zinc-700 disabled:opacity-60"
+                            >
+                              {scene.rooms.map((rm) => {
+                                const fl = scene.floors.find((f) => f.id === rm.floorId);
+                                return (
+                                  <option key={rm.id} value={rm.id}>
+                                    {fl?.code ?? rm.floorId} · {rm.code} — {rm.name}
+                                  </option>
+                                );
+                              })}
+                            </select>
+                          </div>
+                          {activeRoom && canEdit && (
+                            <button
+                              type="button"
+                              onClick={() => snapCameraToRoom(activeCam.id, activeRoom.id)}
+                              className="px-3 py-1.5 rounded-xl bg-violet-600/15 hover:bg-violet-600 hover:text-white text-violet-500 text-[11px] font-semibold whitespace-nowrap transition-colors"
+                            >
+                              Re-Center Aim
+                            </button>
+                          )}
                         </div>
 
                         {/* X, Y, Z Mount Coordinates */}

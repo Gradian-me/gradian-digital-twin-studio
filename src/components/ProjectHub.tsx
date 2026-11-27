@@ -4,17 +4,21 @@ import {
   AlertTriangle,
   ArrowRight,
   Building2,
+  CalendarClock,
   CheckCircle2,
   Cloud,
   Compass,
   ExternalLink,
+  FileText,
   FileUp,
+  Flame,
   FolderOpen,
   Layers,
   LayoutGrid,
   Moon,
   Plus,
   Search,
+  Server,
   ShieldAlert,
   Sparkles,
   Sun,
@@ -25,11 +29,19 @@ import {
 } from 'lucide-react';
 import { useTwinStore } from '../store/useTwinStore';
 import { useTelemetryStore } from '../store/useTelemetryStore';
+import { useGmpStore } from '../store/useGmpStore';
+import { getRpnPriority, useRiskIncidentStore } from '../store/useRiskIncidentStore';
+import { navigateToRiskTarget } from './RiskFmeaCenter';
 import { useAuth } from '../context/AuthContext';
 import { MiniSparkline } from './TelemetryDashboard';
 import { UserAvatarMenu } from './UserAvatarMenu';
 import { METRIC_PRESETS, type SensorDefinition } from '../types/telemetry';
 import type { DigitalTwinScene } from '../types/twin';
+import {
+  normalizeVectorsToPlan,
+  parseAsciiDxf,
+  parseSvgPlan,
+} from '../utils/cadPlanParser';
 
 const HERO_IMG = '/src/assets/images/cinnagen_campus_aerial_1795410615873.jpg';
 const CLEANROOM_IMG = '/src/assets/images/aseptic_cleanroom_suite_1795410616007.jpg';
@@ -113,6 +125,9 @@ export const ProjectHub: React.FC = () => {
   const deleteSavedProject = useTwinStore((s) => s.deleteSavedProject);
   const importProjectJSON = useTwinStore((s) => s.importProjectJSON);
   const addReferencePlan = useTwinStore((s) => s.addReferencePlan);
+  const importCadOcrPlan = useTwinStore((s) => s.importCadOcrPlan);
+  const openCadOcrForReference = useTwinStore((s) => s.openCadOcrForReference);
+  const setShowCadOcrModal = useTwinStore((s) => s.setShowCadOcrModal);
   const setLeftTab = useTwinStore((s) => s.setLeftTab);
   const setRightTab = useTwinStore((s) => s.setRightTab);
   const setRightPanelOpen = useTwinStore((s) => s.setRightPanelOpen);
@@ -122,6 +137,7 @@ export const ProjectHub: React.FC = () => {
   const setShowModelsGallery = useTwinStore((s) => s.setShowModelsGallery);
   const setShowQuickSearch = useTwinStore((s) => s.setShowQuickSearch);
   const setShowMayaChat = useTwinStore((s) => s.setShowMayaChat);
+  const openDataCenterPage = useTwinStore((s) => s.openDataCenterPage);
   const drillInto = useTwinStore((s) => s.drillInto);
   const showToast = useTwinStore((s) => s.showToast);
 
@@ -130,11 +146,19 @@ export const ProjectHub: React.FC = () => {
   const streamRunning = useTelemetryStore((s) => s.streamRunning);
   const openDashboard = useTelemetryStore((s) => s.openDashboard);
   const buildTelemetryTabUrl = useTelemetryStore((s) => s.buildTelemetryTabUrl);
+  const openResourceSchedulingModal = useGmpStore((s) => s.openResourceSchedulingModal);
+
+  const riskIncidents = useRiskIncidentStore((s) => s.incidents);
+  const autoLogEnabled = useRiskIncidentStore((s) => s.autoLogEnabled);
+  const setAutoLogEnabled = useRiskIncidentStore((s) => s.setAutoLogEnabled);
+  const openRiskModal = useRiskIncidentStore((s) => s.openRiskModal);
+  const openAssetPdfModal = useRiskIncidentStore((s) => s.openAssetPdfModal);
 
   const { user, signInWithGoogle, signOut, getIdToken, error: authError } = useAuth();
   const [cloudProjects, setCloudProjects] = useState<CloudProjectSummary[]>([]);
   const [loadingCloud, setLoadingCloud] = useState(false);
   const [activeSection, setActiveSection] = useState<'overview' | 'projects' | 'templates'>('overview');
+  const [riskFilter, setRiskFilter] = useState<'all' | 'alarm' | 'drift' | 'critical-fmea' | 'auto'>('all');
   const [trendChannelIdx, setTrendChannelIdx] = useState(0);
   const [newName, setNewName] = useState('');
   const [showBlankForm, setShowBlankForm] = useState(false);
@@ -193,12 +217,23 @@ export const ProjectHub: React.FC = () => {
     const criticalValidation = validationIssues.filter((v) => v.severity === 'error').length;
     const warnValidation = validationIssues.filter((v) => v.severity === 'warning').length;
 
+    const openAlarmsCount =
+      alarmSensors.length +
+      riskIncidents.filter((i) => i.kind === 'alarm' && (i.status === 'open' || i.status === 'investigating')).length;
+    const openDriftsCount =
+      warnSensors.length +
+      riskIncidents.filter((i) => i.kind === 'drift' && (i.status === 'open' || i.status === 'investigating')).length;
+    const criticalFmeaCount = riskIncidents.filter(
+      (i) => i.rpn >= 200 && (i.status === 'open' || i.status === 'investigating')
+    ).length;
+
     const penalty =
-      alarmSensors.length * 14 +
-      warnSensors.length * 5 +
-      criticalValidation * 6 +
+      openAlarmsCount * 8 +
+      openDriftsCount * 3 +
+      criticalFmeaCount * 4 +
+      criticalValidation * 5 +
       warnValidation * 2;
-    const complianceScore = Math.max(42, Math.min(100, 100 - penalty));
+    const complianceScore = Math.max(46, Math.min(100, 100 - penalty));
 
     // Featured key equipment sensors (Bioreactors + HPLC + Cleanroom)
     const keyEquipmentSensors: SensorDefinition[] = [];
@@ -221,12 +256,32 @@ export const ProjectHub: React.FC = () => {
       avgDp: avg(roomDp),
       alarmSensors,
       warnSensors,
+      openAlarmsCount,
+      openDriftsCount,
+      criticalFmeaCount,
       criticalValidation,
       warnValidation,
       complianceScore,
       keyEquipmentSensors,
     };
-  }, [sensors, readings, validationIssues]);
+  }, [sensors, readings, validationIssues, riskIncidents]);
+
+  const filteredRiskIncidents = useMemo(() => {
+    return riskIncidents
+      .filter((inc) => {
+        if (riskFilter === 'alarm') return inc.kind === 'alarm';
+        if (riskFilter === 'drift') return inc.kind === 'drift';
+        if (riskFilter === 'critical-fmea') return inc.rpn >= 200;
+        if (riskFilter === 'auto') return inc.source === 'auto-telemetry';
+        return true;
+      })
+      .sort((a, b) => {
+        const openA = a.status === 'open' || a.status === 'investigating' ? 1 : 0;
+        const openB = b.status === 'open' || b.status === 'investigating' ? 1 : 0;
+        if (openA !== openB) return openB - openA;
+        return b.rpn - a.rpn;
+      });
+  }, [riskIncidents, riskFilter]);
 
   const featuredTrendSensor =
     overviewMetrics.keyEquipmentSensors[trendChannelIdx % Math.max(1, overviewMetrics.keyEquipmentSensors.length)] ??
@@ -289,37 +344,174 @@ export const ProjectHub: React.FC = () => {
     e.target.value = '';
   };
 
-  const handleImportFloorPlan = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImportFloorPlan = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    e.target.value = '';
+
+    const ext = file.name.split('.').pop()?.toLowerCase() || '';
+    const baseName = file.name.replace(/\.[^.]+$/, '');
+
+    // 1. SVG vector floorplan → preserve aspect ratio, overlay reference, AND build real 3D walls immediately
+    if (ext === 'svg' || file.type === 'image/svg+xml') {
+      try {
+        const svgText = await file.text();
+        const parsed = parseSvgPlan(svgText);
+        const vb = parsed.viewBox;
+        const aspect = vb && vb.height > 0 ? vb.width / vb.height : 1.5;
+        const planW = aspect >= 1 ? 28 : Math.max(12, Number((28 * aspect).toFixed(1)));
+        const planD = aspect >= 1 ? Math.max(12, Number((28 / aspect).toFixed(1))) : 28;
+        const dataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgText)}`;
+
+        createNewProject('blank', baseName);
+        const flId = useTwinStore.getState().activeFloorId;
+        const ref = addReferencePlan({
+          floorId: flId,
+          name: file.name,
+          layerCategory: 'reference-plan',
+          dataUrl,
+          fileType: 'image/svg+xml',
+          x: 1,
+          z: 1,
+          elevation: 0,
+          width: planW,
+          depth: planD,
+          rotationDeg: 0,
+          opacity: 0.38,
+          visible: true,
+          locked: false,
+          calibrated: true,
+          layerId: 'layer-references',
+        });
+
+        const extracted = normalizeVectorsToPlan(parsed.segments, parsed.labels, planW, planD, {
+          viewBox: vb,
+          alignBox: { x: 1, z: 1, width: planW, depth: planD },
+        });
+
+        if (extracted.walls.length > 0) {
+          importCadOcrPlan(
+            {
+              sourceName: file.name,
+              replaceExisting: true,
+              footprintWidthM: Math.ceil(planW + 2),
+              footprintDepthM: Math.ceil(planD + 2),
+              wallHeightM: 3.6,
+              walls: extracted.walls,
+              rooms: extracted.rooms,
+              openings: extracted.openings,
+            },
+            { switchToViewMode: '3d-perspective' }
+          );
+          showToast(
+            `Built ${extracted.walls.length} 3D walls, ${extracted.rooms.length} zones & ${extracted.openings.length} doors directly from "${file.name}".`,
+            'success'
+          );
+        } else {
+          setViewMode('2d');
+          setLeftTab('references');
+          openCadOcrForReference(ref.id);
+          showToast(
+            'SVG contains raster/non-vector paths — opened AI Vision OCR to convert into 3D walls.',
+            'info'
+          );
+        }
+      } catch {
+        showToast('Could not parse SVG file.', 'error');
+      }
+      return;
+    }
+
+    // 2. CAD DXF / DWG → extract ASCII DXF geometry directly into 3D walls, or open OCR modal for binary DWG
+    if (ext === 'dxf' || ext === 'dwg') {
+      try {
+        const buf = await file.arrayBuffer();
+        const head = new TextDecoder('ascii').decode(buf.slice(0, 12));
+        const isBinaryDwg = /^AC10\d\d/.test(head);
+        createNewProject('blank', baseName);
+
+        if (isBinaryDwg) {
+          setShowCadOcrModal(true);
+          showToast(
+            `Detected binary AutoCAD DWG (${head.slice(0, 6)}). Export as ASCII .DXF or .SVG/.PNG and run CAD OCR to build 3D walls.`,
+            'warning'
+          );
+          return;
+        }
+
+        const dxfText = new TextDecoder('utf-8').decode(buf);
+        const parsed = parseAsciiDxf(dxfText);
+        const extracted = normalizeVectorsToPlan(parsed.segments, parsed.labels, 28, 18, {
+          alignBox: { x: 1, z: 1, width: 28, depth: 18 },
+        });
+
+        if (extracted.walls.length > 0) {
+          importCadOcrPlan(
+            {
+              sourceName: file.name,
+              replaceExisting: true,
+              footprintWidthM: 30,
+              footprintDepthM: 20,
+              wallHeightM: 3.6,
+              walls: extracted.walls,
+              rooms: extracted.rooms,
+              openings: extracted.openings,
+            },
+            { switchToViewMode: '3d-perspective' }
+          );
+          showToast(
+            `Built ${extracted.walls.length} 3D walls & ${extracted.rooms.length} rooms directly from DXF "${file.name}".`,
+            'success'
+          );
+        } else {
+          setShowCadOcrModal(true);
+          showToast('No ASCII LINE/POLYLINE wall entities detected — try CAD OCR modal.', 'warning');
+        }
+      } catch {
+        showToast('Could not parse CAD file.', 'error');
+      }
+      return;
+    }
+
+    // 3. Raster blueprint (PNG / JPG / WEBP) → preserve natural aspect ratio and launch Vision OCR
     const reader = new FileReader();
     reader.onload = () => {
-      createNewProject('blank', file.name.replace(/\.[^.]+$/, ''));
-      const flId = useTwinStore.getState().activeFloorId;
-      addReferencePlan({
-        floorId: flId,
-        name: file.name,
-        layerCategory: 'reference-plan',
-        dataUrl: String(reader.result),
-        fileType: file.type || 'image/png',
-        x: 1,
-        z: 1,
-        elevation: 0,
-        width: 28,
-        depth: 18,
-        rotationDeg: 0,
-        opacity: 0.65,
-        visible: true,
-        locked: false,
-        calibrated: false,
-        layerId: 'layer-references',
-      });
-      setViewMode('2d');
-      setLeftTab('references');
-      showToast('Floor plan imported — use Calibrate Scale to set real-world dimensions.', 'info');
+      const dataUrl = String(reader.result);
+      const probe = new Image();
+      const finalizeRaster = (natW: number, natH: number) => {
+        const aspect = natH > 0 ? natW / natH : 1.5;
+        const planW = aspect >= 1 ? 28 : Math.max(12, Number((28 * aspect).toFixed(1)));
+        const planD = aspect >= 1 ? Math.max(12, Number((28 / aspect).toFixed(1))) : 28;
+        createNewProject('blank', baseName);
+        const flId = useTwinStore.getState().activeFloorId;
+        const ref = addReferencePlan({
+          floorId: flId,
+          name: file.name,
+          layerCategory: 'reference-plan',
+          dataUrl,
+          fileType: file.type || 'image/png',
+          x: 1,
+          z: 1,
+          elevation: 0,
+          width: planW,
+          depth: planD,
+          rotationDeg: 0,
+          opacity: 0.6,
+          visible: true,
+          locked: false,
+          calibrated: false,
+          layerId: 'layer-references',
+        });
+        setViewMode('2d');
+        setLeftTab('references');
+        openCadOcrForReference(ref.id);
+        showToast('Blueprint loaded — click "Run AI Vision OCR" to extrude real 3D walls & rooms.', 'info');
+      };
+      probe.onload = () => finalizeRaster(probe.naturalWidth || 28, probe.naturalHeight || 18);
+      probe.onerror = () => finalizeRaster(28, 18);
+      probe.src = dataUrl;
     };
     reader.readAsDataURL(file);
-    e.target.value = '';
   };
 
   const startGuidedWorkflow = () => {
@@ -369,6 +561,13 @@ export const ProjectHub: React.FC = () => {
               {item.label}
             </button>
           ))}
+          <button
+            onClick={() => openDataCenterPage()}
+            className="px-3.5 py-1.5 rounded-xl text-zinc-600 dark:text-zinc-300 hover:text-violet-600 dark:hover:text-violet-300 whitespace-nowrap transition-colors flex items-center gap-1.5"
+          >
+            <Server className="w-3.5 h-3.5 text-violet-500" />
+            Data Center &amp; IT
+          </button>
           <button
             onClick={() => setShowModelsGallery(true)}
             className="px-3.5 py-1.5 rounded-xl text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white whitespace-nowrap transition-colors"
@@ -429,8 +628,15 @@ export const ProjectHub: React.FC = () => {
           </button>
         ))}
         <button
+          onClick={() => openDataCenterPage()}
+          className="px-3 py-1.5 rounded-xl text-xs font-medium bg-zinc-100 dark:bg-[#191922] text-violet-500 whitespace-nowrap shrink-0 flex items-center gap-1"
+        >
+          <Server className="w-3.5 h-3.5" />
+          Data Center &amp; IT
+        </button>
+        <button
           onClick={() => openDashboard({ tab: 'trends' })}
-          className="px-3 py-1.5 rounded-xl text-xs font-medium bg-zinc-100 dark:bg-[#191922] text-amber-500 whitespace-nowrap"
+          className="px-3 py-1.5 rounded-xl text-xs font-medium bg-zinc-100 dark:bg-[#191922] text-amber-500 whitespace-nowrap shrink-0"
         >
           Live Telemetry
         </button>
@@ -461,15 +667,29 @@ export const ProjectHub: React.FC = () => {
 
                 <div className="flex flex-wrap items-center gap-2">
                   <button
+                    onClick={() => openResourceSchedulingModal(null)}
+                    className="flex items-center gap-1.5 h-9 px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#15151C] hover:border-violet-500 text-xs font-medium whitespace-nowrap transition-colors cursor-pointer"
+                  >
+                    <CalendarClock className="w-3.5 h-3.5 text-violet-500" />
+                    Resource Scheduling
+                  </button>
+                  <button
+                    onClick={() => openDataCenterPage()}
+                    className="flex items-center gap-1.5 h-9 px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#15151C] hover:border-violet-500 text-xs font-medium whitespace-nowrap transition-colors cursor-pointer"
+                  >
+                    <Server className="w-3.5 h-3.5 text-violet-500" />
+                    Data Center &amp; IT Network
+                  </button>
+                  <button
                     onClick={() => openDashboard({ tab: 'trends' })}
-                    className="flex items-center gap-1.5 h-9 px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#15151C] hover:border-violet-500 text-xs font-medium transition-colors"
+                    className="flex items-center gap-1.5 h-9 px-3.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#15151C] hover:border-violet-500 text-xs font-medium whitespace-nowrap transition-colors cursor-pointer"
                   >
                     <Activity className="w-3.5 h-3.5 text-amber-500" />
                     Telemetry Console
                   </button>
                   <button
                     onClick={openCinnaGenDemo}
-                    className="flex items-center gap-1.5 h-9 px-4 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold transition-colors shadow-sm"
+                    className="flex items-center gap-1.5 h-9 px-4 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold whitespace-nowrap transition-colors shadow-sm cursor-pointer"
                   >
                     Launch 3D Studio
                     <ArrowRight className="w-3.5 h-3.5" />
@@ -495,49 +715,45 @@ export const ProjectHub: React.FC = () => {
                   <div className="py-1">
                     <ComplianceRadialGauge
                       score={overviewMetrics.complianceScore}
-                      alarms={overviewMetrics.alarmSensors.length}
-                      warnings={overviewMetrics.warnSensors.length + overviewMetrics.warnValidation}
+                      alarms={overviewMetrics.openAlarmsCount}
+                      warnings={overviewMetrics.openDriftsCount + overviewMetrics.warnValidation}
                     />
                   </div>
 
                   <div className="grid grid-cols-3 gap-2 text-center">
                     <div className="p-2.5 rounded-2xl bg-zinc-50 dark:bg-[#191922] border border-zinc-200/70 dark:border-zinc-800/70">
                       <div className="font-mono tabular-nums text-base font-bold text-rose-500">
-                        {overviewMetrics.alarmSensors.length}
+                        {overviewMetrics.openAlarmsCount}
                       </div>
                       <div className="text-[10.5px] text-zinc-500">Alarms</div>
                     </div>
                     <div className="p-2.5 rounded-2xl bg-zinc-50 dark:bg-[#191922] border border-zinc-200/70 dark:border-zinc-800/70">
                       <div className="font-mono tabular-nums text-base font-bold text-amber-500">
-                        {overviewMetrics.warnSensors.length}
+                        {overviewMetrics.openDriftsCount}
                       </div>
                       <div className="text-[10.5px] text-zinc-500">Drifts</div>
                     </div>
                     <div className="p-2.5 rounded-2xl bg-zinc-50 dark:bg-[#191922] border border-zinc-200/70 dark:border-zinc-800/70">
                       <div className="font-mono tabular-nums text-base font-bold text-violet-500">
-                        {validationIssues.length}
+                        {overviewMetrics.criticalFmeaCount}
                       </div>
-                      <div className="text-[10.5px] text-zinc-500">Spatial Risks</div>
+                      <div className="text-[10.5px] text-zinc-500">FMEA ≥200</div>
                     </div>
                   </div>
 
                   <div className="grid grid-cols-2 gap-2">
                     <button
-                      onClick={() => {
-                        openCinnaGenDemo();
-                        setRightTab('validation');
-                        setRightPanelOpen(true);
-                      }}
-                      className="h-9 px-3 rounded-xl border border-zinc-200 dark:border-zinc-800 hover:border-violet-500 text-xs font-medium text-zinc-700 dark:text-zinc-200 transition-colors"
+                      onClick={() => openRiskModal({ mode: 'create' })}
+                      className="h-9 px-3 rounded-xl border border-zinc-200 dark:border-zinc-800 hover:border-violet-500 text-xs font-medium text-zinc-700 dark:text-zinc-200 transition-colors cursor-pointer"
                     >
-                      Inspect Risks
+                      + Log FMEA Risk
                     </button>
                     <button
                       onClick={() => {
                         openCinnaGenDemo();
                         setShowMayaChat(true);
                       }}
-                      className="h-9 px-3 rounded-xl bg-violet-500/15 hover:bg-violet-600 text-violet-600 dark:text-violet-300 hover:text-white text-xs font-semibold transition-colors"
+                      className="h-9 px-3 rounded-xl bg-violet-500/15 hover:bg-violet-600 text-violet-600 dark:text-violet-300 hover:text-white text-xs font-semibold transition-colors cursor-pointer"
                     >
                       Ask Maya AI
                     </button>
@@ -732,6 +948,199 @@ export const ProjectHub: React.FC = () => {
               </div>
             </section>
 
+            {/* LIVE ALARMS, DRIFTS & FMEA RISK PRIORITY REGISTER */}
+            <section className="rounded-3xl border border-zinc-200 dark:border-zinc-800/80 bg-white dark:bg-[#121216] overflow-hidden">
+              <div className="px-5 sm:px-6 py-4 border-b border-zinc-200 dark:border-zinc-800/80 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-xs font-medium text-amber-600 dark:text-amber-400">
+                    <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
+                    <span>Automated Incident Logging · FMEA Risk Priority (RPN = S × O × D)</span>
+                  </div>
+                  <h2 className="text-base sm:text-lg font-bold text-zinc-900 dark:text-white mt-0.5">
+                    Active Alarms, Live Drifts &amp; FMEA Register
+                  </h2>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#181821] text-xs text-zinc-700 dark:text-zinc-300 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={autoLogEnabled}
+                      onChange={(e) => setAutoLogEnabled(e.target.checked)}
+                      className="accent-violet-600 rounded"
+                    />
+                    <span>Auto-Log Telemetry</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => openRiskModal({ mode: 'heatmap' })}
+                    className="h-9 px-3 rounded-xl border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Flame className="w-3.5 h-3.5" />
+                    Risk Heatmap (S×O)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openAssetPdfModal(null)}
+                    className="h-9 px-3 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#181821] hover:border-violet-500 text-zinc-800 dark:text-zinc-200 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <FileText className="w-3.5 h-3.5 text-violet-500" />
+                    Asset PDF Report
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openRiskModal({ mode: 'create' })}
+                    className="h-9 px-3.5 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    Add Risk / FMEA
+                  </button>
+                </div>
+              </div>
+
+              {/* Filter Strip */}
+              <div className="px-5 sm:px-6 py-2.5 border-b border-zinc-200/70 dark:border-zinc-800/70 bg-zinc-50/70 dark:bg-[#15151C] flex items-center gap-2 overflow-x-auto">
+                {(
+                  [
+                    { id: 'all', label: `All (${riskIncidents.length})` },
+                    { id: 'alarm', label: `Alarms (${riskIncidents.filter((i) => i.kind === 'alarm').length})` },
+                    { id: 'drift', label: `Drifts (${riskIncidents.filter((i) => i.kind === 'drift').length})` },
+                    { id: 'critical-fmea', label: `Critical RPN ≥200 (${riskIncidents.filter((i) => i.rpn >= 200).length})` },
+                    { id: 'auto', label: `Auto-Logged (${riskIncidents.filter((i) => i.source === 'auto-telemetry').length})` },
+                  ] as const
+                ).map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    onClick={() => setRiskFilter(f.id)}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
+                      riskFilter === f.id
+                        ? 'bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900'
+                        : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white hover:bg-zinc-200/60 dark:hover:bg-zinc-800'
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Ranked Incident & FMEA Rows */}
+              <div className="divide-y divide-zinc-200/70 dark:divide-zinc-800/80">
+                {filteredRiskIncidents.length === 0 ? (
+                  <div className="px-6 py-8 text-center text-sm text-zinc-500">
+                    No matching alarms, drifts, or FMEA risks in this view.
+                  </div>
+                ) : (
+                  filteredRiskIncidents.map((inc) => {
+                    const prio = getRpnPriority(inc.rpn);
+                    return (
+                      <div
+                        key={inc.id}
+                        className="px-5 sm:px-6 py-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4 hover:bg-zinc-50/70 dark:hover:bg-[#171720] transition-colors"
+                      >
+                        <div className="min-w-0 flex-1 space-y-1">
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] font-mono text-zinc-500 dark:text-zinc-400">
+                            <span className="font-semibold text-zinc-900 dark:text-zinc-100">{inc.code}</span>
+                            <span>·</span>
+                            <span
+                              className={
+                                inc.kind === 'alarm'
+                                  ? 'text-rose-500 font-semibold'
+                                  : inc.kind === 'drift'
+                                    ? 'text-amber-500 font-semibold'
+                                    : 'text-violet-500 font-semibold'
+                              }
+                            >
+                              {inc.kind === 'alarm' ? 'ALARM' : inc.kind === 'drift' ? 'DRIFT' : inc.kind === 'fmea-risk' ? 'FMEA RISK' : 'GMP DEV'}
+                            </span>
+                            <span>·</span>
+                            <span className="capitalize">{inc.status}</span>
+                            <span>·</span>
+                            <span className="text-zinc-700 dark:text-zinc-300 font-medium">
+                              {inc.targetCode} · {inc.targetName}
+                            </span>
+                            {inc.source === 'auto-telemetry' && (
+                              <>
+                                <span>·</span>
+                                <span className="text-emerald-600 dark:text-emerald-400">Auto-Logged</span>
+                              </>
+                            )}
+                          </div>
+
+                          <div className="text-sm font-semibold text-zinc-900 dark:text-white leading-snug">
+                            {inc.title}
+                          </div>
+
+                          <div className="text-xs text-zinc-600 dark:text-zinc-400 flex flex-wrap items-center gap-x-3 gap-y-1">
+                            {inc.currentValueLabel && (
+                              <span className="font-mono font-medium text-amber-600 dark:text-amber-400">
+                                {inc.currentValueLabel}
+                              </span>
+                            )}
+                            <span className="truncate max-w-xl">{inc.failureMode}</span>
+                            {inc.linkedWorkOrderId && (
+                              <span className="font-mono text-emerald-600 dark:text-emerald-400">
+                                CAPA {inc.linkedWorkOrderId}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* FMEA RPN Score + Navigation & AI Resolve Actions */}
+                        <div className="flex flex-wrap items-center justify-between lg:justify-end gap-3 shrink-0">
+                          <div className="text-left lg:text-right pr-1">
+                            <div className={`font-mono tabular-nums text-base font-bold leading-none ${prio.textClass}`}>
+                              RPN {inc.rpn}
+                            </div>
+                            <div className="font-mono tabular-nums text-[10.5px] text-zinc-500 mt-1">
+                              S:{inc.severity} · O:{inc.occurrence} · D:{inc.detection} ({prio.label})
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => navigateToRiskTarget(inc, '3d')}
+                              className="min-h-[36px] px-2.5 rounded-xl border border-zinc-200 dark:border-zinc-700 hover:border-violet-500 text-xs font-medium text-zinc-800 dark:text-zinc-100 cursor-pointer"
+                              title="Focus target in 3D Digital Twin"
+                            >
+                              3D
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => navigateToRiskTarget(inc, '2d')}
+                              className="min-h-[36px] px-2.5 rounded-xl border border-zinc-200 dark:border-zinc-700 hover:border-violet-500 text-xs font-medium text-zinc-800 dark:text-zinc-100 cursor-pointer"
+                              title="Focus target in 2D Floor Plan"
+                            >
+                              2D
+                            </button>
+                            {(inc.sensorId || inc.targetKind === 'asset' || inc.targetKind === 'room') && (
+                              <button
+                                type="button"
+                                onClick={() => navigateToRiskTarget(inc, 'telemetry')}
+                                className="min-h-[36px] px-2.5 rounded-xl border border-zinc-200 dark:border-zinc-700 hover:border-emerald-500 text-xs font-medium text-zinc-800 dark:text-zinc-100 cursor-pointer"
+                                title="Open live telemetry trends"
+                              >
+                                Trends
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => openRiskModal({ mode: 'resolve', incidentId: inc.id })}
+                              className="min-h-[36px] px-3 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                            >
+                              <Sparkles className="w-3.5 h-3.5" />
+                              {inc.aiResolution ? 'AI CAPA' : 'AI Resolve'}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </section>
+
             {/* FEATURED DIGITAL TWIN CAMPUS LAUNCH CARD */}
             <section className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-stretch">
               <div className="lg:col-span-5 flex flex-col justify-between bg-white dark:bg-[#121216] border border-zinc-200 dark:border-zinc-800/80 rounded-3xl p-6">
@@ -835,7 +1244,29 @@ export const ProjectHub: React.FC = () => {
         )}
 
         {/* Quick Dashboards & Launchers Strip */}
-        <section className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3.5">
+        <section className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 gap-3.5">
+          <button
+            onClick={() => openResourceSchedulingModal(null)}
+            className="text-left p-4 rounded-2xl bg-white dark:bg-[#121216] border border-violet-500/35 hover:border-violet-500 transition-colors cursor-pointer"
+          >
+            <CalendarClock className="w-5 h-5 text-violet-500 mb-2.5" />
+            <div className="text-sm font-semibold text-zinc-900 dark:text-white">Zone Scheduling</div>
+            <p className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1">
+              Assign personnel &amp; GMP assets to zones gated by live telemetry.
+            </p>
+          </button>
+
+          <button
+            onClick={() => openDataCenterPage()}
+            className="text-left p-4 rounded-2xl bg-white dark:bg-[#121216] border border-violet-500/35 hover:border-violet-500 transition-colors cursor-pointer"
+          >
+            <Server className="w-5 h-5 text-violet-500 mb-2.5" />
+            <div className="text-sm font-semibold text-zinc-900 dark:text-white">Data Center &amp; IT</div>
+            <p className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1">
+              Dedicated 42U rack, fiber/copper port, VLAN &amp; PDU designer.
+            </p>
+          </button>
+
           <button
             onClick={() => {
               openCinnaGenDemo();
@@ -882,7 +1313,7 @@ export const ProjectHub: React.FC = () => {
             <LayoutGrid className="w-5 h-5 text-amber-400 mb-2.5" />
             <div className="text-sm font-semibold text-zinc-900 dark:text-white">3D Models Gallery</div>
             <p className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1">
-              Inspect 55+ interactive PBR biopharma &amp; lab 3D equipment models.
+              Inspect 60+ interactive PBR biopharma, safety &amp; cold-room models.
             </p>
           </button>
 
@@ -891,9 +1322,9 @@ export const ProjectHub: React.FC = () => {
             className="text-left p-4 rounded-2xl bg-white dark:bg-[#121216] border border-zinc-200 dark:border-zinc-800/80 hover:border-violet-500 transition-colors"
           >
             <Upload className="w-5 h-5 text-zinc-500 dark:text-zinc-300 mb-2.5" />
-            <div className="text-sm font-semibold text-zinc-900 dark:text-white">Import Blueprint</div>
+            <div className="text-sm font-semibold text-zinc-900 dark:text-white">Import SVG / DWG Plan</div>
             <p className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1">
-              Overlay PNG, JPG, or SVG plan and calibrate real-world scale.
+              Build real 3D walls &amp; rooms directly from SVG, DXF, DWG, or blueprint image.
             </p>
           </button>
 
@@ -909,7 +1340,7 @@ export const ProjectHub: React.FC = () => {
           </button>
 
           <input ref={jsonInputRef} type="file" accept=".json" className="hidden" onChange={handleImportJSON} />
-          <input ref={planInputRef} type="file" accept="image/png,image/jpeg,image/svg+xml" className="hidden" onChange={handleImportFloorPlan} />
+          <input ref={planInputRef} type="file" accept=".svg,.dxf,.dwg,image/png,image/jpeg,image/webp,image/svg+xml" className="hidden" onChange={handleImportFloorPlan} />
         </section>
 
         {/* Industry Templates */}
