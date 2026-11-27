@@ -23,6 +23,7 @@ import { ModelsGalleryModal } from './components/ModelsGalleryModal';
 import { GlobalQuickSearch } from './components/GlobalQuickSearch';
 import { TelemetryDashboard } from './components/TelemetryDashboard';
 import { MayaChatDrawer } from './components/MayaChatDrawer';
+import { MayaLifePage } from './components/MayaLifePage';
 import { CameraManagerModal } from './components/CameraManagerModal';
 import { DataCenterDesignerPage, NetworkRackDesignerModal } from './components/NetworkRackDesignerModal';
 import { SaveValidationModal } from './components/SaveValidationModal';
@@ -40,6 +41,8 @@ import { AssetCompliancePdfModal } from './components/AssetCompliancePdfModal';
 import { useTelemetryStore } from './store/useTelemetryStore';
 import { useGmpStore } from './store/useGmpStore';
 import { useRiskIncidentStore } from './store/useRiskIncidentStore';
+import { useAclStore, canCurrentUserEditSpatial } from './store/useAclStore';
+import { useAppRouter } from './utils/appRouter';
 
 const WorkspaceShell: React.FC = () => {
   const screen = useTwinStore((s) => s.screen);
@@ -59,6 +62,18 @@ const WorkspaceShell: React.FC = () => {
   const autoSaveEnabled = useTwinStore((s) => s.autoSaveEnabled);
   const streamRunning = useTelemetryStore((s) => s.streamRunning);
   const telemetryLastUpdated = useTelemetryStore((s) => s.serverTime);
+  const workspaceMode = useTwinStore((s) => s.workspaceMode);
+  const aclUsers = useAclStore((s) => s.users);
+  const aclRoles = useAclStore((s) => s.roles);
+  const aclGroups = useAclStore((s) => s.groups);
+  const activeAclUserId = useAclStore((s) => s.activeAclUserId);
+
+  // Enforce strict ACL read-only lock: immediately downgrade to View mode if active ACL user lacks spatial.edit
+  useEffect(() => {
+    if (workspaceMode === 'design' && !canCurrentUserEditSpatial()) {
+      useTwinStore.setState({ workspaceMode: 'view', activeTool: 'select', editingFlowId: null });
+    }
+  }, [workspaceMode, aclUsers, aclRoles, aclGroups, activeAclUserId]);
 
   // Detect dedicated new-tab Telemetry Dashboard mode (?mode=telemetry)
   const isStandaloneTelemetry = (() => {
@@ -68,6 +83,9 @@ const WorkspaceShell: React.FC = () => {
       return false;
     }
   })();
+
+  // Synchronize screens, floors, and dialogs with browser history routes (Back never exits app)
+  useAppRouter(isStandaloneTelemetry);
 
   // Sync dark/light class on <html>
   useEffect(() => {
@@ -330,6 +348,8 @@ const WorkspaceShell: React.FC = () => {
         <ProjectHub />
       ) : screen === 'datacenter' ? (
         <DataCenterDesignerPage />
+      ) : screen === 'maya-life' ? (
+        <MayaLifePage />
       ) : (
         <>
           {/* Dedicated Mobile Viewer-First Shell (< md) */}
@@ -489,9 +509,9 @@ const WorkspaceShell: React.FC = () => {
       <RiskFmeaModal />
       <AssetCompliancePdfModal />
 
-      {/* Global Toast Notification with optional Undo */}
+      {/* Global Toast Notification (top-center, clear of menus & bottom hover cards) */}
       {toast && (
-        <div className="fixed bottom-12 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 rounded-2xl shadow-2xl border bg-[#14141A] text-zinc-100 border-zinc-800 flex items-center gap-3 text-xs max-w-md">
+        <div className="fixed top-14 left-1/2 -translate-x-1/2 z-[70] px-3.5 py-2 rounded-2xl shadow-2xl border bg-[#14141A]/95 backdrop-blur-md text-zinc-100 border-zinc-700/90 flex items-center gap-2.5 text-xs max-w-[min(92vw,420px)] pointer-events-auto">
           <span
             className={`w-2 h-2 rounded-full shrink-0 ${
               toast.tone === 'error'

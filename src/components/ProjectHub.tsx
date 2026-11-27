@@ -3,6 +3,7 @@ import {
   Activity,
   AlertTriangle,
   ArrowRight,
+  Bot,
   Building2,
   CalendarClock,
   CheckCircle2,
@@ -137,6 +138,7 @@ export const ProjectHub: React.FC = () => {
   const setShowModelsGallery = useTwinStore((s) => s.setShowModelsGallery);
   const setShowQuickSearch = useTwinStore((s) => s.setShowQuickSearch);
   const setShowMayaChat = useTwinStore((s) => s.setShowMayaChat);
+  const setScreen = useTwinStore((s) => s.setScreen);
   const openDataCenterPage = useTwinStore((s) => s.openDataCenterPage);
   const drillInto = useTwinStore((s) => s.drillInto);
   const showToast = useTwinStore((s) => s.showToast);
@@ -594,10 +596,19 @@ export const ProjectHub: React.FC = () => {
               openCinnaGenDemo();
               setShowMayaChat(true);
             }}
-            className="hidden sm:flex items-center gap-1.5 h-9 px-3.5 rounded-xl gradian-violet-amber text-white text-xs font-semibold shadow-sm hover:opacity-95 transition-opacity whitespace-nowrap"
+            className="hidden sm:flex items-center gap-1.5 h-9 px-3.5 rounded-xl gradian-violet-amber text-white text-xs font-semibold shadow-sm hover:opacity-95 transition-opacity whitespace-nowrap cursor-pointer"
           >
             <Sparkles className="w-3.5 h-3.5" />
             Maya AI
+          </button>
+
+          <button
+            onClick={() => setScreen('maya-life')}
+            className="flex items-center gap-1.5 h-9 px-3 rounded-xl border border-violet-500/40 bg-violet-500/12 hover:bg-violet-500/20 text-violet-700 dark:text-violet-300 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer"
+            title="Open MAYA Life 3D Companion & SOP Studio"
+          >
+            <Bot className="w-3.5 h-3.5" />
+            <span className="hidden md:inline">MAYA Life</span>
           </button>
 
           <button

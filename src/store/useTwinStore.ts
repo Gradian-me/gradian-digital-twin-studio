@@ -25,6 +25,7 @@ import type {
   ReferencePlan,
   Room,
   RoomHvacConfig,
+  RoomLightingConfig,
   SceneCamera,
   SnapConfig,
   SpaceTypeTemplate,
@@ -40,6 +41,7 @@ import type {
   WorkspaceMode,
 } from '../types/twin';
 import { getEffectiveRoomHvac } from '../utils/hvac';
+import { SMART_ROOM_TEMPLATES } from '../data/smartRoomTemplates';
 import {
   createCinnaGenCampusScene,
   createTemplateScene,
@@ -377,7 +379,7 @@ export interface CadOcrPlanPayload {
 
 interface TwinState {
   // App-level mode
-  screen: 'hub' | 'workspace' | 'datacenter';
+  screen: 'hub' | 'workspace' | 'datacenter' | 'maya-life';
   theme: 'dark' | 'light';
   canvasBackdrop: 'dark' | 'light';
   savedProjects: DigitalTwinScene[];
@@ -503,9 +505,19 @@ interface TwinState {
   // Universal Entity Info Dialog & WebXR VR Immersion state
   entityInfoTarget: EntityInfoTarget;
   entityInfoAutoEligibility: boolean;
+  entityInfoInitialTab: 'overview' | 'history' | 'relations' | 'risks' | 'sops' | 'fire' | null;
   vrSessionActive: boolean;
   vrMode: 'off' | 'webxr' | 'stereo-preview';
   vrToggleNonce: number;
+
+  // Global Voice Command 3D Highlights
+  voiceHighlightIds: string[];
+  voiceHighlightBanner: {
+    title: string;
+    subtitle: string;
+    kind: 'asset' | 'room';
+    matchedIds: string[];
+  } | null;
 
   // IT Port & Cable End-to-End Trace Overlay (2D & 3D)
   activeNetworkTrace: NetworkTraceOverlay | null;
@@ -526,7 +538,7 @@ interface TwinState {
   toast: ToastNotice | null;
 
   // Actions
-  setScreen: (screen: 'hub' | 'workspace' | 'datacenter') => void;
+  setScreen: (screen: 'hub' | 'workspace' | 'datacenter' | 'maya-life') => void;
   openDataCenterPage: (assetId?: string | null) => void;
   toggleTheme: () => void;
   toggleCanvasBackdrop: () => void;
@@ -653,8 +665,10 @@ interface TwinState {
   duplicateSelected: () => void;
 
   addRoom: (x: number, z: number, width: number, depth: number, spaceTypeId?: string, customName?: string) => Room;
+  addSmartRoomFromTemplate: (templateId: string, dropX?: number, dropZ?: number) => Room | null;
   updateRoom: (id: string, patch: Partial<Room>) => void;
   updateRoomHvac: (roomId: string, patch: Partial<RoomHvacConfig>) => void;
+  updateRoomLighting: (roomId: string, lighting: RoomLightingConfig) => void;
 
   addWall: (x1: number, z1: number, x2: number, z2: number, presetId?: WallPresetId) => Wall;
   updateWall: (id: string, patch: Partial<Wall>) => void;
@@ -742,8 +756,16 @@ interface TwinState {
   clearPendingAIActions: () => void;
 
   // Entity Info Dialog & WebXR VR Immersion
-  openEntityInfo: (target: NonNullable<EntityInfoTarget>, opts?: { autoEligibility?: boolean }) => void;
+  openEntityInfo: (
+    target: NonNullable<EntityInfoTarget>,
+    opts?: { autoEligibility?: boolean; initialTab?: 'overview' | 'history' | 'relations' | 'risks' | 'sops' | 'fire' }
+  ) => void;
   closeEntityInfo: () => void;
+  setVoiceHighlight: (
+    ids: string[],
+    banner?: { title: string; subtitle: string; kind: 'asset' | 'room' } | null
+  ) => void;
+  clearVoiceHighlight: () => void;
   requestVrToggle: () => void;
   setVrSessionState: (active: boolean, mode: 'off' | 'webxr' | 'stereo-preview') => void;
 
@@ -860,7 +882,7 @@ export const useTwinStore = create<TwinState>((set, get) => {
     showAllFloors: false,
     renderStyle: 'realistic',
 
-    workspaceMode: 'design',
+    workspaceMode: 'view',
     categoryFilter: 'all',
     viewMode: '3d-perspective',
     orthoPreset: 'isometric',
@@ -968,6 +990,9 @@ export const useTwinStore = create<TwinState>((set, get) => {
     aiPreviewMessage: null,
     entityInfoTarget: null,
     entityInfoAutoEligibility: false,
+    entityInfoInitialTab: null,
+    voiceHighlightIds: [],
+    voiceHighlightBanner: null,
     vrSessionActive: false,
     vrMode: 'off',
     vrToggleNonce: 0,
@@ -1240,7 +1265,20 @@ export const useTwinStore = create<TwinState>((set, get) => {
       });
     },
 
-    setWorkspaceMode: (workspaceMode) =>
+    setWorkspaceMode: (workspaceMode) => {
+      if (workspaceMode === 'design' && !canCurrentUserEditSpatial()) {
+        set({
+          workspaceMode: 'view',
+          activeTool: 'select',
+          editingFlowId: null,
+          toast: {
+            id: `t-${Date.now()}`,
+            message: 'ACL Read-Only — your active role does not have edit permission.',
+            tone: 'warning',
+          },
+        });
+        return;
+      }
       set((s) => ({
         workspaceMode,
         activeTool: workspaceMode === 'view' ? 'select' : s.activeTool,
@@ -1249,11 +1287,12 @@ export const useTwinStore = create<TwinState>((set, get) => {
           id: `t-${Date.now()}`,
           message:
             workspaceMode === 'view'
-              ? 'View Mode enabled — all spatial editing & dragging locked'
-              : 'Design Mode enabled — full spatial editing unlocked',
+              ? 'View Mode active — spatial editing & dragging locked'
+              : 'Design Mode enabled — spatial editing unlocked',
           tone: 'info',
         },
-      })),
+      }));
+    },
     setCategoryFilter: (categoryFilter) =>
       set({
         categoryFilter,
@@ -2662,6 +2701,298 @@ export const useTwinStore = create<TwinState>((set, get) => {
       return newRoom;
     },
 
+    addSmartRoomFromTemplate: (templateId, dropX, dropZ) => {
+      const tpl = SMART_ROOM_TEMPLATES.find((t) => t.id === templateId);
+      if (!tpl) return null;
+      const { activeFloorId, scene } = get();
+      const fl = scene.floors.find((f) => f.id === activeFloorId) ?? scene.floors[0];
+      if (!fl) return null;
+
+      // Determine non-overlapping placement if dropX/dropZ omitted
+      const flRooms = scene.rooms.filter((r) => r.floorId === fl.id);
+      let x = dropX ?? 1.5;
+      let z = dropZ ?? 1.5;
+      if (dropX === undefined || dropZ === undefined) {
+        let placed = false;
+        outer: for (let tz = 1; tz <= Math.max(2, fl.depth - tpl.depth + 2); tz += 1.5) {
+          for (let tx = 1; tx <= Math.max(2, fl.width - tpl.width + 2); tx += 1.5) {
+            const overlaps = flRooms.some(
+              (r) =>
+                tx < r.x + r.width + 0.25 &&
+                tx + tpl.width + 0.25 > r.x &&
+                tz < r.z + r.depth + 0.25 &&
+                tz + tpl.depth + 0.25 > r.z
+            );
+            if (!overlaps) {
+              x = tx;
+              z = tz;
+              placed = true;
+              break outer;
+            }
+          }
+        }
+        if (!placed) {
+          const maxRight = flRooms.reduce((m, r) => Math.max(m, r.x + r.width), 0);
+          x = maxRight + 1.0;
+          z = 1.0;
+        }
+      } else {
+        x = Math.max(0.2, Number((dropX - tpl.width / 2).toFixed(2)));
+        z = Math.max(0.2, Number((dropZ - tpl.depth / 2).toFixed(2)));
+      }
+
+      const id = `rm-srt-${Date.now()}`;
+      const usedCodes = new Set(scene.rooms.map((r) => r.code));
+      let seq = 1;
+      let code = `${tpl.codePrefix}-${String(seq).padStart(2, '0')}`;
+      while (usedCodes.has(code)) {
+        seq += 1;
+        code = `${tpl.codePrefix}-${String(seq).padStart(2, '0')}`;
+      }
+
+      const today = new Date().toISOString().slice(0, 10);
+      const nextYear = new Date(Date.now() + 365 * 86400_000).toISOString().slice(0, 10);
+
+      // Build switches & lights with linked switchIds
+      const switchIdBySlot: Record<'main' | 'aux', string> = {
+        main: `sw-${id}-main`,
+        aux: `sw-${id}-aux`,
+      };
+      const switches = tpl.switches.map((sw) => ({
+        id: switchIdBySlot[sw.slot],
+        label: sw.label,
+        wallSide: sw.wallSide,
+        offsetRatio: sw.offsetRatio,
+        heightM: 1.28,
+        isOn: sw.slot === 'main',
+        dimmerPct: 100,
+      }));
+      const fixtures = tpl.lights.map((lt, idx) => ({
+        id: `fix-${id}-${idx + 1}`,
+        label: lt.label,
+        type: lt.type,
+        switchId: switchIdBySlot[lt.switchSlot] ?? switches[0]?.id ?? switchIdBySlot.main,
+        relX: lt.relX,
+        relZ: lt.relZ,
+        kelvin: lt.kelvin,
+        intensity: lt.intensity,
+      }));
+
+      const newRoom: Room = {
+        id,
+        floorId: fl.id,
+        departmentId: scene.hierarchy.find((h) => h.level === 'department')?.id ?? 'dept-1',
+        name: tpl.name,
+        code,
+        spaceTypeId: tpl.spaceTypeId,
+        category: tpl.category,
+        x: Number(x.toFixed(2)),
+        z: Number(z.toFixed(2)),
+        width: tpl.width,
+        depth: tpl.depth,
+        height: tpl.height,
+        color: tpl.roomColor,
+        floorMaterialId: tpl.floorMaterialId,
+        wallMaterialId: tpl.wallMaterialId,
+        ceilingMaterialId: tpl.ceilingMaterialId,
+        layerId: 'layer-architecture',
+        environmental: {
+          cleanroomGrade: tpl.cleanroomGrade,
+          pressurePa: tpl.pressurePa,
+          airChangesPerHour: tpl.airChangesPerHour,
+          temperatureC: tpl.temperatureC,
+          humidityPct: tpl.humidityPct,
+          monitoringRequired: true,
+          hvac: {
+            ahuId: tpl.hvac.ahuId,
+            ahuName: tpl.hvac.ahuName,
+            hepaClass: tpl.hvac.hepaClass,
+            airflowMode: tpl.hvac.airflowMode,
+            airChangesPerHour: tpl.airChangesPerHour,
+            targetPressurePa: tpl.pressurePa,
+            supplyTempC: tpl.hvac.supplyTempC,
+            damperPct: tpl.hvac.damperPct,
+            diffuserCount: tpl.hvac.diffuserCount,
+            exhaustPct: tpl.hvac.exhaustPct,
+            status: 'online',
+            systemStatus: 'online',
+            showDucts: true,
+          },
+        },
+        fireSafety: {
+          sensors: tpl.fireSensors.map((fs, i) => ({
+            ...fs,
+            id: `fs-${id}-${i + 1}`,
+            tag: `FS-${code}-${String(i + 1).padStart(2, '0')}`,
+            lastTested: today,
+            nextTestDue: nextYear,
+          })),
+          extinguishers: tpl.fireExtinguishers.map((fe, i) => ({
+            ...fe,
+            id: `fe-${id}-${i + 1}`,
+            tag: `FE-${code}-${String(i + 1).padStart(2, '0')}`,
+            lastInspection: today,
+            nextInspection: nextYear,
+          })),
+        },
+        lighting: { switches, fixtures },
+        occupancyMax: tpl.occupancyMax,
+        currentOccupancy: 1,
+        utilizationPct: 72,
+        riskLevel: tpl.riskLevel,
+        complianceStatus: 'compliant',
+        energyKw: tpl.energyKw,
+        costPerSqm: tpl.costPerSqm,
+        activeFromDate: get().timelineDate,
+        metadata: {
+          code,
+          description: tpl.tagline,
+          status: 'operational',
+          tags: ['Smart Template', tpl.category, tpl.cleanroomGrade],
+          owner: 'Facility Engineering',
+          department: tpl.category,
+          accessPermission: 'gmp-authorized',
+          createdAt: today,
+          updatedAt: today,
+          revision: 1,
+          customProperties: { Template: tpl.name, AHU: tpl.hvac.ahuId },
+          linkedDocuments: [],
+          relatedSystems: ['HVAC', 'BMS', 'Fire Safety', 'Lighting'],
+          relatedProcesses: [],
+        },
+      };
+
+      const allObjects = [...scene.customObjects, ...OBJECT_LIBRARY];
+      const spawnedAssets: SpatialAsset[] = tpl.equipment.map((eq, idx) => {
+        const lib =
+          allObjects.find((o) => o.archetype === eq.templateId || o.id === eq.templateId) ??
+          allObjects[0];
+        const ax = Number((newRoom.x + newRoom.width * eq.relX).toFixed(2));
+        const az = Number((newRoom.z + newRoom.depth * eq.relZ).toFixed(2));
+        const assetCode = `${code}-EQ${String(idx + 1).padStart(2, '0')}`;
+        return {
+          id: `ast-srt-${Date.now()}-${idx}`,
+          floorId: fl.id,
+          roomId: id,
+          templateId: lib.id,
+          archetype: lib.archetype,
+          name: eq.labelOverride || lib.name,
+          assetId: assetCode,
+          equipmentId: assetCode,
+          category: lib.category,
+          manufacturer: lib.manufacturer,
+          model: lib.model,
+          serialNumber: `SN-${code}-${1000 + idx}`,
+          description: lib.description,
+          tags: ['Smart Template', tpl.codePrefix, lib.category],
+          criticality: tpl.riskLevel === 'critical' ? 'critical' : 'high',
+          owner: 'Process Engineering',
+          department: tpl.category,
+          responsiblePerson: 'Suite Lead',
+          x: ax,
+          y: 0,
+          z: az,
+          rotationX: 0,
+          rotationY: eq.rotationY ?? 0,
+          rotationZ: 0,
+          width: lib.width,
+          depth: lib.depth,
+          height: lib.height,
+          weightKg: lib.weightKg,
+          clearanceM: lib.clearanceM,
+          materialId: lib.defaultMaterialId,
+          color: lib.defaultColor,
+          layerId: 'layer-equipment',
+          operationalStatus: 'running',
+          installationDate: today,
+          commissioningDate: today,
+          warrantyUntil: nextYear,
+          maintenanceSchedule: 'Quarterly GMP PM',
+          lastMaintenance: today,
+          nextMaintenance: nextYear,
+          capacityLabel: `${lib.energyKw} kW`,
+          utilizationPct: 78,
+          availabilityPct: 99.4,
+          conditionScore: 98,
+          lifecycle: 'operational',
+          capexUsd: lib.capexUsd,
+          annualOpexUsd: lib.annualOpexUsd,
+          energyKw: lib.energyKw,
+          connectivity: {
+            protocol: 'OPC UA',
+            endpoint: `opc.tcp://10.42.20.${10 + idx}:4840`,
+            plcTag: `PLC_${code}_${idx + 1}`,
+            scadaNode: `SCADA-${code}`,
+            historianId: `HIST-${assetCode}`,
+            liveMetrics: [],
+          },
+          documents: [],
+          qrCode: `GRADIAN:${assetCode}`,
+          relatedSystems: ['HVAC', 'EMS', 'SCADA'],
+          relatedProcesses: [tpl.name],
+        };
+      });
+
+      commit((draft) => {
+        // Expand floor slab automatically if smart room extends beyond slab
+        const targetFl = draft.floors.find((f) => f.id === fl.id);
+        if (targetFl) {
+          targetFl.width = Math.max(targetFl.width, Math.ceil(newRoom.x + newRoom.width + 2));
+          targetFl.depth = Math.max(targetFl.depth, Math.ceil(newRoom.z + newRoom.depth + 2));
+        }
+        draft.rooms.push(newRoom);
+        const roomWalls = generateWallsForRoom(newRoom, id);
+        draft.walls.push(...roomWalls);
+
+        // Place template door on the requested wall side (0=N, 1=E, 2=S, 3=W)
+        const sideIdx =
+          tpl.doorWallSide === 'north'
+            ? 0
+            : tpl.doorWallSide === 'east'
+              ? 1
+              : tpl.doorWallSide === 'south'
+                ? 2
+                : 3;
+        const doorWall = roomWalls[sideIdx] ?? roomWalls[2] ?? roomWalls[0];
+        if (doorWall) {
+          draft.openings.push({
+            id: `op-srt-${Date.now()}`,
+            floorId: fl.id,
+            wallId: doorWall.id,
+            kind: 'door',
+            subtype: tpl.doorSubtype,
+            name: `${code} Entry Door`,
+            offsetRatio: tpl.doorOffsetRatio,
+            width: tpl.doorSubtype === 'double-door' || tpl.doorSubtype === 'sliding-door' ? 1.5 : 1.1,
+            height: 2.25,
+            sillHeight: 0,
+            thickness: 0.14,
+            swingDirection: tpl.doorSubtype === 'sliding-door' ? 'slide' : 'left',
+            swingAngle: 90,
+            materialId: 'cleanroom-panel',
+            frameColor: '#3B82F6',
+            lockType: 'Interlock Badge',
+            accessControl: 'badge',
+            fireRating: '60 min',
+            status: 'closed',
+            layerId: 'layer-openings',
+          });
+        }
+
+        draft.assets.push(...spawnedAssets);
+        return draft;
+      }, `Dropped Smart Room "${tpl.name}" (${code}) with HVAC, ${tpl.fireSensors.length} fire sensors, ${spawnedAssets.length} assets & ${fixtures.length} lights`);
+
+      set({ selected: [{ type: 'room', id }] });
+      get().completeOnboardingStep(4);
+      get().focusEntity({ type: 'room', id });
+      get().showToast(
+        `Added ${tpl.name} (${code}) · ${spawnedAssets.length} assets, HVAC, ${tpl.fireSensors.length} fire sensors & ${fixtures.length} lights`,
+        'success'
+      );
+      return newRoom;
+    },
+
     updateRoom: (id, patch) => {
       commit((draft) => {
         const rm = draft.rooms.find((r) => r.id === id);
@@ -2731,6 +3062,28 @@ export const useTwinStore = create<TwinState>((set, get) => {
           entityType: 'room',
           entityId: roomId,
           summary: `Updated HVAC parameters (${Object.keys(patch).join(', ')})`,
+        }
+      );
+    },
+
+    updateRoomLighting: (roomId, lighting) => {
+      commit(
+        (draft) => {
+          const rm = draft.rooms.find((r) => r.id === roomId);
+          if (!rm) return draft;
+          rm.lighting = {
+            switches: lighting.switches.map((s) => ({ ...s })),
+            fixtures: lighting.fixtures.map((f) => ({ ...f })),
+          };
+          return draft;
+        },
+        'Updated room lighting & wall switches',
+        {
+          category: 'spatial',
+          action: 'Updated Room Lighting',
+          entityType: 'room',
+          entityId: roomId,
+          summary: `Configured ${lighting.switches.length} wall switch(es) and ${lighting.fixtures.length} fixture(s)`,
         }
       );
     },
@@ -2876,8 +3229,8 @@ export const useTwinStore = create<TwinState>((set, get) => {
       const { activeFloorId, scene, snap } = get();
       const allObjs = [...OBJECT_LIBRARY, ...scene.customObjects];
       const tpl = allObjs.find((o) => o.id === templateId) ?? allObjs[0];
-      const x = snapValue(rawX, snap.gridSize, snap.enabled && snap.snapToGrid);
-      const z = snapValue(rawZ, snap.gridSize, snap.enabled && snap.snapToGrid);
+      const x = opts?.x !== undefined ? opts.x : snapValue(rawX, snap.gridSize, snap.enabled && snap.snapToGrid);
+      const z = opts?.z !== undefined ? opts.z : snapValue(rawZ, snap.gridSize, snap.enabled && snap.snapToGrid);
 
       const hostRoom = scene.rooms.find(
         (r) =>
@@ -4195,12 +4548,26 @@ export const useTwinStore = create<TwinState>((set, get) => {
       set({
         entityInfoTarget: target,
         entityInfoAutoEligibility: Boolean(opts?.autoEligibility),
+        entityInfoInitialTab: opts?.initialTab ?? null,
       }),
 
     closeEntityInfo: () =>
       set({
         entityInfoTarget: null,
         entityInfoAutoEligibility: false,
+        entityInfoInitialTab: null,
+      }),
+
+    setVoiceHighlight: (ids, banner = null) =>
+      set({
+        voiceHighlightIds: ids,
+        voiceHighlightBanner: banner ? { ...banner, matchedIds: ids } : null,
+      }),
+
+    clearVoiceHighlight: () =>
+      set({
+        voiceHighlightIds: [],
+        voiceHighlightBanner: null,
       }),
 
     requestVrToggle: () =>

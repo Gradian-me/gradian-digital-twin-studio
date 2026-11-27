@@ -13,6 +13,8 @@ import {
   snapValue,
 } from '../utils/spatial';
 import { computeFlowRoomSequence } from '../utils/flowAnalytics';
+import { computeSnappedPlacement, type PlacementSnapResult } from '../utils/placementSnap';
+import { OBJECT_LIBRARY } from '../data/objectLibrary';
 
 export const Viewport2D: React.FC = () => {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -42,6 +44,7 @@ export const Viewport2D: React.FC = () => {
   const clearSelection = useTwinStore((s) => s.clearSelection);
   const setCursorCoords = useTwinStore((s) => s.setCursorCoords);
   const addRoom = useTwinStore((s) => s.addRoom);
+  const addSmartRoomFromTemplate = useTwinStore((s) => s.addSmartRoomFromTemplate);
   const addWall = useTwinStore((s) => s.addWall);
   const addOpeningOnWall = useTwinStore((s) => s.addOpeningOnWall);
   const addAsset = useTwinStore((s) => s.addAsset);
@@ -82,6 +85,7 @@ export const Viewport2D: React.FC = () => {
   const [activeDockSubject, setActiveDockSubject] = useState<'flows' | 'hvac' | 'fmea' | null>(null);
   const toggleDockSubject = (subj: 'flows' | 'hvac' | 'fmea') =>
     setActiveDockSubject((prev) => (prev === subj ? null : subj));
+  const [placePreview, setPlacePreview] = useState<PlacementSnapResult | null>(null);
 
   const selectedMaterialId = useTwinStore((s) => s.selectedMaterialId);
   const selectedObjectTemplateId = useTwinStore((s) => s.selectedObjectTemplateId);
@@ -387,7 +391,24 @@ export const Viewport2D: React.FC = () => {
       }
 
       if (activeTool === 'place-object') {
-        addAsset(selectedObjectTemplateId, pt.x, pt.z);
+        const allObjs = [...OBJECT_LIBRARY, ...scene.customObjects];
+        const tpl = allObjs.find((o) => o.id === selectedObjectTemplateId) ?? allObjs[0];
+        const flWalls = scene.walls.filter((w) => w.floorId === activeFloorId);
+        const snapped = computeSnappedPlacement(
+          pt.x,
+          pt.z,
+          tpl?.width ?? 1.2,
+          tpl?.depth ?? 1.0,
+          flWalls,
+          snap,
+          { floorWidth: activeFloor?.width, floorDepth: activeFloor?.depth }
+        );
+        addAsset(selectedObjectTemplateId, snapped.x, snapped.z, {
+          x: snapped.x,
+          z: snapped.z,
+          rotationY: snapped.rotationY,
+        });
+        setPlacePreview(null);
         setActiveTool('select');
         return;
       }
@@ -458,6 +479,25 @@ export const Viewport2D: React.FC = () => {
 
     const pt = screenToWorld(e.clientX, e.clientY);
     setCursorCoords({ x: pt.x, y: activeFloor?.elevation ?? 0, z: pt.z });
+
+    if (!isReadOnly && activeTool === 'place-object') {
+      const allObjs = [...OBJECT_LIBRARY, ...scene.customObjects];
+      const tpl = allObjs.find((o) => o.id === selectedObjectTemplateId) ?? allObjs[0];
+      const flWalls = scene.walls.filter((w) => w.floorId === activeFloorId);
+      setPlacePreview(
+        computeSnappedPlacement(
+          pt.x,
+          pt.z,
+          tpl?.width ?? 1.2,
+          tpl?.depth ?? 1.0,
+          flWalls,
+          snap,
+          { floorWidth: activeFloor?.width, floorDepth: activeFloor?.depth }
+        )
+      );
+    } else if (placePreview) {
+      setPlacePreview(null);
+    }
 
     if (isPanning) {
       const dx = e.clientX - panOriginRef.current.mx;
@@ -605,6 +645,12 @@ export const Viewport2D: React.FC = () => {
   const handleDrop = (e: React.DragEvent<SVGSVGElement>) => {
     e.preventDefault();
     if (isReadOnly) return;
+    const smartRoomId = e.dataTransfer.getData('application/x-gradian-smart-room');
+    if (smartRoomId) {
+      const pt = screenToWorld(e.clientX, e.clientY);
+      useTwinStore.getState().addSmartRoomFromTemplate(smartRoomId, pt.x, pt.z);
+      return;
+    }
     const templateId = e.dataTransfer.getData('application/x-gradian-object');
     if (templateId) {
       const pt = screenToWorld(e.clientX, e.clientY);
@@ -612,15 +658,114 @@ export const Viewport2D: React.FC = () => {
     }
   };
 
-  const rooms = scene.rooms.filter((r) => r.floorId === activeFloorId && r.activeFromDate <= timelineDate);
-  const walls = scene.walls.filter((w) => w.floorId === activeFloorId && w.activeFromDate <= timelineDate);
-  const openings = scene.openings.filter((o) => o.floorId === activeFloorId);
-  const assets = scene.assets.filter((a) => a.floorId === activeFloorId && !a.hidden && a.installationDate <= timelineDate);
-  const cameras = scene.cameras.filter((c) => c.floorId === activeFloorId);
-  const flows = scene.flows.filter((f) => f.floorId === activeFloorId);
-  const references = scene.references.filter((r) => r.floorId === activeFloorId && r.visible);
+  const rooms = useMemo(
+    () => scene.rooms.filter((r) => r.floorId === activeFloorId && r.activeFromDate <= timelineDate),
+    [scene.rooms, activeFloorId, timelineDate]
+  );
+  const walls = useMemo(
+    () => scene.walls.filter((w) => w.floorId === activeFloorId && w.activeFromDate <= timelineDate),
+    [scene.walls, activeFloorId, timelineDate]
+  );
+  const openings = useMemo(
+    () => scene.openings.filter((o) => o.floorId === activeFloorId),
+    [scene.openings, activeFloorId]
+  );
+  const assets = useMemo(
+    () => scene.assets.filter((a) => a.floorId === activeFloorId && !a.hidden && a.installationDate <= timelineDate),
+    [scene.assets, activeFloorId, timelineDate]
+  );
+  const cameras = useMemo(
+    () => scene.cameras.filter((c) => c.floorId === activeFloorId),
+    [scene.cameras, activeFloorId]
+  );
+  const flows = useMemo(
+    () => scene.flows.filter((f) => f.floorId === activeFloorId),
+    [scene.flows, activeFloorId]
+  );
+  const references = useMemo(
+    () => scene.references.filter((r) => r.floorId === activeFloorId && r.visible),
+    [scene.references, activeFloorId]
+  );
 
-  const selectedSet = new Set(selected.map((s) => `${s.type}:${s.id}`));
+  // Pre-compute Room FMEA summaries so panning/zooming never re-runs incident scans
+  const roomFmeaMap = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof getTargetFmeaSummary>>();
+    if (!showFmeaIndicators) return map;
+    for (const rm of rooms) {
+      map.set(rm.id, getTargetFmeaSummary(riskIncidents, 'room', rm.id, true));
+    }
+    return map;
+  }, [showFmeaIndicators, rooms, riskIncidents]);
+
+  // Pre-compute 2D HVAC ductwork & diffuser layout in world-meter coordinates (scaled by zoom at draw time)
+  const hvac2DLayout = useMemo(() => {
+    if (!showHvacOverlay || !activeFloor) return null;
+    const items: {
+      id: string;
+      ahuHex: string;
+      cx: number;
+      cy: number;
+      rx: number;
+      rzBottom: number;
+      badgeLabel: string;
+      diffs: { x: number; y: number }[];
+    }[] = [];
+
+    let minX = Infinity;
+    let maxX = -Infinity;
+
+    for (const rm of rooms) {
+      const cfg = getEffectiveRoomHvac(rm);
+      if (hvacAhuFilter !== 'all' && cfg.ahuId !== hvacAhuFilter) continue;
+      const cx = rm.x + rm.width / 2;
+      const cy = rm.z + rm.depth / 2;
+      if (cx < minX) minX = cx;
+      if (cx > maxX) maxX = cx;
+
+      const diffCount = Math.max(1, Math.min(6, cfg.diffuserCount));
+      const cols = diffCount <= 2 ? diffCount : Math.ceil(Math.sqrt(diffCount));
+      const rows = Math.max(1, Math.ceil(diffCount / cols));
+      const diffs: { x: number; y: number }[] = [];
+      for (let rIdx = 0; rIdx < rows && diffs.length < diffCount; rIdx++) {
+        for (let cIdx = 0; cIdx < cols && diffs.length < diffCount; cIdx++) {
+          diffs.push({
+            x: rm.x + ((cIdx + 0.5) / cols) * rm.width,
+            y: rm.z + ((rIdx + 0.5) / rows) * rm.depth,
+          });
+        }
+      }
+
+      items.push({
+        id: rm.id,
+        ahuHex: getAhuColor(cfg.ahuId),
+        cx,
+        cy,
+        rx: rm.x,
+        rzBottom: rm.z + rm.depth,
+        badgeLabel: `${cfg.ahuId} · ${cfg.airChangesPerHour}ACH · ${cfg.targetPressurePa >= 0 ? '+' : ''}${cfg.targetPressurePa}Pa`,
+        diffs,
+      });
+    }
+
+    if (items.length === 0) return null;
+    return {
+      spineZ: activeFloor.depth * 0.5,
+      minX,
+      maxX,
+      items,
+    };
+  }, [showHvacOverlay, activeFloor, rooms, hvacAhuFilter]);
+
+  const visibleFlows = useMemo(() => {
+    if (!showFlows) return [];
+    return flows.filter((fl) => {
+      if (fl.points.length < 2) return false;
+      if (isolatedFlowId) return fl.id === isolatedFlowId;
+      return !hiddenFlowIds.includes(fl.id);
+    });
+  }, [showFlows, flows, isolatedFlowId, hiddenFlowIds]);
+
+  const selectedSet = useMemo(() => new Set(selected.map((s) => `${s.type}:${s.id}`)), [selected]);
   const isDarkBg = canvasBackdrop === 'dark';
 
   const measureDist =
@@ -908,10 +1053,10 @@ export const Viewport2D: React.FC = () => {
                       </text>
                     </g>
                   )}
-                  {/* 2D Room FMEA RPN Status Indicator */}
+                  {/* 2D Room FMEA RPN Status Indicator (Memoized Lookup) */}
                   {showFmeaIndicators && (() => {
-                    const rmFmea = getTargetFmeaSummary(riskIncidents, 'room', rm.id, true);
-                    if (rmFmea.level === 'clear' || !rmFmea.worstIncident || rw < 42) return null;
+                    const rmFmea = roomFmeaMap.get(rm.id);
+                    if (!rmFmea || rmFmea.level === 'clear' || !rmFmea.worstIncident || rw < 42) return null;
                     const badgeFill =
                       rmFmea.level === 'critical'
                         ? '#F43F5E'
@@ -948,88 +1093,69 @@ export const Viewport2D: React.FC = () => {
               );
             })}
 
-          {/* 2D HVAC Ductwork & HEPA Terminal Diffuser Overlay */}
-          {showHvacOverlay && (() => {
-            const hvacRooms = rooms.filter(
-              (r) => hvacAhuFilter === 'all' || getEffectiveRoomHvac(r).ahuId === hvacAhuFilter
-            );
-            if (hvacRooms.length === 0 || !activeFloor) return null;
-            const spineZ = activeFloor.depth * 0.5 * zoom;
-            const minX = Math.min(...hvacRooms.map((r) => (r.x + r.width / 2) * zoom));
-            const maxX = Math.max(...hvacRooms.map((r) => (r.x + r.width / 2) * zoom));
-            return (
-              <g pointerEvents="none">
-                {/* Main Supply & Return Duct Trunks */}
-                <line
-                  x1={minX}
-                  y1={spineZ - 4}
-                  x2={maxX}
-                  y2={spineZ - 4}
-                  stroke="#06B6D4"
-                  strokeWidth={4}
-                  strokeDasharray="10 4"
-                  strokeOpacity={0.85}
-                />
-                <line
-                  x1={minX}
-                  y1={spineZ + 5}
-                  x2={maxX}
-                  y2={spineZ + 5}
-                  stroke="#F59E0B"
-                  strokeWidth={2.5}
-                  strokeDasharray="6 4"
-                  strokeOpacity={0.7}
-                />
-                {hvacRooms.map((rm) => {
-                  const cfg = getEffectiveRoomHvac(rm);
-                  const ahuHex = getAhuColor(cfg.ahuId);
-                  const cx = (rm.x + rm.width / 2) * zoom;
-                  const cy = (rm.z + rm.depth / 2) * zoom;
-                  const diffCount = Math.max(1, Math.min(6, cfg.diffuserCount));
-                  const cols = diffCount <= 2 ? diffCount : Math.ceil(Math.sqrt(diffCount));
-                  const rows = Math.max(1, Math.ceil(diffCount / cols));
-                  const diffs: { x: number; y: number }[] = [];
-                  for (let rIdx = 0; rIdx < rows && diffs.length < diffCount; rIdx++) {
-                    for (let cIdx = 0; cIdx < cols && diffs.length < diffCount; cIdx++) {
-                      diffs.push({
-                        x: (rm.x + ((cIdx + 0.5) / cols) * rm.width) * zoom,
-                        y: (rm.z + ((rIdx + 0.5) / rows) * rm.depth) * zoom,
-                      });
-                    }
-                  }
-                  return (
-                    <g key={`hvac-2d-${rm.id}`}>
-                      <line
-                        x1={cx}
-                        y1={spineZ - 4}
-                        x2={cx}
-                        y2={cy}
-                        stroke={ahuHex}
-                        strokeWidth={2.4}
-                        strokeOpacity={0.85}
-                      />
-                      {diffs.map((d, di) => (
-                        <g key={di} transform={`translate(${d.x}, ${d.y})`}>
-                          <line x1={cx - d.x} y1={cy - d.y} x2={0} y2={0} stroke={ahuHex} strokeWidth={1.2} strokeOpacity={0.55} />
-                          <rect x={-7} y={-7} width={14} height={14} rx={2} fill="#09090D" fillOpacity={0.85} stroke={ahuHex} strokeWidth={1.4} />
-                          <line x1={-5} y1={-5} x2={5} y2={5} stroke={ahuHex} strokeWidth={1} />
-                          <line x1={5} y1={-5} x2={-5} y2={5} stroke={ahuHex} strokeWidth={1} />
+          {/* 2D HVAC Ductwork & HEPA Terminal Diffuser Overlay (Precomputed Layout) */}
+          {hvac2DLayout && (
+            <g pointerEvents="none">
+              <line
+                x1={hvac2DLayout.minX * zoom}
+                y1={hvac2DLayout.spineZ * zoom - 4}
+                x2={hvac2DLayout.maxX * zoom}
+                y2={hvac2DLayout.spineZ * zoom - 4}
+                stroke="#06B6D4"
+                strokeWidth={4}
+                strokeDasharray="10 4"
+                strokeOpacity={0.85}
+              />
+              <line
+                x1={hvac2DLayout.minX * zoom}
+                y1={hvac2DLayout.spineZ * zoom + 5}
+                x2={hvac2DLayout.maxX * zoom}
+                y2={hvac2DLayout.spineZ * zoom + 5}
+                stroke="#F59E0B"
+                strokeWidth={2.5}
+                strokeDasharray="6 4"
+                strokeOpacity={0.7}
+              />
+              {hvac2DLayout.items.map((item) => {
+                const cx = item.cx * zoom;
+                const cy = item.cy * zoom;
+                const spineY = hvac2DLayout.spineZ * zoom - 4;
+                return (
+                  <g key={`hvac-2d-${item.id}`}>
+                    <line
+                      x1={cx}
+                      y1={spineY}
+                      x2={cx}
+                      y2={cy}
+                      stroke={item.ahuHex}
+                      strokeWidth={2.4}
+                      strokeOpacity={0.85}
+                    />
+                    {item.diffs.map((d, di) => {
+                      const dx = d.x * zoom;
+                      const dy = d.y * zoom;
+                      return (
+                        <g key={di} transform={`translate(${dx}, ${dy})`}>
+                          <line x1={cx - dx} y1={cy - dy} x2={0} y2={0} stroke={item.ahuHex} strokeWidth={1.2} strokeOpacity={0.55} />
+                          <rect x={-7} y={-7} width={14} height={14} rx={2} fill="#09090D" fillOpacity={0.85} stroke={item.ahuHex} strokeWidth={1.4} />
+                          <line x1={-5} y1={-5} x2={5} y2={5} stroke={item.ahuHex} strokeWidth={1} />
+                          <line x1={5} y1={-5} x2={-5} y2={5} stroke={item.ahuHex} strokeWidth={1} />
                         </g>
-                      ))}
-                      {zoom >= 12 && (
-                        <g transform={`translate(${rm.x * zoom + 6}, ${(rm.z + rm.depth) * zoom - 20})`}>
-                          <rect x={0} y={0} width={118} height={15} rx={3} fill="#0B131E" fillOpacity={0.88} stroke={ahuHex} strokeWidth={0.8} />
-                          <text x={5} y={10.5} fill="#E0F2FE" className="font-mono text-[8.5px] font-semibold">
-                            {cfg.ahuId} · {cfg.airChangesPerHour}ACH · {cfg.targetPressurePa >= 0 ? '+' : ''}{cfg.targetPressurePa}Pa
-                          </text>
-                        </g>
-                      )}
-                    </g>
-                  );
-                })}
-              </g>
-            );
-          })()}
+                      );
+                    })}
+                    {zoom >= 12 && (
+                      <g transform={`translate(${item.rx * zoom + 6}, ${item.rzBottom * zoom - 20})`}>
+                        <rect x={0} y={0} width={118} height={15} rx={3} fill="#0B131E" fillOpacity={0.88} stroke={item.ahuHex} strokeWidth={0.8} />
+                        <text x={5} y={10.5} fill="#E0F2FE" className="font-mono text-[8.5px] font-semibold">
+                          {item.badgeLabel}
+                        </text>
+                      </g>
+                    )}
+                  </g>
+                );
+              })}
+            </g>
+          )}
 
           {/* Walls */}
           {isLayerVisible('layer-walls') &&
@@ -1178,13 +1304,7 @@ export const Viewport2D: React.FC = () => {
           {/* Flow Routes (Animated + Toggle Off + Isolate + Interactive Node Modify Mode) */}
           {showFlows &&
             isLayerVisible('layer-flows') &&
-            flows
-              .filter((fl) => {
-                if (fl.points.length < 2) return false;
-                if (isolatedFlowId) return fl.id === isolatedFlowId;
-                return !hiddenFlowIds.includes(fl.id);
-              })
-              .map((fl) => {
+            visibleFlows.map((fl) => {
                 const isSel = selectedSet.has(`flow:${fl.id}`);
                 const isModifying = !isReadOnly && (isSel || editingFlowId === fl.id);
                 const d = fl.points
@@ -1772,6 +1892,89 @@ export const Viewport2D: React.FC = () => {
               </g>
             );
           })()}
+
+          {/* Live Snap-to-Grid & Snap-to-Wall Placement Ghost for place-object tool */}
+          {!isReadOnly && activeTool === 'place-object' && placePreview && (() => {
+            const allObjs = [...OBJECT_LIBRARY, ...scene.customObjects];
+            const tpl = allObjs.find((o) => o.id === selectedObjectTemplateId) ?? allObjs[0];
+            const wPx = (tpl?.width ?? 1.2) * zoom;
+            const dPx = (tpl?.depth ?? 1.0) * zoom;
+            const cx = placePreview.x * zoom;
+            const cz = placePreview.z * zoom;
+            const deg = (-placePreview.rotationY * 180) / Math.PI;
+            const wallSnap = placePreview.snappedWall;
+            return (
+              <g className="pointer-events-none">
+                {wallSnap && (
+                  <>
+                    <line
+                      x1={wallSnap.ax * zoom}
+                      y1={wallSnap.az * zoom}
+                      x2={wallSnap.bx * zoom}
+                      y2={wallSnap.bz * zoom}
+                      stroke="#22D3EE"
+                      strokeWidth={3.5}
+                      strokeLinecap="round"
+                      strokeOpacity={0.85}
+                    />
+                    <line
+                      x1={wallSnap.projX * zoom}
+                      y1={wallSnap.projZ * zoom}
+                      x2={cx}
+                      y2={cz}
+                      stroke="#22D3EE"
+                      strokeWidth={1.5}
+                      strokeDasharray="4 3"
+                    />
+                    <circle cx={wallSnap.projX * zoom} cy={wallSnap.projZ * zoom} r={4} fill="#22D3EE" />
+                  </>
+                )}
+                <g transform={`translate(${cx}, ${cz}) rotate(${deg})`}>
+                  <rect
+                    x={-wPx / 2}
+                    y={-dPx / 2}
+                    width={wPx}
+                    height={dPx}
+                    rx={4}
+                    fill={wallSnap ? '#06B6D4' : '#8B5CF6'}
+                    fillOpacity={0.28}
+                    stroke={wallSnap ? '#22D3EE' : '#A78BFA'}
+                    strokeWidth={2}
+                    strokeDasharray="5 3"
+                  />
+                  {/* Front orientation indicator */}
+                  <line
+                    x1={0}
+                    y1={dPx / 2}
+                    x2={0}
+                    y2={dPx / 2 + 10}
+                    stroke={wallSnap ? '#22D3EE' : '#A78BFA'}
+                    strokeWidth={2}
+                  />
+                </g>
+                <g transform={`translate(${cx + 12}, ${cz - dPx / 2 - 14})`}>
+                  <rect
+                    x={0}
+                    y={-11}
+                    width={wallSnap ? 148 : 114}
+                    height={19}
+                    rx={5}
+                    fill="#0D111C"
+                    fillOpacity={0.92}
+                    stroke={wallSnap ? '#22D3EE' : '#8B5CF6'}
+                    strokeWidth={1}
+                  />
+                  <text x={6} y={2} className="fill-white text-[9.5px] font-mono font-semibold">
+                    {wallSnap
+                      ? `WALL SNAP · ${placePreview.x},${placePreview.z}`
+                      : placePreview.snappedGrid
+                        ? `GRID SNAP · ${placePreview.x},${placePreview.z}`
+                        : `${placePreview.x},${placePreview.z}`}
+                  </text>
+                </g>
+              </g>
+            );
+          })()}
         </g>
       </svg>
 
@@ -1845,7 +2048,7 @@ export const Viewport2D: React.FC = () => {
           {activeTool === 'draw-wall' && 'Click and drag between two points to draw a wall segment'}
           {activeTool === 'place-door' && 'Click any wall line to insert a door opening'}
           {activeTool === 'place-window' && 'Click any wall line to insert an observation window'}
-          {activeTool === 'place-object' && 'Click anywhere on the floor plan to place selected equipment'}
+          {activeTool === 'place-object' && 'Click floor to place equipment — auto Snap-to-Grid & Snap-to-Wall active'}
           {activeTool === 'paint-material' && 'Click any room, wall, or equipment to apply the active material'}
           {activeTool === 'measure' && 'Click two points to measure exact real-world distance'}
           {activeTool === 'place-camera' && 'Click to place a camera with field-of-view cone'}

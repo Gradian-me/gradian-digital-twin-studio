@@ -19,8 +19,8 @@ export const MiniMapOverlay: React.FC = () => {
   const [collapsed, setCollapsed] = useState(
     () => typeof window !== 'undefined' && window.innerWidth < 1280
   );
-  // Default offset from bottom-right of <main> workspace, cleanly above Sensors & Map dock
-  const [pos, setPos] = useState<{ x: number; y: number }>({ x: 14, y: 58 });
+  // Default offset clears the right-edge vertical LVL / SITE / ALL / L1 / L0 navigation rail
+  const [pos, setPos] = useState<{ x: number; y: number }>({ x: 74, y: 58 });
   const [draggingWidget, setDraggingWidget] = useState(false);
   const [navDragging, setNavDragging] = useState(false);
   const [hoverWorld, setHoverWorld] = useState<{ x: number; z: number } | null>(null);
@@ -87,7 +87,7 @@ export const MiniMapOverlay: React.FC = () => {
         type="button"
         onClick={() => setShowMiniMap(true)}
         title="Show Birds-Eye Mini-Map"
-        className={`absolute bottom-14 right-3 z-20 flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[11px] font-semibold shadow-lg border transition cursor-pointer ${
+        className={`absolute bottom-14 right-[74px] z-20 flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-[11px] font-semibold shadow-lg border transition cursor-pointer ${
           isDark
             ? 'bg-[#14141A]/95 border-zinc-700/80 text-zinc-200 hover:border-violet-500/60 hover:text-violet-300'
             : 'bg-white/95 border-slate-200 text-slate-700 hover:border-violet-400 hover:text-violet-700'
@@ -116,8 +116,8 @@ export const MiniMapOverlay: React.FC = () => {
     if (!draggingWidget || !dragStartRef.current) return;
     const dx = e.clientX - dragStartRef.current.startX;
     const dy = e.clientY - dragStartRef.current.startY;
-    // Bottom-right anchored offset (moving left increases right, moving up increases bottom)
-    const nextRight = Math.max(8, Math.min(window.innerWidth - 250, dragStartRef.current.origX - dx));
+    // Bottom-right anchored offset (keep clear of the 56px right-edge LVL/SITE rail)
+    const nextRight = Math.max(72, Math.min(window.innerWidth - 256, dragStartRef.current.origX - dx));
     const nextBottom = Math.max(54, Math.min(window.innerHeight - 230, dragStartRef.current.origY - dy));
     setPos({ x: nextRight, y: nextBottom });
   };

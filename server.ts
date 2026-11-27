@@ -443,7 +443,7 @@ Formatting & Response Rules:
 1. Write \`markdown\` in clean, structured Markdown using headings (##, ###), concise bullet points, bold metrics, and Markdown tables when comparing rooms, equipment, HVAC, GMP compliance, FMEA risks, or telemetry.
 2. ALWAYS cite exact room codes (e.g. \`A0-101\`), asset IDs/tags (e.g. \`BIO-2000-01\`), and floor codes (e.g. \`A-L0\`) inside backticks so the UI turns them into interactive 3D jump links!
 3. Whenever you discuss or recommend inspecting any specific room, equipment asset, floor, or building, populate \`navigationTargets\` with exact matching \`type\` ('room' | 'asset' | 'floor' | 'building'), \`id\`, \`code\`, \`name\`, and a short \`reason\` from \`facilitySummary\` so users can fly directly to each object in the 3D digital twin with 1 click.
-4. Whenever quantitative comparisons, room areas, FMEA RPN scores, equipment power/condition, HVAC ACH/pressure, or sensor readings are discussed, ALSO populate \`charts\` with 1-2 structured chart definitions (\`bar\`, \`line\`, or \`kpi\`).
+4. Whenever quantitative comparisons, trends, distributions, room areas, FMEA RPN scores, equipment power/condition, HVAC ACH/pressure, or KPI target attainment are discussed, populate \`charts\` with 1-2 structured chart definitions (\`bar\`, \`line\`, \`area\`, \`pie\`, \`target\`, or \`kpi\`). You may also embed fenced \`\`\`chart:line / \`\`\`chart:bar / \`\`\`chart:area / \`\`\`chart:pie / \`\`\`chart:target JSON blocks directly inside \`markdown\` when the user requests specific chart templates.
 5. Whenever the user asks to design, add, modify, rearrange, paint, add flows, optimize the map, check production line eligibility, or create GMP/CAPA work orders, populate \`proposedActions\` with exact, non-overlapping, safe actions:
    - Supported action types: create_room, place_equipment, update_wall_height, apply_floor_material, add_door, create_camera, create_flow, set_analytics_mode, select_entities, run_validation, highlight_production_line, create_work_order.
    - For \`highlight_production_line\`: pass \`lineId\` using the real Production Line \`id\` or \`code\` from \`facilitySummary.gmpCompliance.productionLines\`.
@@ -474,7 +474,7 @@ Formatting & Response Rules:
           properties: {
             markdown: {
               type: Type.STRING,
-              description: 'Rich Markdown response with headings, lists, bold metrics, backtick entity codes, and optional markdown tables.',
+              description: 'Rich Markdown response with headings, lists, bold metrics, backtick entity codes, GFM tables, and optional ```chart:line|bar|area|pie|target blocks.',
             },
             highlightTitle: {
               type: Type.STRING,
@@ -488,7 +488,7 @@ Formatting & Response Rules:
                 properties: {
                   title: { type: Type.STRING },
                   subtitle: { type: Type.STRING },
-                  kind: { type: Type.STRING, description: 'bar, line, or kpi' },
+                  kind: { type: Type.STRING, description: 'bar, line, area, pie, target, or kpi' },
                   unit: { type: Type.STRING },
                   data: {
                     type: Type.ARRAY,
@@ -569,6 +569,116 @@ Formatting & Response Rules:
     res.json({ ...parsed, modelUsed });
   } catch (error: any) {
     console.error('Maya Chat error:', error);
+    const friendly = formatFriendlyGeminiError(error);
+    res.status(friendly.status).json({ error: friendly.message });
+  }
+});
+
+// Dedicated MAYA Life Interactive Companion & SOP Intelligence Endpoint (Server-Side Gemini)
+app.post('/api/maya/life-chat', async (req, res) => {
+  try {
+    const {
+      message,
+      history = [],
+      facilityContext,
+      mayaContext,
+      sopContext,
+    } = req.body ?? {};
+    if (!message || typeof message !== 'string' || message.trim().length === 0) {
+      return res.status(400).json({ error: 'Message is required.' });
+    }
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(503).json({
+        error: 'Gemini API key is not configured on the server. Add GEMINI_API_KEY in Settings > Secrets.',
+      });
+    }
+
+    const systemInstruction = `You are MAYA, the animated 3D Digital Twin Specialist & GMP Operations Companion living inside Gradian Digital Twin Studio.
+You walk through real cleanrooms, open doors, toggle room lights, read equipment SOPs, monitor HVAC/fire safety/cameras/telemetry, and collaborate directly with engineers and QA personnel.
+
+Rules:
+1. Answer thoroughly, accurately, and concisely in clean GFM Markdown (using proper pipe tables with header separator \`| --- | --- |\`, checklists, bold metrics, and embedded interactive charts when presenting trends, comparisons, shares, or targets) based ONLY on the provided \`facilityContext\`, \`sopContext\`, and \`mayaContext\` (plus standard EU GMP Annex 1 / ISO 14644 / 21 CFR Part 11 best practices when explaining SOP steps).
+   - To embed an interactive chart inside \`reply\`, use a fenced block \`\`\`chart:line (or \`chart:bar\`, \`chart:area\`, \`chart:pie\`, \`chart:target\`) containing valid JSON: \`{"title":"...","unit":"...","xKey":"label","target":95,"series":[{"key":"value","label":"..."}],"data":[{"label":"...","value":96,"target":95}]}\`.
+2. Cite exact room codes (e.g. \`A0-101\`), equipment tags (e.g. \`BR-2001\`), and SOP document numbers (e.g. \`SOP-BIO-001\`) in backticks.
+3. Choose the most expressive matching \`mayaState\` from: idle, working, thinking, searching, approval, question, error, finished, chat, wave, analyze, present, create, organize, teach, support, celebrate, laptop.
+   - Use \`teach\` or \`analyze\` when explaining SOP steps or technical procedures.
+   - Use \`present\` when summarizing rooms, HVAC cascades, or fire safety status.
+   - Use \`approval\` or \`celebrate\` when confirming compliant/healthy status.
+   - Use \`searching\` when investigating equipment or telemetry.
+   - Use \`chat\` or \`support\` for general helpful answers.
+4. Choose a matching \`mayaExpression\` from: neutral, happy, smile, thinking, curious, confident, proud, approval, calm, focus, surprised, worried, concerned.
+5. Provide \`statusNote\` (max 8 words describing what MAYA is currently doing, e.g., "Explaining Bioreactor CIP/SIP sterilization steps").
+6. Populate \`citedSopCodes\`, \`navigationTargets\` (matching real rooms/assets/SOPs from context), and 2-3 helpful \`suggestedPrompts\`.`;
+
+    const recentHistory = Array.isArray(history)
+      ? history.slice(-8).map((h: any) => ({
+          role: h.role === 'user' ? 'user' : 'assistant',
+          content: String(h.content ?? '').slice(0, 700),
+        }))
+      : [];
+
+    const { text: raw, modelUsed } = await callGeminiResilient({
+      contents: JSON.stringify({
+        conversationHistory: recentHistory,
+        userMessage: message.trim().slice(0, 2000),
+        mayaContext: mayaContext ?? {},
+        facilityContext: facilityContext ?? {},
+        sopContext: sopContext ?? [],
+      }),
+      config: {
+        systemInstruction,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            reply: {
+              type: Type.STRING,
+              description: 'Accurate, well-structured Markdown reply from MAYA.',
+            },
+            mayaState: {
+              type: Type.STRING,
+              description: 'MAYA 3D animation state name.',
+            },
+            mayaExpression: {
+              type: Type.STRING,
+              description: 'MAYA 3D facial expression name.',
+            },
+            statusNote: {
+              type: Type.STRING,
+              description: 'Short 4-8 word live status banner for MAYA.',
+            },
+            citedSopCodes: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+            },
+            navigationTargets: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  type: { type: Type.STRING, description: 'room, asset, floor, building, or sop' },
+                  id: { type: Type.STRING },
+                  code: { type: Type.STRING },
+                  name: { type: Type.STRING },
+                  reason: { type: Type.STRING },
+                },
+                required: ['type', 'code', 'name'],
+              },
+            },
+            suggestedPrompts: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+            },
+          },
+          required: ['reply', 'mayaState', 'mayaExpression', 'statusNote'],
+        },
+      },
+    });
+
+    const parsed = safeParseModelJson(raw);
+    res.json({ ...parsed, modelUsed });
+  } catch (error: any) {
+    console.error('Maya Life Chat error:', error);
     const friendly = formatFriendlyGeminiError(error);
     res.status(friendly.status).json({ error: friendly.message });
   }
@@ -1604,6 +1714,190 @@ app.post('/api/incidents/ai-resolve', async (req, res) => {
     });
   } catch (error: any) {
     console.error('AI Incident Resolution error:', error);
+    const friendly = formatFriendlyGeminiError(error);
+    return res.status(friendly.status).json({ error: friendly.message });
+  }
+});
+
+// MAYA Voice Audio Transcription Endpoint (gemini-3.5-transcribe)
+app.post('/api/maya/transcribe', async (req, res) => {
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(503).json({
+        error: 'Gemini API key is not configured on the server.',
+      });
+    }
+
+    const { audioBase64, mimeType } = req.body ?? {};
+    if (!audioBase64 || typeof audioBase64 !== 'string') {
+      return res.status(400).json({ error: 'Missing audioBase64 payload.' });
+    }
+
+    const cleanedBase64 = audioBase64.replace(/^data:[^;]+;base64,/, '').trim();
+    if (!cleanedBase64 || cleanedBase64.length < 32) {
+      return res.status(400).json({ error: 'Audio recording is empty or too short.' });
+    }
+
+    const rawMime = typeof mimeType === 'string' && mimeType.trim() ? mimeType.trim() : 'audio/webm';
+    const normalizedMime = rawMime.split(';')[0].trim() || 'audio/webm';
+
+    const ai = createGeminiClient();
+    const response = await Promise.race([
+      ai.models.generateContent({
+        model: 'gemini-3.5-transcribe',
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: normalizedMime,
+                data: cleanedBase64,
+              },
+            },
+            {
+              text: 'Transcribe this audio accurately. Preserve pharmaceutical, GMP, HVAC, IT, room code, and equipment terminology. Return only the spoken transcript text.',
+            },
+          ],
+        },
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(Object.assign(new Error('Transcription timeout'), { status: 503 })), 25000)
+      ),
+    ]);
+
+    const transcript = (response.text ?? '').trim();
+    return res.json({
+      text: transcript,
+      modelUsed: 'gemini-3.5-transcribe',
+    });
+  } catch (error: any) {
+    console.error('MAYA audio transcribe error:', error);
+    const friendly = formatFriendlyGeminiError(error);
+    return res.status(friendly.status).json({ error: friendly.message });
+  }
+});
+
+// MAYA Async AI Chat Title Generator (gemini-4-hydrogen)
+app.post('/api/maya/generate-title', async (req, res) => {
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(503).json({ error: 'Gemini API key is not configured on the server.' });
+    }
+    const { userMessage, assistantPreview } = req.body ?? {};
+    const safeUser =
+      typeof userMessage === 'string' ? userMessage.trim().slice(0, 400) : '';
+    const safeAssistant =
+      typeof assistantPreview === 'string' ? assistantPreview.trim().slice(0, 300) : '';
+    if (!safeUser) {
+      return res.status(400).json({ error: 'Missing userMessage.' });
+    }
+
+    const { text } = await callGeminiResilient({
+      contents: `Create a crisp, specific 3-to-6 word conversation title for this facility digital-twin chat.\nUser: ${safeUser}\n${safeAssistant ? `Assistant: ${safeAssistant}` : ''}`,
+      config: {
+        systemInstruction:
+          'Return ONLY a plain-text 3 to 6 word title. No quotes, no punctuation at the end, no markdown, no prefixes like "Title:". Preserve exact room codes or equipment codes when mentioned.',
+      },
+    });
+
+    const cleaned = (text || '')
+      .replace(/^["'`#\-\s]+|["'`.\s]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .slice(0, 60);
+
+    return res.json({
+      title: cleaned || safeUser.slice(0, 42),
+    });
+  } catch (error: any) {
+    console.error('MAYA title generation error:', error);
+    const friendly = formatFriendlyGeminiError(error);
+    return res.status(friendly.status).json({ error: friendly.message });
+  }
+});
+
+// MAYA Global Voice Command Interpreter (gemini-4-hydrogen structured JSON)
+app.post('/api/maya/voice-command', async (req, res) => {
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      return res.status(503).json({ error: 'Gemini API key is not configured on the server.' });
+    }
+    const { transcript, context } = req.body ?? {};
+    const safeTranscript =
+      typeof transcript === 'string' ? transcript.trim().slice(0, 500) : '';
+    if (!safeTranscript) {
+      return res.status(400).json({ error: 'Missing voice transcript.' });
+    }
+
+    const roomsSummary = Array.isArray(context?.rooms)
+      ? context.rooms.slice(0, 40).map((r: any) => ({
+          id: String(r.id ?? ''),
+          code: String(r.code ?? ''),
+          name: String(r.name ?? ''),
+          energyKw: Number(r.energyKw ?? 0),
+          hvacStatus: String(r.hvacStatus ?? 'online'),
+        }))
+      : [];
+    const assetsSummary = Array.isArray(context?.assets)
+      ? context.assets.slice(0, 80).map((a: any) => ({
+          id: String(a.id ?? ''),
+          code: String(a.code ?? ''),
+          name: String(a.name ?? ''),
+          category: String(a.category ?? ''),
+          archetype: String(a.archetype ?? ''),
+          roomId: String(a.roomId ?? ''),
+          energyKw: Number(a.energyKw ?? 0),
+        }))
+      : [];
+
+    const { text, modelUsed } = await callGeminiResilient({
+      contents: `Voice command: "${safeTranscript}"\n\nFacility Rooms:\n${JSON.stringify(
+        roomsSummary
+      )}\n\nFacility Equipment:\n${JSON.stringify(assetsSummary)}`,
+      config: {
+        systemInstruction: `You are MAYA, the voice command router for a Pharmaceutical & Industrial 3D Digital Twin.
+Interpret the spoken command (even if it starts with "Maya, ...") and map it to ONE structured action:
+- "show_fire_sensors": user asks to show/inspect fire sensors or extinguishers in a room (set roomId to matching room id).
+- "highlight_hvac_energy": user asks to highlight HVAC equipment or rooms with high energy usage (set matchedAssetIds to HVAC/high-kW asset ids and matchedRoomIds to high-energy rooms, enableHvacOverlay=true).
+- "highlight_assets": user asks to highlight/find specific equipment by category/keyword (set matchedAssetIds).
+- "navigate_room": user asks to go to, show, or inspect a room (set roomId).
+- "walk_room": user asks to walk inside a room in first-person (set roomId).
+- "toggle_room_light": user asks to turn lights on or off in a room (set roomId and desiredBool=true/false).
+- "open_equipment_info": user asks for info/SOP/history of an asset (set assetId).
+- "open_screen": user asks to open telemetry, maya-life, data-center, or workspace (set screen).
+- "ask_maya": general question not covered by direct UI commands (set chatPrompt).
+Always return concise spokenFeedback (1 short sentence).`,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            action: {
+              type: Type.STRING,
+              description:
+                'One of: show_fire_sensors, highlight_hvac_energy, highlight_assets, navigate_room, walk_room, toggle_room_light, open_equipment_info, open_screen, ask_maya',
+            },
+            roomId: { type: Type.STRING },
+            assetId: { type: Type.STRING },
+            matchedAssetIds: { type: Type.ARRAY, items: { type: Type.STRING } },
+            matchedRoomIds: { type: Type.ARRAY, items: { type: Type.STRING } },
+            desiredBool: { type: Type.BOOLEAN },
+            enableHvacOverlay: { type: Type.BOOLEAN },
+            screen: { type: Type.STRING },
+            bannerTitle: { type: Type.STRING },
+            bannerSubtitle: { type: Type.STRING },
+            spokenFeedback: { type: Type.STRING },
+            chatPrompt: { type: Type.STRING },
+          },
+          required: ['action', 'spokenFeedback'],
+        },
+      },
+    });
+
+    const parsed = safeParseModelJson(text);
+    return res.json({
+      ...parsed,
+      modelUsed,
+    });
+  } catch (error: any) {
+    console.error('MAYA voice command error:', error);
     const friendly = formatFriendlyGeminiError(error);
     return res.status(friendly.status).json({ error: friendly.message });
   }

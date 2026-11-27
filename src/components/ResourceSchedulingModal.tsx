@@ -837,7 +837,7 @@ export const ResourceSchedulingModal: React.FC = () => {
             <div
               className={`${
                 mobilePane === 'zones' ? 'hidden lg:block' : 'block'
-              } flex-1 lg:flex-none min-h-0 lg:col-span-8 overflow-y-auto p-4 sm:p-5 space-y-5`}
+              } flex-1 lg:flex-none min-h-0 lg:col-span-8 overflow-y-auto overscroll-contain touch-pan-y p-4 sm:p-5 space-y-5`}
             >
               {/* Mobile Back-to-Zones Header */}
               <div className="lg:hidden flex items-center justify-between pb-2.5 border-b border-zinc-200 dark:border-zinc-800">

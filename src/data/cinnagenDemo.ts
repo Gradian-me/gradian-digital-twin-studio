@@ -3,6 +3,7 @@ import type {
   EnterpriseNode,
   Floor,
   NetworkArchitectureState,
+  NetworkUserNode,
   Opening,
   Room,
   SceneCamera,
@@ -371,6 +372,151 @@ export function ensureRoomsHaveCodesAndModels(scene: DigitalTwinScene): void {
       scene.assets.push(autoAsset);
     }
   });
+
+  // Guarantee EVERY room across ALL floors has at least one connected IT/OT NetworkUserNode
+  if (scene.networkArchitecture) {
+    const netArch = scene.networkArchitecture;
+    const itRacks = scene.assets.filter(
+      (a) => a.category === 'IT & Data Center' || Boolean(a.rackConfig)
+    );
+    if (itRacks.length > 0) {
+      const coveredRooms = new Set(netArch.userNodes.map((n) => n.roomId).filter(Boolean));
+      let autoSeq = netArch.userNodes.length + 1;
+
+      scene.rooms.forEach((rm) => {
+        if (coveredRooms.has(rm.id)) return;
+        const floorRacks = itRacks.filter((r) => r.floorId === rm.floorId);
+        const targetRack =
+          floorRacks.find((r) => r.rackConfig?.devices.some((d) => d.tier === 'access')) ??
+          floorRacks[0] ??
+          itRacks.find((r) => r.rackConfig?.devices.some((d) => d.tier === 'access')) ??
+          itRacks[0];
+        if (!targetRack?.rackConfig?.devices?.length) return;
+
+        const targetDev =
+          targetRack.rackConfig.devices.find((d) => d.tier === 'access') ??
+          targetRack.rackConfig.devices.find((d) => d.kind === 'switch') ??
+          targetRack.rackConfig.devices[0];
+        if (!targetDev) return;
+
+        const usedPortIds = new Set(netArch.userNodes.map((n) => n.connectedPortId));
+        let port = targetDev.ports.find(
+          (p) => p.kind === 'RJ45' && !p.isUplink && !usedPortIds.has(p.id)
+        );
+        if (!port) {
+          const nextNum = targetDev.ports.filter((p) => p.kind === 'RJ45').length + 1;
+          port = {
+            id: `${targetDev.id}-gi${nextNum}`,
+            label: `Gi1/0/${nextNum}`,
+            kind: 'RJ45',
+            speedGbps: 1,
+            status: 'up',
+            vlan: 'VLAN-10-OT',
+            connectedToLabel: `${rm.code} Drop`,
+            poeWatts: 12,
+          };
+          targetDev.ports.push(port);
+        }
+
+        const nameL = (rm.name || '').toLowerCase();
+        const catL = (rm.category || '').toLowerCase();
+        const nodeKind: NetworkUserNode['nodeKind'] =
+          nameL.includes('hvac') || nameL.includes('water') || nameL.includes('wfi') || nameL.includes('elec') || nameL.includes('ups')
+            ? 'iot-gateway'
+            : nameL.includes('lab') || nameL.includes('micro') || nameL.includes('analytical') || nameL.includes('stability') || nameL.includes('r&d')
+              ? 'hplc-drop'
+              : nameL.includes('corridor') || nameL.includes('dock') || nameL.includes('warehouse') || nameL.includes('cold') || nameL.includes('quarantine')
+                ? 'wifi-ap'
+                : nameL.includes('airlock') || nameL.includes('mal') || nameL.includes('pal')
+                  ? 'badge-reader'
+                  : nameL.includes('downstream') || nameL.includes('media') || nameL.includes('buffer') || nameL.includes('pack') || nameL.includes('fill') || catL.includes('cleanroom')
+                    ? 'hmi-panel'
+                    : 'workstation';
+
+        const prefixMap: Record<NetworkUserNode['nodeKind'], string> = {
+          'hmi-panel': 'HMI',
+          'hplc-drop': 'LAB',
+          'wifi-ap': 'AP',
+          'badge-reader': 'ACS',
+          'iot-gateway': 'BMS',
+          'cctv-cam': 'CAM',
+          'ip-phone': 'VOIP',
+          workstation: 'WS',
+        };
+        const vlanMap: Record<NetworkUserNode['nodeKind'], string> = {
+          'hmi-panel': 'VLAN-10-OT',
+          'hplc-drop': 'VLAN-31-LAB',
+          'wifi-ap': 'VLAN-50-WIFI',
+          'badge-reader': 'VLAN-70-ACS',
+          'iot-gateway': 'VLAN-20-SCADA',
+          'cctv-cam': 'VLAN-70-ACS',
+          'ip-phone': 'VLAN-11-QA',
+          workstation: 'VLAN-11-QA',
+        };
+        const octet3 =
+          nodeKind === 'hmi-panel'
+            ? 20
+            : nodeKind === 'hplc-drop'
+              ? 31
+              : nodeKind === 'wifi-ap'
+                ? 50
+                : nodeKind === 'badge-reader'
+                  ? 70
+                  : nodeKind === 'iot-gateway'
+                    ? 22
+                    : 11;
+
+        const cleanCode = (rm.code || `RM${autoSeq}`).replace(/[^A-Z0-9-]/gi, '').toUpperCase();
+        const prefix = prefixMap[nodeKind];
+        const code = `${prefix}-${cleanCode}`;
+        const labelSuffix =
+          nodeKind === 'iot-gateway'
+            ? 'BMS / PLC Telemetry Gateway'
+            : nodeKind === 'hplc-drop'
+              ? 'Lab Instrument Network Drop'
+              : nodeKind === 'wifi-ap'
+                ? 'Industrial Wi-Fi 6E AP'
+                : nodeKind === 'badge-reader'
+                  ? 'Interlock RFID Access Controller'
+                  : nodeKind === 'hmi-panel'
+                    ? 'Cleanroom Process HMI Terminal'
+                    : 'GMP Room Workstation Drop';
+
+        const nx = Number((rm.x + Math.min(rm.width - 1.2, Math.max(1.2, rm.width * 0.52))).toFixed(2));
+        const nz = Number((rm.z + Math.min(rm.depth - 1.2, Math.max(1.2, rm.depth * 0.5))).toFixed(2));
+        const ipHost = 80 + ((autoSeq * 3) % 160);
+        const hexIdx = autoSeq.toString(16).toUpperCase().padStart(2, '0');
+
+        netArch.userNodes.push({
+          id: `un-room-${rm.id}`,
+          code,
+          name: `${rm.name} ${labelSuffix}`,
+          nodeKind,
+          floorId: rm.floorId,
+          roomId: rm.id,
+          x: nx,
+          z: nz,
+          wallJackId: `WJ-${cleanCode}-01`,
+          ipAddress: `10.42.${octet3}.${ipHost}`,
+          macAddress: `3C:7C:3F:E0:${hexIdx}:${(ipHost % 250).toString(16).toUpperCase().padStart(2, '0')}`,
+          vlan: vlanMap[nodeKind],
+          poeWatts: nodeKind === 'wifi-ap' ? 21.5 : nodeKind === 'hmi-panel' ? 16.4 : nodeKind === 'iot-gateway' ? 11.2 : 9.5,
+          connectedRackId: targetRack.id,
+          connectedDeviceId: targetDev.id,
+          connectedPortId: port.id,
+          media: nodeKind === 'wifi-ap' || nodeKind === 'hmi-panel' ? 'PoE++ Cat6A' : 'Cat6A',
+          status: 'online',
+          bandwidthMbps: 180 + (autoSeq % 5) * 65,
+          latencyMs: Number((0.9 + (autoSeq % 7) * 0.25).toFixed(1)),
+          packetLossPct: 0.0,
+          crcErrors: 0,
+          notes: `Auto-provisioned room drop in ${rm.code} (${rm.name}) → ${targetRack.assetId} ${targetDev.model} [${port.label}].`,
+        });
+        coveredRooms.add(rm.id);
+        autoSeq += 1;
+      });
+    }
+  }
 }
 
 function makeRoom(
@@ -1835,7 +1981,7 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
     topologyMap: {
       diagramName: 'cinnagen-dc-live-map',
       snapToGrid: true,
-      showLegend: true,
+      showLegend: false,
       vlans: [
         { id: 'v-10', vlanTag: 'VLAN-10-OT', name: 'GMP Production OT', subnet: '10.42.10.0/24', color: '#10B981', visible: true },
         { id: 'v-20', vlanTag: 'VLAN-20-SCADA', name: 'SCADA & Historian', subnet: '10.42.20.0/24', color: '#8B5CF6', visible: true },
@@ -1847,23 +1993,34 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
         { id: 'v-99', vlanTag: 'VLAN-99-UPLINK', name: 'Fiber Trunk & DMZ', subnet: '10.42.99.0/24', color: '#38BDF8', visible: true },
       ],
       nodePositions: {
-        'custom:vpn-wg': { x: 60, y: 40 },
-        'custom:tunnel-cf': { x: 60, y: 185 },
-        'dev:dev-fw-1': { x: 420, y: 40 },
-        'dev:dev-sw-1': { x: 340, y: 215 },
-        'dev:dev-nas-1': { x: 870, y: 430 },
-        'dev:dev-srv-1': { x: 260, y: 690 },
-        'dev:dev-srv-2': { x: 60, y: 455 },
-        'dev:dev-dist-a1': { x: 60, y: 690 },
-        'dev:dev-acc-2960-a1': { x: 60, y: 890 },
-        'dev:dev-dist-a0': { x: 460, y: 435 },
-        'dev:dev-acc-2960-a0': { x: 870, y: 710 },
-        'dev:dev-dist-b1': { x: 960, y: 215 },
-        'dev:dev-acc-2960-b1': { x: 1020, y: 40 },
-        'un:un-hmi-up': { x: 870, y: 920 },
-        'un:un-badge-pal': { x: 1120, y: 920 },
-        'un:un-ap-a1': { x: 360, y: 950 },
-        'un:un-hplc-01': { x: 1270, y: 225 },
+        // Row 1: Perimeter DMZ + Core Firewall + Power UPS
+        'custom:vpn-wg': { x: 40, y: 40 },
+        'custom:tunnel-cf': { x: 40, y: 180 },
+        'dev:dev-fw-1': { x: 380, y: 40 },
+        'dev:dev-ups-1': { x: 840, y: 40 },
+        // Row 2: Core Nexus Switch + Building B Distribution & Access
+        'dev:dev-sw-1': { x: 380, y: 200 },
+        'dev:dev-dist-b1': { x: 960, y: 200 },
+        'dev:dev-acc-2960-b1': { x: 1520, y: 200 },
+        // Row 3: Compute / Storage / Floor A0 & A1 Distribution Switches
+        'dev:dev-srv-2': { x: 40, y: 400 },
+        'dev:dev-dist-a0': { x: 360, y: 400 },
+        'dev:dev-nas-1': { x: 940, y: 400 },
+        'dev:dev-dist-a1': { x: 1380, y: 400 },
+        // Row 4: Hypervisor Cluster + Access 2960-X Switches
+        'dev:dev-srv-1': { x: 40, y: 660 },
+        'dev:dev-acc-2960-a0': { x: 640, y: 660 },
+        'dev:dev-acc-2960-a1': { x: 1220, y: 660 },
+        // Row 5: Key User Nodes (clean spaced row, zero overlap)
+        'un:un-hmi-up': { x: 40, y: 940 },
+        'un:un-hmi-fil': { x: 300, y: 940 },
+        'un:un-badge-pal': { x: 560, y: 940 },
+        'un:un-qa-01': { x: 820, y: 940 },
+        'un:un-qa-02': { x: 1080, y: 940 },
+        'un:un-scada-01': { x: 1340, y: 940 },
+        'un:un-ap-a1': { x: 1600, y: 940 },
+        'un:un-hplc-01': { x: 1520, y: 400 },
+        'un:un-lcms-01': { x: 1780, y: 400 },
       },
       boxes: [
         {
@@ -1871,10 +2028,10 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
           kind: 'frame',
           title: 'Remote Access & DMZ Perimeter',
           subtitle: 'Zero-Trust Edge',
-          x: 32,
+          x: 20,
           y: 12,
           width: 310,
-          height: 300,
+          height: 295,
           color: '#F59E0B',
         },
         {
@@ -1882,10 +2039,10 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
           kind: 'frame',
           title: 'MDF Core Data Center · A1-204',
           subtitle: 'DC-R01 · Cold Aisle A1',
-          x: 368,
+          x: 355,
           y: 12,
-          width: 970,
-          height: 360,
+          width: 790,
+          height: 340,
           color: '#06B6D4',
           roomId: 'rm-a1-control',
         },
@@ -1893,9 +2050,9 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
       texts: [
         {
           id: 'txt-core-note',
-          text: '100G OS2 Campus Backbone · Click any switch power toggle to test outage cascade',
-          x: 380,
-          y: 388,
+          text: '100G OS2 Campus Backbone · Search any device/port/node to isolate its full recursive graph',
+          x: 360,
+          y: 362,
           color: '#94A3B8',
           fontSize: 11,
         },

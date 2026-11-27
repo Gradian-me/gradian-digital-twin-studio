@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
@@ -15,10 +15,12 @@ import {
   ChevronRight,
   ChevronUp,
   Compass,
+  DoorOpen,
   Droplets,
   ExternalLink,
   Eye,
   EyeOff,
+  FileText,
   Focus,
   Footprints,
   Gauge,
@@ -26,23 +28,30 @@ import {
   Globe,
   Info,
   Layers,
+  Lightbulb,
   Link2,
   Lock,
   Map as MapIcon,
   MapPin,
   Moon,
+  Navigation,
   Pause,
   Play,
   Radio,
   RotateCcw,
   Route,
   Scissors,
+  Search,
   Server,
   ShieldCheck,
   SlidersHorizontal,
+  Sparkles,
   Sun,
   Tablet,
   Thermometer,
+  User,
+  Volume2,
+  VolumeX,
   Waypoints,
   Wind,
   X,
@@ -54,6 +63,7 @@ import { useTwinStore, type RenderStyle } from '../store/useTwinStore';
 import { useTelemetryStore } from '../store/useTelemetryStore';
 import { useGmpStore } from '../store/useGmpStore';
 import { useAclStore, computeEffectivePermissions, getActiveAclUser } from '../store/useAclStore';
+import { useMayaStore } from '../store/useMayaStore';
 import { getTargetFmeaSummary, useRiskIncidentStore } from '../store/useRiskIncidentStore';
 import {
   AHU_CATALOG,
@@ -72,18 +82,233 @@ import { METRIC_PRESETS, type HeatmapMetric, type SensorDefinition } from '../ty
 import { MiniSparkline } from './TelemetryDashboard';
 import { AssetMini3DViewer } from './AssetMini3DViewer';
 import { DEFAULT_MATERIALS } from '../data/materialsLibrary';
+import { OBJECT_LIBRARY } from '../data/objectLibrary';
 import { getProceduralMaterial } from '../engine/proceduralTextures';
 import { buildProceduralEquipmentGroup } from '../engine/equipmentBuilder';
 import {
   buildFloorNavMesh,
   buildNavMeshVisualGroup,
   type FloorNavMesh,
+  type NoGoZone,
+  type PathRoutingAlgorithm,
 } from '../engine/navMesh';
+import {
+  DEFAULT_SPATIAL_AUDIO_SETTINGS,
+  FacilitySpatialAudioEngine,
+  type NearbyAudioTelemetry,
+  type SpatialAudioSettings,
+} from '../engine/spatialAudio';
+import {
+  animatePathFinderVisual,
+  computePathLengthMeters,
+  populateNoGoZonesVisual,
+  populatePathFinderVisual,
+  type PathFinderVisualRig,
+} from '../engine/pathFinderVisual';
+import {
+  PathFinderConfigPopover,
+  SpatialAudioSettingsPopover,
+} from './WalkthroughConfigPopovers';
 import { getRoomColorForAnalytics, snapValue } from '../utils/spatial';
 import { computeFlowRoomSequence } from '../utils/flowAnalytics';
+import { computeSnappedPlacement } from '../utils/placementSnap';
+import {
+  computeSwitchLocalTransform,
+  getEffectiveRoomLighting,
+  getFixtureCatalogItem,
+  kelvinToHex,
+} from '../utils/lighting';
+import { attachCanvasPinchGuard } from '../utils/preventPinchZoom';
+import { MayaController, loadMayaGltf } from '../lib/mayaController';
 import type { Building, Floor, MaterialDef, Opening, Room, Wall } from '../types/twin';
 
 const _projVec = new THREE.Vector3();
+const _projViewMat = new THREE.Matrix4();
+const _tmpMat4 = new THREE.Matrix4();
+const _tmpVec3 = new THREE.Vector3();
+const _tmpScale = new THREE.Vector3(1, 1, 1);
+const _tmpColor = new THREE.Color();
+const _flipQuatX = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+const _identityQuat = new THREE.Quaternion();
+const _mayaAxisX = new THREE.Vector3(1, 0, 0);
+const _mayaAdditiveQuat = new THREE.Quaternion();
+
+interface FlowPulseTrack {
+  samples: Float32Array; // N * 3 base world-space xyz points (before exploded offset)
+  sampleCount: number;
+  phase: number;
+  speed: number;
+  scale: number;
+  levelIndex: number;
+}
+
+interface WalkAvatarRig {
+  root: THREE.Group;
+  modelHolder: THREE.Group;
+  shadowRing: THREE.Mesh;
+  mayaController: MayaController | null;
+  torsoPivot: THREE.Object3D | null;
+  armL: THREE.Object3D | null;
+  armR: THREE.Object3D | null;
+  legL: THREE.Object3D | null;
+  legR: THREE.Object3D | null;
+  baseTorsoY: number;
+  activeMotionMode: 'idle' | 'walk' | 'sprint' | 'jump';
+  manualEmoteUntil: number;
+  loaded: boolean;
+  disposed: boolean;
+}
+
+function buildWalkAvatar(onLoaded?: () => void): WalkAvatarRig {
+  const root = new THREE.Group();
+  root.visible = false;
+
+  // Ground contact halo so MAYA's footing is unmistakable during walking and jumping
+  const shadowRing = new THREE.Mesh(
+    new THREE.RingGeometry(0.22, 0.38, 28),
+    new THREE.MeshBasicMaterial({
+      color: '#8B5CF6',
+      transparent: true,
+      opacity: 0.45,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    })
+  );
+  shadowRing.rotation.x = -Math.PI / 2;
+  shadowRing.position.y = 0.025;
+  root.add(shadowRing);
+
+  const modelHolder = new THREE.Group();
+  root.add(modelHolder);
+
+  const rig: WalkAvatarRig = {
+    root,
+    modelHolder,
+    shadowRing,
+    mayaController: null,
+    torsoPivot: null,
+    armL: null,
+    armR: null,
+    legL: null,
+    legR: null,
+    baseTorsoY: 0.38,
+    activeMotionMode: 'idle',
+    manualEmoteUntil: 0,
+    loaded: false,
+    disposed: false,
+  };
+
+  // Load MAYA Cinematic v3 GLB asynchronously and ground feet flush at y = 0
+  loadMayaGltf('/models/maya.glb')
+    .then((gltf) => {
+      if (rig.disposed) {
+        gltf.scene.traverse((obj) => {
+          const mesh = obj as THREE.Mesh;
+          if (mesh.geometry) mesh.geometry.dispose();
+          if (mesh.material) {
+            const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+            mats.forEach((m) => m.dispose());
+          }
+        });
+        return;
+      }
+
+      const model = gltf.scene;
+      model.traverse((obj) => {
+        const mesh = obj as THREE.Mesh;
+        if (mesh.isMesh) {
+          mesh.castShadow = obj.name !== 'StatusIconAtlas';
+          mesh.receiveShadow = true;
+        }
+      });
+
+      // Scale MAYA (~2.14 units tall) to crisp ~0.98m proportions so head & torso glide cleanly through 1.0m doors
+      const mayaScale = 0.46;
+      model.scale.setScalar(mayaScale);
+      model.updateMatrixWorld(true);
+      const bounds = new THREE.Box3().setFromObject(model);
+      if (Number.isFinite(bounds.min.y)) {
+        model.position.y -= bounds.min.y;
+      }
+
+      modelHolder.add(model);
+
+      const controller = new MayaController(gltf, {
+        fade: 0.42,
+        faceFade: 0.16,
+        autoReturn: true,
+      });
+
+      rig.mayaController = controller;
+      rig.torsoPivot = model.getObjectByName('TorsoPivot') ?? null;
+      rig.armL = model.getObjectByName('Arm_L') ?? null;
+      rig.armR = model.getObjectByName('Arm_R') ?? null;
+      rig.legL = model.getObjectByName('Leg_L') ?? null;
+      rig.legR = model.getObjectByName('Leg_R') ?? null;
+      rig.baseTorsoY = rig.torsoPivot ? rig.torsoPivot.position.y : 0.38;
+      rig.loaded = true;
+      onLoaded?.();
+    })
+    .catch((err) => {
+      console.error('Failed to load MAYA 3D character:', err);
+    });
+
+  return rig;
+}
+
+function pickWalkSpawn(
+  activeFl: Floor | undefined,
+  rooms: Room[],
+  navMesh: FloorNavMesh | null
+): { x: number; z: number; lookX: number; lookZ: number } {
+  const flW = activeFl?.width ?? 28;
+  const flD = activeFl?.depth ?? 18;
+  const flRooms = activeFl ? rooms.filter((r) => r.floorId === activeFl.id) : [];
+
+  // Prefer a corridor or spacious room center so user always spawns grounded inside a real room
+  const corridor = flRooms.find((r) =>
+    /corridor|hall|lobby|airlock|aisle|gallery/i.test(r.name)
+  );
+  const largestRoom =
+    corridor ??
+    [...flRooms].sort((a, b) => b.width * b.depth - a.width * a.depth)[0];
+
+  const seedX = largestRoom
+    ? largestRoom.x + largestRoom.width * 0.5
+    : flW * 0.5;
+  const seedZ = largestRoom
+    ? largestRoom.z + largestRoom.depth * 0.5
+    : flD * 0.5;
+
+  const safe = navMesh
+    ? navMesh.findNearestWalkable(seedX, seedZ)
+    : { x: seedX, z: seedZ };
+
+  const clampedX = Math.max(0.8, Math.min(flW - 0.8, safe.x));
+  const clampedZ = Math.max(0.8, Math.min(flD - 0.8, safe.z));
+  const lookX = largestRoom ? largestRoom.x + largestRoom.width * 0.8 : flW * 0.5;
+  const lookZ = largestRoom ? largestRoom.z + largestRoom.depth * 0.25 : flD * 0.25;
+  return { x: clampedX, z: clampedZ, lookX, lookZ };
+}
+
+const PULSE_SAMPLES = 48;
+
+function sampleCurveWorld(
+  curve: THREE.CatmullRomCurve3,
+  ox: number,
+  oy: number,
+  oz: number
+): Float32Array {
+  const arr = new Float32Array(PULSE_SAMPLES * 3);
+  for (let i = 0; i < PULSE_SAMPLES; i++) {
+    const t = i / (PULSE_SAMPLES - 1);
+    curve.getPointAt(t, _tmpVec3);
+    arr[i * 3] = _tmpVec3.x + ox;
+    arr[i * 3 + 1] = _tmpVec3.y + oy;
+    arr[i * 3 + 2] = _tmpVec3.z + oz;
+  }
+  return arr;
+}
 
 // Deduplicate & trim overlapping coplanar wall segments (prevents Z-fighting / crashy flicker when adjacent rooms share a wall)
 function deduplicateCoplanarWalls(walls: Wall[], openings: Opening[]): Wall[] {
@@ -205,7 +430,8 @@ function resolveStrictWallCollision(
   walls: Wall[],
   openings: Opening[],
   floorWidth: number,
-  floorDepth: number
+  floorDepth: number,
+  openDoorsMap?: Record<string, boolean>
 ): { x: number; z: number } {
   const solidSegments: { ax: number; az: number; bx: number; bz: number; halfThick: number }[] = [];
 
@@ -219,10 +445,20 @@ function resolveStrictWallCollision(
     const halfThick = Math.max(0.08, (w.thickness || 0.18) * 0.5);
 
     const doorGaps = openings
-      .filter((o) => o.wallId === w.id && o.kind === 'door' && o.sillHeight < 0.25)
+      .filter((o) => {
+        if (o.wallId !== w.id || o.kind !== 'door' || o.sillHeight >= 0.25) return false;
+        if (!openDoorsMap) return true;
+        const isOpen = openDoorsMap[o.id] ?? o.status === 'open';
+        if (isOpen) return true;
+        // If player is already standing inside the closed doorway threshold, never trap them
+        const dcx = w.x1 + dx * o.offsetRatio;
+        const dcz = w.z1 + dz * o.offsetRatio;
+        return Math.hypot(prevX - dcx, prevZ - dcz) < Math.max(0.75, o.width * 0.55);
+      })
       .map((o) => {
         const c = o.offsetRatio * len;
-        const half = Math.max(0.45, o.width * 0.5);
+        // Slightly widened clearance on open doors so MAYA's larger head passes cleanly without snagging jambs
+        const half = Math.max(0.58, o.width * 0.54);
         return [Math.max(0, c - half), Math.min(len, c + half)] as [number, number];
       })
       .sort((a, b) => a[0] - b[0]);
@@ -406,6 +642,186 @@ function applyBlueprintWireframeToGroup(
   });
 }
 
+// Local telemetry subscriber for each 3D sensor beacon chip (prevents 1.5s full-Viewport3D re-renders)
+const Viewport3DSensorPinChip = React.memo<{
+  pin: {
+    key: string;
+    targetKind: 'asset' | 'room';
+    targetId: string;
+    targetName: string;
+    targetCode: string;
+    mainSensor: SensorDefinition;
+  };
+  isInspected: boolean;
+  fmea: ReturnType<typeof getTargetFmeaSummary> | null;
+  onToggleInspect: (key: string) => void;
+  onOpenRisk: (incidentId: string) => void;
+  registerDom: (key: string, el: HTMLDivElement | null) => void;
+}>(({ pin, isInspected, fmea, onToggleInspect, onOpenRisk, registerDom }) => {
+  const snap = useTelemetryStore((s) => s.readings[pin.mainSensor.id]);
+  const val = snap?.value ?? pin.mainSensor.nominal;
+  const status = snap?.status ?? 'nominal';
+
+  const dotCls =
+    status === 'alarm' || fmea?.level === 'critical'
+      ? 'bg-rose-500'
+      : status === 'warning' || fmea?.level === 'high'
+        ? 'bg-amber-400'
+        : 'bg-emerald-400';
+  const borderCls = isInspected
+    ? 'border-violet-400 ring-2 ring-violet-500/40'
+    : status === 'alarm' || fmea?.level === 'critical'
+      ? 'border-rose-500/90'
+      : status === 'warning' || fmea?.level === 'high'
+        ? 'border-amber-500/80'
+        : 'border-zinc-700/90 hover:border-violet-400';
+
+  return (
+    <div
+      ref={(el) => registerDom(pin.key, el)}
+      style={{ opacity: 0, willChange: 'transform' }}
+      className="absolute top-0 left-0"
+    >
+      <div className="flex items-center gap-1">
+        <button
+          type="button"
+          onClick={() => onToggleInspect(pin.key)}
+          className={`group flex items-center gap-1.5 rounded-full bg-[#131319] text-zinc-100 border ${borderCls} shadow-lg px-2.5 py-1 text-[10.5px] font-mono tabular-nums whitespace-nowrap transition-colors cursor-pointer`}
+          title={`${pin.targetName} — Click to inspect 3D model & live sensors`}
+        >
+          <span className={`w-2 h-2 rounded-full shrink-0 ${dotCls}`} />
+          <span className="font-semibold text-zinc-100">{pin.targetCode}</span>
+          <span className="text-zinc-500">·</span>
+          <span className="text-amber-300 font-semibold">
+            {val.toFixed(pin.mainSensor.precision)}
+            <span className="text-zinc-400 font-normal ml-0.5">{pin.mainSensor.unit}</span>
+          </span>
+        </button>
+        {fmea && fmea.level !== 'clear' && fmea.worstIncident && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenRisk(fmea.worstIncident!.id);
+            }}
+            className={`px-1.5 py-0.5 rounded-md text-[9.5px] font-mono font-bold tabular-nums shadow-lg cursor-pointer ${
+              fmea.level === 'critical'
+                ? 'bg-rose-500 text-white'
+                : fmea.level === 'high'
+                  ? 'bg-amber-400 text-zinc-950'
+                  : fmea.level === 'mitigated'
+                    ? 'bg-emerald-500 text-zinc-950'
+                    : 'bg-violet-500 text-white'
+            }`}
+            title={`FMEA ${fmea.shortLabel}: ${fmea.worstIncident.title}`}
+          >
+            {fmea.shortLabel}
+          </button>
+        )}
+      </div>
+      <div className="mx-auto w-px h-2.5 bg-violet-500/60" />
+    </div>
+  );
+});
+
+// Local telemetry subscriber for Focused Pin Inspector body
+const Viewport3DInspectedPinBody: React.FC<{
+  inspectedAssetObj: any;
+  inspectedRoomObj: any;
+  mainSensor: SensorDefinition;
+  secondarySensors: SensorDefinition[];
+}> = ({ inspectedAssetObj, inspectedRoomObj, mainSensor, secondarySensors }) => {
+  const readings = useTelemetryStore((s) => s.readings);
+  const allCh = [mainSensor, ...secondarySensors];
+  return (
+    <>
+      <AssetMini3DViewer
+        asset={inspectedAssetObj}
+        room={inspectedRoomObj}
+        height={186}
+        statusAccent={readings[mainSensor.id]?.status ?? 'nominal'}
+      />
+      <div className="space-y-1.5 max-h-40 overflow-y-auto overscroll-contain touch-pan-y pr-0.5">
+        {allCh.map((s) => {
+          const snap = readings[s.id];
+          const v = snap?.value ?? s.nominal;
+          const st = snap?.status ?? 'nominal';
+          const color =
+            st === 'alarm'
+              ? '#F43F5E'
+              : st === 'warning'
+                ? '#F59E0B'
+                : METRIC_PRESETS[s.metric]?.color ?? '#8B5CF6';
+          return (
+            <div
+              key={s.id}
+              className="px-3 py-2 rounded-2xl bg-zinc-50 dark:bg-[#191923] border border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-2"
+            >
+              <div className="min-w-0">
+                <div className="text-[10px] font-mono text-zinc-500 dark:text-zinc-400 truncate">
+                  {s.tag} {s.isMainSensor ? '★' : ''}
+                </div>
+                <div className="text-[11px] font-medium text-zinc-800 dark:text-zinc-200 truncate">
+                  {s.name.split('·').pop()?.trim() || s.name}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <MiniSparkline points={snap?.history ?? []} color={color} width={48} height={18} />
+                <span className="font-mono tabular-nums text-xs font-bold text-zinc-900 dark:text-white">
+                  {v.toFixed(s.precision)}
+                  <span className="text-[10px] font-normal text-zinc-400 ml-0.5">{s.unit}</span>
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+};
+
+// Local telemetry subscriber for First-Person Walk handheld tablet room metrics
+const Viewport3DWalkRoomMetrics: React.FC<{
+  tempSnap?: SensorDefinition;
+  rhSnap?: SensorDefinition;
+  dpSnap?: SensorDefinition;
+  curRoom?: Room;
+}> = ({ tempSnap, rhSnap, dpSnap, curRoom }) => {
+  const readings = useTelemetryStore((s) => s.readings);
+  const tVal = tempSnap ? readings[tempSnap.id]?.value ?? tempSnap.nominal : curRoom?.environmental.temperatureC ?? 21.0;
+  const rhVal = rhSnap ? readings[rhSnap.id]?.value ?? rhSnap.nominal : curRoom?.environmental.humidityPct ?? 45;
+  const dpVal = dpSnap ? readings[dpSnap.id]?.value ?? dpSnap.nominal : curRoom?.environmental.pressurePa ?? 15;
+  return (
+    <div className="grid grid-cols-3 gap-1.5 font-mono tabular-nums">
+      <div className="p-1.5 sm:p-2 rounded-xl bg-[#1A1A25] border border-zinc-800">
+        <div className="text-[9px] text-zinc-400 flex items-center gap-0.5">
+          <Thermometer className="w-2.5 h-2.5 text-amber-400" /> T
+        </div>
+        <div className="text-[11px] sm:text-xs font-bold text-white mt-0.5">
+          {tVal.toFixed(1)}°
+        </div>
+      </div>
+      <div className="p-1.5 sm:p-2 rounded-xl bg-[#1A1A25] border border-zinc-800">
+        <div className="text-[9px] text-zinc-400 flex items-center gap-0.5">
+          <Droplets className="w-2.5 h-2.5 text-cyan-400" /> RH
+        </div>
+        <div className="text-[11px] sm:text-xs font-bold text-white mt-0.5">
+          {rhVal.toFixed(0)}%
+        </div>
+      </div>
+      <div className="p-1.5 sm:p-2 rounded-xl bg-[#1A1A25] border border-zinc-800">
+        <div className="text-[9px] text-zinc-400 flex items-center gap-0.5">
+          <Gauge className="w-2.5 h-2.5 text-emerald-400" /> ΔP
+        </div>
+        <div className="text-[11px] sm:text-xs font-bold text-emerald-400 mt-0.5">
+          {dpVal >= 0 ? '+' : ''}
+          {dpVal.toFixed(0)}Pa
+        </div>
+      </div>
+    </div>
+  );
+};
+
 export const Viewport3D: React.FC = () => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const storeRef = useRef(useTwinStore.getState());
@@ -503,6 +919,10 @@ export const Viewport3D: React.FC = () => {
   const clearNetworkTrace = useTwinStore((s) => s.clearNetworkTrace);
   const qrHighlight = useTwinStore((s) => s.qrHighlight);
   const clearQrHighlight = useTwinStore((s) => s.clearQrHighlight);
+  const voiceHighlightIds = useTwinStore((s) => s.voiceHighlightIds);
+  const voiceHighlightBanner = useTwinStore((s) => s.voiceHighlightBanner);
+  const clearVoiceHighlight = useTwinStore((s) => s.clearVoiceHighlight);
+  const focusEntity = useTwinStore((s) => s.focusEntity);
   const setViewMode = useTwinStore((s) => s.setViewMode);
 
   const aclUsers = useAclStore((s) => s.users);
@@ -517,12 +937,11 @@ export const Viewport3D: React.FC = () => {
     return !computeEffectivePermissions(activeUser, aclRoles, aclGroups).includes('spatial.edit');
   }, [workspaceMode, aclUsers, aclRoles, aclGroups, activeAclUserId]);
 
-  // Real-Time Telemetry & Heatmap Store Subscriptions
+  // Real-Time Telemetry & Heatmap Store Subscriptions (readings subscribed locally in subcomponents & heatmap listener)
   const heatmapMetric = useTelemetryStore((s) => s.heatmapMetric);
   const heatmapOpacity = useTelemetryStore((s) => s.heatmapOpacity);
   const show3DSensorPins = useTelemetryStore((s) => s.show3DSensorPins);
   const sensors = useTelemetryStore((s) => s.sensors);
-  const readings = useTelemetryStore((s) => s.readings);
   const setHeatmapMetric = useTelemetryStore((s) => s.setHeatmapMetric);
   const setHeatmapOpacity = useTelemetryStore((s) => s.setHeatmapOpacity);
   const setShow3DSensorPins = useTelemetryStore((s) => s.setShow3DSensorPins);
@@ -558,6 +977,10 @@ export const Viewport3D: React.FC = () => {
   const joyActivePointerRef = useRef<number | null>(null);
   const [joyKnob, setJoyKnob] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [joySprint, setJoySprint] = useState(false);
+  const [walkCameraMode, setWalkCameraMode] = useState<'first-person' | 'third-person'>('first-person');
+  const walkCameraModeRef = useRef<'first-person' | 'third-person'>('first-person');
+  walkCameraModeRef.current = walkCameraMode;
+  const [showDecompPopover, setShowDecompPopover] = useState(false);
 
   useEffect(() => {
     if (!firstPersonMode) {
@@ -620,16 +1043,401 @@ export const Viewport3D: React.FC = () => {
   const triggerWalkJump = () => {
     const eng = engineRef.current;
     if (!eng || !eng.fpOnGround) return;
-    eng.fpVelY = 5.4;
+    eng.fpVelY = 7.6;
     eng.fpOnGround = false;
     eng.requestRender();
   };
+
+  useEffect(() => {
+    const eng = engineRef.current;
+    if (!eng) return;
+    if (walkCameraMode === 'third-person' && eng.walkAvatar.mayaController && storeRef.current.firstPersonMode) {
+      eng.walkAvatar.manualEmoteUntil = performance.now() + 2600;
+      eng.walkAvatar.mayaController.setState('wave', { fade: 0.24, restart: true });
+    }
+    eng.requestRender();
+  }, [walkCameraMode]);
 
   storeRef.current = useTwinStore.getState();
 
   const pinDomRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const roomPinDomRefs = useRef<Map<string, HTMLDivElement>>(new Map());
-  const projectPinsRef = useRef<() => void>(() => {});
+  const projectPinsRef = useRef<(force?: boolean) => void>(() => {});
+  const viewportSizeRef = useRef<{ w: number; h: number }>({ w: 800, h: 560 });
+  const lastCamProjRef = useRef<Float32Array>(new Float32Array(16));
+
+  type WalkInteractable = {
+    kind: 'door' | 'light' | 'equipment';
+    id: string;
+    code: string;
+    title: string;
+    actionLabel: string;
+    detail: string;
+    worldX: number;
+    worldY: number;
+    worldZ: number;
+    roomId?: string;
+    switchId?: string;
+    switchLabel?: string;
+    isOnOrOpen?: boolean;
+  };
+
+  type AnimatedDoorRig = {
+    openingId: string;
+    floorId: string;
+    subtype: string;
+    label: string;
+    roomId?: string;
+    worldX: number;
+    worldY: number;
+    worldZ: number;
+    progress: number;
+    swingSign: number;
+    singlePivot?: THREE.Group;
+    leftPivot?: THREE.Group;
+    rightPivot?: THREE.Group;
+    slideLeft?: THREE.Group;
+    slideRight?: THREE.Group;
+    slideTravel: number;
+    rollCurtain?: THREE.Mesh;
+    rollMaxH: number;
+    closerArm?: THREE.Mesh;
+    ledMat?: THREE.MeshBasicMaterial;
+  };
+
+  type RoomLightRig = {
+    roomId: string;
+    roomCode: string;
+    roomName: string;
+    floorId: string;
+    switches: Array<{
+      id: string;
+      label: string;
+      defaultOn: boolean;
+      worldX: number;
+      worldY: number;
+      worldZ: number;
+      ledMat: THREE.MeshBasicMaterial;
+      rocker: THREE.Mesh;
+    }>;
+    fixtures: Array<{
+      id: string;
+      switchId: string;
+      defaultOn: boolean;
+      mat: THREE.MeshStandardMaterial;
+      maxEmissive: number;
+      isEmergency: boolean;
+    }>;
+    pointLight?: THREE.PointLight;
+    maxLightIntensity: number;
+    dimOverlayMat: THREE.MeshBasicMaterial;
+    dimOverlayMesh: THREE.Mesh;
+    darkEnvelopeMat: THREE.MeshBasicMaterial;
+    darkEnvelopeMesh: THREE.Mesh;
+  };
+
+  const [nearbyInteractable, setNearbyInteractable] = useState<(WalkInteractable & { screenX: number; screenY: number }) | null>(null);
+  const nearbyInteractableRef = useRef<WalkInteractable | null>(null);
+  const [walkInspectAssetId, setWalkInspectAssetId] = useState<string | null>(null);
+  const [placeSnapBadge, setPlaceSnapBadge] = useState<{ label: string; isWall: boolean } | null>(null);
+  const [fpExpandedPad, setFpExpandedPad] = useState(false);
+
+  // 3D HRTF Spatial Audio & Visual Path Finder State
+  const spatialAudioRef = useRef<FacilitySpatialAudioEngine | null>(null);
+  const [spatialAudioEnabled, setSpatialAudioEnabled] = useState(true);
+  const spatialAudioEnabledRef = useRef(true);
+  spatialAudioEnabledRef.current = spatialAudioEnabled;
+  const [spatialAudioSettingsOpen, setSpatialAudioSettingsOpen] = useState(false);
+  const [spatialAudioSettings, setSpatialAudioSettings] = useState<SpatialAudioSettings>(() => ({
+    masterVolume: DEFAULT_SPATIAL_AUDIO_SETTINGS.masterVolume,
+    machinery: { ...DEFAULT_SPATIAL_AUDIO_SETTINGS.machinery },
+    ventilation: { ...DEFAULT_SPATIAL_AUDIO_SETTINGS.ventilation },
+  }));
+  const [audioTelemetry, setAudioTelemetry] = useState<NearbyAudioTelemetry | null>(null);
+
+  const [pathFinderOpen, setPathFinderOpen] = useState(false);
+  const [pathAlgorithm, setPathAlgorithm] = useState<PathRoutingAlgorithm>('shortest');
+  const pathAlgorithmRef = useRef<PathRoutingAlgorithm>('shortest');
+  pathAlgorithmRef.current = pathAlgorithm;
+
+  const [noGoZones, setNoGoZones] = useState<NoGoZone[]>([]);
+  const noGoZonesRef = useRef<NoGoZone[]>([]);
+  noGoZonesRef.current = noGoZones;
+
+  const [placingNoGoZone, setPlacingNoGoZone] = useState(false);
+  const placingNoGoZoneRef = useRef(false);
+  placingNoGoZoneRef.current = placingNoGoZone;
+
+  const [noGoRadius, setNoGoRadius] = useState(2.4);
+  const noGoRadiusRef = useRef(2.4);
+  noGoRadiusRef.current = noGoRadius;
+
+  const [noGoLabelDraft, setNoGoLabelDraft] = useState('');
+  const noGoLabelDraftRef = useRef('');
+  noGoLabelDraftRef.current = noGoLabelDraft;
+
+  const [pathFinderHud, setPathFinderHud] = useState<{
+    label: string;
+    code: string;
+    remainingM: number;
+    autoWalking: boolean;
+  } | null>(null);
+
+  const openDoorsState = useMayaStore((s) => s.openDoors);
+  const roomLightsState = useMayaStore((s) => s.roomLights);
+  const switchStates = useMayaStore((s) => s.switchStates);
+  const focusedInspectorRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    engineRef.current?.requestRender();
+  }, [openDoorsState, roomLightsState, switchStates]);
+
+  useEffect(() => {
+    const el = focusedInspectorRef.current;
+    if (!el) return;
+    return attachCanvasPinchGuard(el);
+  }, [inspectedPinKey]);
+
+  const clearPathFinderRoute = useCallback(() => {
+    const eng = engineRef.current;
+    if (eng) {
+      eng.pathFinderDest = null;
+      eng.pathFinderWaypoints = [];
+      eng.teleportQueue = [];
+      eng.teleportTarget = null;
+      eng.teleportRing.visible = false;
+      eng.pathFinderGroup.visible = false;
+      disposeObject3D(eng.pathFinderGroup);
+      eng.pathFinderGroup.clear();
+      eng.pathFinderRig = null;
+      eng.requestRender();
+    }
+    setPathFinderHud(null);
+  }, []);
+
+  const setPathFinderRoute = useCallback(
+    (
+      dest: { label: string; code: string; x: number; z: number },
+      autoWalk: boolean
+    ) => {
+      const eng = engineRef.current;
+      if (!eng) return;
+      const st = storeRef.current;
+      const fl = st.scene.floors.find((f) => f.id === st.activeFloorId);
+      const flElev = fl?.elevation ?? 0;
+      const algo = pathAlgorithmRef.current;
+      const zones = noGoZonesRef.current;
+
+      const pts = eng.navMesh
+        ? eng.navMesh.findPath(eng.fpPosX, eng.fpPosZ, dest.x, dest.z, {
+            algorithm: algo,
+            noGoZones: zones,
+          })
+        : [
+            { x: eng.fpPosX, z: eng.fpPosZ },
+            { x: dest.x, z: dest.z },
+          ];
+      const finalPt = pts[pts.length - 1] ?? { x: dest.x, z: dest.z };
+      eng.pathFinderDest = { label: dest.label, code: dest.code, x: finalPt.x, z: finalPt.z };
+      eng.pathFinderWaypoints = pts;
+      eng.pathFinderRig = populatePathFinderVisual(
+        eng.pathFinderGroup,
+        pts,
+        flElev,
+        disposeObject3D,
+        algo
+      );
+      eng.lastPathRerouteAt = performance.now();
+
+      if (autoWalk) {
+        eng.teleportQueue = pts.slice(1);
+        eng.teleportTarget = eng.teleportQueue.shift() ?? { x: finalPt.x, z: finalPt.z };
+        eng.teleportRing.visible = true;
+        eng.teleportRing.position.set(finalPt.x, flElev + 0.055, finalPt.z);
+        if (spatialAudioEnabledRef.current && spatialAudioRef.current) {
+          spatialAudioRef.current.setEnabled(true);
+        }
+      } else {
+        eng.teleportQueue = [];
+        eng.teleportTarget = null;
+        eng.teleportRing.visible = false;
+      }
+
+      const distM = Number(computePathLengthMeters(pts).toFixed(1));
+      setPathFinderHud({
+        label: dest.label,
+        code: dest.code,
+        remainingM: distM,
+        autoWalking: autoWalk,
+      });
+      setPathFinderOpen(false);
+      st.showToast(
+        autoWalk
+          ? `Path Finder (${algo === 'least-congested' ? 'Least Congested' : 'Shortest'}): auto-walking to ${dest.code} (${distM}m)`
+          : `Path Finder (${algo === 'least-congested' ? 'Least Congested' : 'Shortest'}): route highlighted to ${dest.code} (${distM}m)`,
+        'info'
+      );
+      eng.requestRender();
+    },
+    []
+  );
+
+  // Sync user-configured Spatial Audio rolloff distances & falloff curves into Web Audio engine
+  useEffect(() => {
+    if (!spatialAudioRef.current) {
+      spatialAudioRef.current = new FacilitySpatialAudioEngine();
+    }
+    spatialAudioRef.current.updateSettings(spatialAudioSettings);
+  }, [spatialAudioSettings]);
+
+  // Sync 3D No-Go Exclusion Zones & live-recalculate any active Path Finder route when config changes
+  useEffect(() => {
+    const eng = engineRef.current;
+    if (!eng) return;
+    const fl = sceneData.floors.find((f) => f.id === activeFloorId);
+    const flElev = fl?.elevation ?? 0;
+    const floorZones = noGoZones.filter((z) => z.floorId === activeFloorId);
+    populateNoGoZonesVisual(eng.noGoZonesGroup, floorZones, flElev, disposeObject3D);
+
+    if (eng.pathFinderDest && eng.pathFinderGroup.visible) {
+      const dest = eng.pathFinderDest;
+      const pts = eng.navMesh
+        ? eng.navMesh.findPath(eng.fpPosX, eng.fpPosZ, dest.x, dest.z, {
+            algorithm: pathAlgorithm,
+            noGoZones,
+          })
+        : [
+            { x: eng.fpPosX, z: eng.fpPosZ },
+            { x: dest.x, z: dest.z },
+          ];
+      eng.pathFinderWaypoints = pts;
+      eng.pathFinderRig = populatePathFinderVisual(
+        eng.pathFinderGroup,
+        pts,
+        flElev,
+        disposeObject3D,
+        pathAlgorithm
+      );
+      if (eng.teleportTarget) {
+        eng.teleportQueue = pts.slice(1);
+        eng.teleportTarget = eng.teleportQueue.shift() ?? null;
+      }
+      const distM = Number(computePathLengthMeters(pts).toFixed(1));
+      setPathFinderHud((prev) => (prev ? { ...prev, remainingM: distM } : null));
+    }
+    eng.requestRender();
+  }, [noGoZones, pathAlgorithm, activeFloorId, sceneData.floors]);
+
+  // Manage 3D Spatial Audio activation with first-person walkthrough mode
+  useEffect(() => {
+    if (!spatialAudioRef.current) {
+      spatialAudioRef.current = new FacilitySpatialAudioEngine();
+    }
+    const active = Boolean(firstPersonMode && spatialAudioEnabled);
+    spatialAudioRef.current.setEnabled(active);
+    if (!active) {
+      setAudioTelemetry(null);
+    }
+    if (!firstPersonMode) {
+      setPathFinderOpen(false);
+      setSpatialAudioSettingsOpen(false);
+      setPlacingNoGoZone(false);
+      clearPathFinderRoute();
+    }
+  }, [firstPersonMode, spatialAudioEnabled, clearPathFinderRoute]);
+
+  // Dispose Web Audio graph cleanly on unmount
+  useEffect(() => {
+    return () => {
+      spatialAudioRef.current?.dispose();
+      spatialAudioRef.current = null;
+    };
+  }, []);
+
+  const executeInteractable = useCallback((item: WalkInteractable) => {
+    const maya = useMayaStore.getState();
+    const eng = engineRef.current;
+    if (item.kind === 'door') {
+      const opened = maya.toggleDoor(item.id, item.title, item.roomId ?? null);
+      if (spatialAudioEnabledRef.current) {
+        spatialAudioRef.current?.playDoorCue(opened);
+      }
+      if (eng?.walkAvatar.mayaController) {
+        eng.walkAvatar.manualEmoteUntil = performance.now() + 1800;
+        eng.walkAvatar.mayaController.setState('working', { expression: 'approval', fade: 0.2, restart: true });
+      }
+      storeRef.current.showToast(`${opened ? 'Opened' : 'Closed'} ${item.title}`, 'info');
+      eng?.requestRender();
+    } else if (item.kind === 'light') {
+      const targetRoomId = item.roomId || item.id;
+      const isOn = maya.toggleRoomLight(
+        targetRoomId,
+        item.code,
+        item.title,
+        item.switchId,
+        item.switchLabel
+      );
+      if (spatialAudioEnabledRef.current) {
+        spatialAudioRef.current?.playSwitchCue(isOn);
+      }
+      if (eng?.walkAvatar.mayaController) {
+        eng.walkAvatar.manualEmoteUntil = performance.now() + 1600;
+        eng.walkAvatar.mayaController.setState('approval', { expression: isOn ? 'happy' : 'neutral', fade: 0.2, restart: true });
+      }
+      const swName = item.switchLabel ? `${item.code} · ${item.switchLabel}` : `${item.code} lighting`;
+      storeRef.current.showToast(`${swName} turned ${isOn ? 'ON (Day)' : 'OFF (Night)'}`, 'info');
+      eng?.requestRender();
+    } else if (item.kind === 'equipment') {
+      setWalkInspectAssetId(item.id);
+      const ast = storeRef.current.scene.assets.find((a) => a.id === item.id);
+      if (ast) {
+        maya.setMood('analyze', 'curious', `Inspecting ${ast.assetId} · ${ast.name}`, 6000);
+        maya.logInteraction({
+          kind: 'equipment',
+          targetId: ast.id,
+          targetCode: ast.assetId,
+          targetName: ast.name,
+          summary: `Inspected ${ast.assetId} (${ast.name}) & opened SOP quick card`,
+          mayaState: 'analyze',
+          roomId: ast.roomId ?? null,
+        });
+      }
+      if (eng?.walkAvatar.mayaController) {
+        eng.walkAvatar.manualEmoteUntil = performance.now() + 3400;
+        eng.walkAvatar.mayaController.setState('analyze', { expression: 'curious', fade: 0.25, restart: true });
+      }
+      eng?.requestRender();
+    }
+  }, []);
+
+  const saveCurrentWalkPose = useCallback(() => {
+    const eng = engineRef.current;
+    const st = storeRef.current;
+    if (!eng || !st.firstPersonMode) return;
+    const curRoom = st.scene.rooms.find(
+      (r) =>
+        r.floorId === st.activeFloorId &&
+        eng.fpPosX >= r.x &&
+        eng.fpPosX <= r.x + r.width &&
+        eng.fpPosZ >= r.z &&
+        eng.fpPosZ <= r.z + r.depth
+    );
+    useMayaStore.getState().saveWalkPose({
+      floorId: st.activeFloorId,
+      x: Number(eng.fpPosX.toFixed(2)),
+      z: Number(eng.fpPosZ.toFixed(2)),
+      yaw: eng.fpYaw,
+      camYaw: eng.fpCamYaw,
+      pitch: eng.fpPitch,
+      cameraMode: walkCameraModeRef.current,
+      roomId: curRoom?.id ?? null,
+      roomCode: curRoom?.code ?? null,
+      roomName: curRoom?.name ?? null,
+    });
+  }, []);
+
+  const executeInteractableRef = useRef(executeInteractable);
+  executeInteractableRef.current = executeInteractable;
 
   const engineRef = useRef<{
     renderer: THREE.WebGLRenderer;
@@ -640,11 +1448,37 @@ export const Viewport3D: React.FC = () => {
     nightLightsGroup: THREE.Group;
     navMeshGroup: THREE.Group;
     navMesh: FloorNavMesh | null;
-    flowPulses: { mesh: THREE.Mesh; curve: THREE.CatmullRomCurve3; phase: number; speed: number }[];
+    flowsGroup: THREE.Group;
+    hvacGroup: THREE.Group;
+    traceGroup: THREE.Group;
+    placeGhostGroup: THREE.Group;
+    pathFinderGroup: THREE.Group;
+    noGoZonesGroup: THREE.Group;
+    pathFinderRig: PathFinderVisualRig | null;
+    pathFinderDest: { label: string; code: string; x: number; z: number } | null;
+    pathFinderWaypoints: Array<{ x: number; z: number }>;
+    teleportQueue: Array<{ x: number; z: number }>;
+    lastPathRerouteAt: number;
+    teleportRing: THREE.Mesh;
+    teleportTarget: { x: number; z: number } | null;
+    animatedDoors: Map<string, AnimatedDoorRig>;
+    roomLightRigs: Map<string, RoomLightRig>;
+    flowPulseInstancedMesh: THREE.InstancedMesh | null;
+    flowPulseTracks: FlowPulseTrack[];
+    tracePulseInstancedMesh: THREE.InstancedMesh | null;
+    tracePulseTracks: FlowPulseTrack[];
+    lastPulseTick: number;
     fpVelY: number;
     fpOnGround: boolean;
     fpYaw: number;
+    fpCamYaw: number;
     fpPitch: number;
+    fpPosX: number;
+    fpPosZ: number;
+    fpJumpY: number;
+    fpAnimPhase: number;
+    fpMoveBlend: number;
+    walkAvatar: WalkAvatarRig;
     fpLookDragging: boolean;
     fpLookLastX: number;
     fpLookLastY: number;
@@ -767,8 +1601,52 @@ export const Viewport3D: React.FC = () => {
     const contentGroup = new THREE.Group();
     threeScene.add(contentGroup);
 
+    const flowsGroup = new THREE.Group();
+    threeScene.add(flowsGroup);
+
+    const hvacGroup = new THREE.Group();
+    threeScene.add(hvacGroup);
+
+    const traceGroup = new THREE.Group();
+    threeScene.add(traceGroup);
+
+    const placeGhostGroup = new THREE.Group();
+    placeGhostGroup.visible = false;
+    threeScene.add(placeGhostGroup);
+
+    const pathFinderGroup = new THREE.Group();
+    pathFinderGroup.visible = false;
+    threeScene.add(pathFinderGroup);
+
+    const noGoZonesGroup = new THREE.Group();
+    noGoZonesGroup.visible = false;
+    threeScene.add(noGoZonesGroup);
+
+    // Glowing floor target ring for Point-and-Click Teleportation in Walk Mode
+    const teleportRing = new THREE.Mesh(
+      new THREE.RingGeometry(0.28, 0.44, 32),
+      new THREE.MeshBasicMaterial({
+        color: '#22D3EE',
+        transparent: true,
+        opacity: 0.85,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    teleportRing.rotation.x = -Math.PI / 2;
+    teleportRing.visible = false;
+    threeScene.add(teleportRing);
+
+    const animatedDoors = new Map<string, AnimatedDoorRig>();
+    const roomLightRigs = new Map<string, RoomLightRig>();
+
     const vrRig = new THREE.Group();
     threeScene.add(vrRig);
+
+    const walkAvatar = buildWalkAvatar(() => {
+      engineRef.current?.requestRender();
+    });
+    threeScene.add(walkAvatar.root);
 
     const navMeshGroup = new THREE.Group();
     threeScene.add(navMeshGroup);
@@ -782,6 +1660,8 @@ export const Viewport3D: React.FC = () => {
 
     const gridHelper = new THREE.Group();
     threeScene.add(gridHelper);
+
+    viewportSizeRef.current = { w: width, h: height };
 
     const clippingPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 100);
     const assetGroupMap = new Map<string, THREE.Object3D>();
@@ -852,148 +1732,692 @@ export const Viewport3D: React.FC = () => {
             }
           }
 
-          // First-Person Character Walkthrough: True Human-Head Rotation + Sub-stepped Anti-Tunnel NavMesh & Wall Collision
+          // Animate realistic doors by type + sync dynamic room lighting every frame
+          const mayaSnapshot = useMayaStore.getState();
+          eng.animatedDoors.forEach((rig) => {
+            const targetOpen = mayaSnapshot.openDoors[rig.openingId] ? 1 : 0;
+            if (Math.abs(rig.progress - targetOpen) > 0.002) {
+              rig.progress = THREE.MathUtils.damp(rig.progress, targetOpen, 7.5, dt);
+              if (Math.abs(rig.progress - targetOpen) <= 0.004) rig.progress = targetOpen;
+              needsAnother = true;
+            }
+            const p = rig.progress;
+            if (rig.singlePivot) {
+              rig.singlePivot.rotation.y = rig.swingSign * p * (Math.PI * 0.48);
+              if (rig.closerArm) {
+                rig.closerArm.rotation.y = rig.swingSign * p * (Math.PI * 0.36);
+              }
+            } else if (rig.leftPivot && rig.rightPivot) {
+              rig.leftPivot.rotation.y = -p * (Math.PI * 0.46);
+              rig.rightPivot.rotation.y = p * (Math.PI * 0.46);
+            } else if (rig.slideLeft && rig.slideRight) {
+              rig.slideLeft.position.x = -p * rig.slideTravel;
+              rig.slideRight.position.x = p * rig.slideTravel;
+            } else if (rig.rollCurtain) {
+              const sY = Math.max(0.06, 1 - p * 0.92);
+              rig.rollCurtain.scale.y = sY;
+              rig.rollCurtain.position.y = rig.rollMaxH - (rig.rollMaxH * sY) / 2;
+            }
+            if (rig.ledMat) {
+              rig.ledMat.color.set(p > 0.35 ? '#22D3EE' : '#10B981');
+            }
+          });
+
+          eng.roomLightRigs.forEach((lr) => {
+            const switchMap = new Map<string, boolean>();
+            for (const sw of lr.switches) {
+              const on = mayaSnapshot.isSwitchOn(sw.id, lr.roomId, sw.defaultOn);
+              switchMap.set(sw.id, on);
+              sw.ledMat.color.set(on ? '#34D399' : '#F59E0B');
+              sw.rocker.rotation.x = on ? -0.22 : 0.22;
+            }
+
+            let primaryTotal = 0;
+            let primaryOn = 0;
+            for (const fx of lr.fixtures) {
+              const swOn = switchMap.has(fx.switchId)
+                ? Boolean(switchMap.get(fx.switchId))
+                : mayaSnapshot.isSwitchOn(fx.switchId, lr.roomId, fx.defaultOn);
+              if (!fx.isEmergency) {
+                primaryTotal++;
+                if (swOn) primaryOn++;
+              }
+              const targetEmissive = swOn ? fx.maxEmissive : 0.03;
+              if (Math.abs(fx.mat.emissiveIntensity - targetEmissive) > 0.015) {
+                fx.mat.emissiveIntensity = THREE.MathUtils.damp(
+                  fx.mat.emissiveIntensity,
+                  targetEmissive,
+                  9,
+                  dt
+                );
+                needsAnother = true;
+              }
+            }
+
+            const litRatio =
+              primaryTotal > 0
+                ? primaryOn / primaryTotal
+                : mayaSnapshot.roomLights[lr.roomId] ?? true
+                  ? 1
+                  : 0;
+
+            if (lr.pointLight) {
+              const targetInt = lr.maxLightIntensity * litRatio;
+              if (Math.abs(lr.pointLight.intensity - targetInt) > 0.02) {
+                lr.pointLight.intensity = THREE.MathUtils.damp(lr.pointLight.intensity, targetInt, 8, dt);
+                needsAnother = true;
+              }
+            }
+
+            const targetFloorDim = (1 - litRatio) * 0.62;
+            if (Math.abs(lr.dimOverlayMat.opacity - targetFloorDim) > 0.008) {
+              lr.dimOverlayMat.opacity = THREE.MathUtils.damp(lr.dimOverlayMat.opacity, targetFloorDim, 8, dt);
+              lr.dimOverlayMesh.visible = lr.dimOverlayMat.opacity > 0.01;
+              needsAnother = true;
+            }
+
+            const targetEnvelopeDark = (1 - litRatio) * 0.72;
+            if (Math.abs(lr.darkEnvelopeMat.opacity - targetEnvelopeDark) > 0.008) {
+              lr.darkEnvelopeMat.opacity = THREE.MathUtils.damp(
+                lr.darkEnvelopeMat.opacity,
+                targetEnvelopeDark,
+                8,
+                dt
+              );
+              lr.darkEnvelopeMesh.visible = lr.darkEnvelopeMat.opacity > 0.01;
+              needsAnother = true;
+            }
+          });
+
+          // First-Person & Third-Person Character Walkthrough: Grounded Physics, Teleport, GTA Camera & Maya Avatar
           if (storeRef.current.firstPersonMode) {
             const activeFl = storeRef.current.scene.floors.find(
               (f) => f.id === storeRef.current.activeFloorId
             );
-            const eyeBaseY = (activeFl?.elevation ?? 0) + 1.68;
+            const floorElev = activeFl?.elevation ?? 0;
             const joy = fpJoystickRef.current;
             const joyMag = Math.hypot(joy.x, joy.y);
             const hasJoy = joyMag > 0.05;
+            const sprinting =
+              eng.keys.has('ShiftLeft') || eng.keys.has('ShiftRight') || fpSprintRef.current;
+            const isThirdPerson =
+              walkCameraModeRef.current === 'third-person' && !eng.renderer.xr.isPresenting;
 
-            // Keep camera head rotation exact in YXZ human-neck order (no orbit arc!)
-            eng.perspCamera.rotation.order = 'YXZ';
-            eng.perspCamera.rotation.set(eng.fpPitch, eng.fpYaw, 0);
+            let movedThisFrame = false;
+            let manualWalkActive = false;
 
-            if (eng.keys.size > 0 || hasJoy) {
-              const sprinting =
-                eng.keys.has('ShiftLeft') || eng.keys.has('ShiftRight') || fpSprintRef.current;
+            const keyFwd =
+              (eng.keys.has('KeyW') || eng.keys.has('ArrowUp') ? 1 : 0) -
+              (eng.keys.has('KeyS') || eng.keys.has('ArrowDown') ? 1 : 0);
+            const keyRight =
+              (eng.keys.has('KeyD') || eng.keys.has('ArrowRight') ? 1 : 0) -
+              (eng.keys.has('KeyA') || eng.keys.has('ArrowLeft') ? 1 : 0);
+
+            const fwdAmt = keyFwd + (hasJoy ? -joy.y : 0);
+            const rightAmt = keyRight + (hasJoy ? joy.x : 0);
+            const inputLen = Math.hypot(fwdAmt, rightAmt);
+
+            const flId = storeRef.current.activeFloorId;
+            const flWalls = storeRef.current.scene.walls.filter((w) => w.floorId === flId);
+            const flOpenings = storeRef.current.scene.openings.filter((o) => o.floorId === flId);
+            const floorW = activeFl?.width ?? 0;
+            const floorD = activeFl?.depth ?? 0;
+            const openDoorsMap = mayaSnapshot.openDoors;
+            const MAYA_RADIUS = 0.28;
+
+            if (inputLen > 0.02) {
+              manualWalkActive = true;
+              eng.teleportTarget = null;
+              eng.teleportRing.visible = false;
+
               const speed = (sprinting ? 8.2 : 4.8) * dt;
-              const forward = new THREE.Vector3(
-                -Math.sin(eng.fpYaw),
-                0,
-                -Math.cos(eng.fpYaw)
-              ).normalize();
-              const right = new THREE.Vector3(
-                Math.cos(eng.fpYaw),
-                0,
-                -Math.sin(eng.fpYaw)
-              ).normalize();
+              const moveYaw = isThirdPerson ? eng.fpCamYaw : eng.fpYaw;
+              const forward = new THREE.Vector3(-Math.sin(moveYaw), 0, -Math.cos(moveYaw)).normalize();
+              const right = new THREE.Vector3(Math.cos(moveYaw), 0, -Math.sin(moveYaw)).normalize();
 
-              const keyFwd =
-                (eng.keys.has('KeyW') || eng.keys.has('ArrowUp') ? 1 : 0) -
-                (eng.keys.has('KeyS') || eng.keys.has('ArrowDown') ? 1 : 0);
-              const keyRight =
-                (eng.keys.has('KeyD') || eng.keys.has('ArrowRight') ? 1 : 0) -
-                (eng.keys.has('KeyA') || eng.keys.has('ArrowLeft') ? 1 : 0);
+              const throttle = Math.min(1, inputLen);
+              const move = new THREE.Vector3()
+                .addScaledVector(forward, fwdAmt / inputLen)
+                .addScaledVector(right, rightAmt / inputLen)
+                .multiplyScalar(speed * throttle);
 
-              const fwdAmt = keyFwd + (hasJoy ? -joy.y : 0);
-              const rightAmt = keyRight + (hasJoy ? joy.x : 0);
-              const inputLen = Math.hypot(fwdAmt, rightAmt);
+              // Rotate MAYA smoothly toward movement direction + GTA-style follow-behind camera alignment
+              if (isThirdPerson) {
+                const desiredCharYaw = Math.atan2(-move.x, -move.z);
+                let diffChar = desiredCharYaw - eng.fpYaw;
+                while (diffChar > Math.PI) diffChar -= Math.PI * 2;
+                while (diffChar < -Math.PI) diffChar += Math.PI * 2;
+                eng.fpYaw += diffChar * Math.min(1, dt * 11);
 
-              if (inputLen > 0.02) {
-                const throttle = Math.min(1, inputLen);
-                const move = new THREE.Vector3()
-                  .addScaledVector(forward, fwdAmt / inputLen)
-                  .addScaledVector(right, rightAmt / inputLen)
-                  .multiplyScalar(speed * throttle);
+                // Smoothly swing camera behind character while walking (GTA style)
+                if (!eng.fpLookDragging) {
+                  let diffCam = eng.fpYaw - eng.fpCamYaw;
+                  while (diffCam > Math.PI) diffCam -= Math.PI * 2;
+                  while (diffCam < -Math.PI) diffCam += Math.PI * 2;
+                  eng.fpCamYaw += diffCam * Math.min(1, dt * 4.5);
+                }
+              } else {
+                eng.fpCamYaw = eng.fpYaw;
+              }
 
-                const flId = storeRef.current.activeFloorId;
-                const flWalls = storeRef.current.scene.walls.filter((w) => w.floorId === flId);
-                const flOpenings = storeRef.current.scene.openings.filter((o) => o.floorId === flId);
-                const floorW = activeFl?.width ?? 0;
-                const floorD = activeFl?.depth ?? 0;
+              // Sub-step every <= 0.075m so even Sprint mode NEVER clips MAYA's head into walls
+              const totalDist = Math.hypot(move.x, move.z);
+              const subSteps = Math.max(1, Math.ceil(totalDist / 0.075));
+              const stepDx = move.x / subSteps;
+              const stepDz = move.z / subSteps;
 
-                // Sub-step every <= 0.075m so even Fast/Sprint mode can NEVER tunnel through walls or non-NavMesh zones
-                const totalDist = Math.hypot(move.x, move.z);
-                const subSteps = Math.max(1, Math.ceil(totalDist / 0.075));
-                const stepDx = move.x / subSteps;
-                const stepDz = move.z / subSteps;
+              let stepX = eng.fpPosX;
+              let stepZ = eng.fpPosZ;
 
-                let stepX = eng.perspCamera.position.x;
-                let stepZ = eng.perspCamera.position.z;
+              for (let s = 0; s < subSteps; s++) {
+                const wantX = stepX + stepDx;
+                const wantZ = stepZ + stepDz;
 
-                for (let s = 0; s < subSteps; s++) {
-                  const wantX = stepX + stepDx;
-                  const wantZ = stepZ + stepDz;
+                const navRes = eng.navMesh
+                  ? eng.navMesh.resolveMove(stepX, stepZ, wantX, wantZ)
+                  : { x: wantX, z: wantZ };
 
-                  // 1. Always enforce NavMesh walkability (door portals are already carved walkable in navMesh.ts)
-                  const navRes = eng.navMesh
-                    ? eng.navMesh.resolveMove(stepX, stepZ, wantX, wantZ)
-                    : { x: wantX, z: wantZ };
+                const strict = resolveStrictWallCollision(
+                  stepX,
+                  stepZ,
+                  navRes.x,
+                  navRes.z,
+                  MAYA_RADIUS,
+                  flWalls,
+                  flOpenings,
+                  floorW,
+                  floorD,
+                  openDoorsMap
+                );
 
-                  // 2. Always enforce analytic solid-wall circle collision
-                  const strict = resolveStrictWallCollision(
-                    stepX,
-                    stepZ,
-                    navRes.x,
-                    navRes.z,
-                    0.36,
-                    flWalls,
-                    flOpenings,
-                    floorW,
-                    floorD
-                  );
-
-                  // 3. Final NavMesh guard so wall-sliding never pushes player into a non-walkable equipment/void cell
-                  if (eng.navMesh && !eng.navMesh.isWalkable(strict.x, strict.z)) {
-                    const reNav = eng.navMesh.resolveMove(stepX, stepZ, strict.x, strict.z);
-                    if (eng.navMesh.isWalkable(reNav.x, reNav.z)) {
-                      stepX = reNav.x;
-                      stepZ = reNav.z;
-                    }
-                    break;
+                if (eng.navMesh && !eng.navMesh.isWalkable(strict.x, strict.z)) {
+                  const reNav = eng.navMesh.resolveMove(stepX, stepZ, strict.x, strict.z);
+                  if (eng.navMesh.isWalkable(reNav.x, reNav.z)) {
+                    stepX = reNav.x;
+                    stepZ = reNav.z;
                   }
-
-                  if (Math.hypot(strict.x - stepX, strict.z - stepZ) < 0.0005) {
-                    break;
-                  }
-                  stepX = strict.x;
-                  stepZ = strict.z;
+                  break;
                 }
 
-                eng.perspCamera.position.x = stepX;
-                eng.perspCamera.position.z = stepZ;
-                needsAnother = true;
+                if (Math.hypot(strict.x - stepX, strict.z - stepZ) < 0.0005) {
+                  break;
+                }
+                stepX = strict.x;
+                stepZ = strict.z;
+              }
+
+              if (Math.hypot(stepX - eng.fpPosX, stepZ - eng.fpPosZ) > 0.0008) {
+                movedThisFrame = true;
+              }
+              eng.fpPosX = stepX;
+              eng.fpPosZ = stepZ;
+              needsAnother = true;
+            } else if (eng.teleportTarget) {
+              // Smooth A* Waypoint-by-Waypoint Path Finder Teleport Glide
+              const tdx = eng.teleportTarget.x - eng.fpPosX;
+              const tdz = eng.teleportTarget.z - eng.fpPosZ;
+              const dist = Math.hypot(tdx, tdz);
+              if (dist < 0.22) {
+                if (eng.teleportQueue.length > 0) {
+                  eng.teleportTarget = eng.teleportQueue.shift() ?? null;
+                  needsAnother = true;
+                } else {
+                  eng.teleportTarget = null;
+                  eng.teleportRing.visible = false;
+                  if (eng.pathFinderDest) {
+                    const destDist = Math.hypot(
+                      eng.pathFinderDest.x - eng.fpPosX,
+                      eng.pathFinderDest.z - eng.fpPosZ
+                    );
+                    if (destDist < 1.35) {
+                      const arrivedLabel = eng.pathFinderDest.label;
+                      eng.pathFinderDest = null;
+                      eng.pathFinderWaypoints = [];
+                      eng.pathFinderGroup.visible = false;
+                      disposeObject3D(eng.pathFinderGroup);
+                      eng.pathFinderGroup.clear();
+                      eng.pathFinderRig = null;
+                      setPathFinderHud(null);
+                      storeRef.current.showToast(`Arrived at ${arrivedLabel}`, 'success');
+                    } else {
+                      setPathFinderHud((prev) => (prev ? { ...prev, autoWalking: false } : null));
+                    }
+                  }
+                }
+              } else {
+                const step = Math.min(dist, 9.5 * dt);
+                const wantX = eng.fpPosX + (tdx / dist) * step;
+                const wantZ = eng.fpPosZ + (tdz / dist) * step;
+                const strict = resolveStrictWallCollision(
+                  eng.fpPosX,
+                  eng.fpPosZ,
+                  wantX,
+                  wantZ,
+                  MAYA_RADIUS,
+                  flWalls,
+                  flOpenings,
+                  floorW,
+                  floorD,
+                  openDoorsMap
+                );
+                const moved = Math.hypot(strict.x - eng.fpPosX, strict.z - eng.fpPosZ);
+                if (moved < 0.004) {
+                  // Hit a closed door or obstacle along path — stop auto-glide so user can press Space to open door
+                  eng.teleportTarget = null;
+                  eng.teleportQueue = [];
+                  eng.teleportRing.visible = false;
+                  setPathFinderHud((prev) => (prev ? { ...prev, autoWalking: false } : null));
+                } else {
+                  eng.fpPosX = strict.x;
+                  eng.fpPosZ = strict.z;
+                  movedThisFrame = true;
+                  const targetYaw = Math.atan2(-tdx, -tdz);
+                  let dyaw = targetYaw - eng.fpYaw;
+                  while (dyaw > Math.PI) dyaw -= Math.PI * 2;
+                  while (dyaw < -Math.PI) dyaw += Math.PI * 2;
+                  eng.fpYaw += dyaw * Math.min(1, dt * 12);
+                  if (!eng.fpLookDragging) {
+                    let dcam = eng.fpYaw - eng.fpCamYaw;
+                    while (dcam > Math.PI) dcam -= Math.PI * 2;
+                    while (dcam < -Math.PI) dcam += Math.PI * 2;
+                    eng.fpCamYaw += dcam * Math.min(1, dt * 6);
+                  }
+                  const finalGoal =
+                    eng.teleportQueue.length > 0
+                      ? eng.teleportQueue[eng.teleportQueue.length - 1]
+                      : eng.teleportTarget;
+                  eng.teleportRing.visible = true;
+                  eng.teleportRing.position.set(finalGoal.x, floorElev + 0.055, finalGoal.z);
+                  const pulse = 0.85 + Math.sin(now * 0.01) * 0.18;
+                  eng.teleportRing.scale.setScalar(pulse);
+                  needsAnother = true;
+                }
               }
             }
 
-            // Vertical Jump Physics (Spacebar)
+            // Animate 3D Path Finder Ribbon & Dynamically Update Route while Walking
+            if (eng.pathFinderDest && eng.pathFinderGroup.visible) {
+              animatePathFinderVisual(eng.pathFinderRig, now * 0.001);
+              needsAnother = true;
+              const distToDest = Math.hypot(
+                eng.pathFinderDest.x - eng.fpPosX,
+                eng.pathFinderDest.z - eng.fpPosZ
+              );
+              if (distToDest < 1.25 && !eng.teleportTarget) {
+                const arrivedLabel = eng.pathFinderDest.label;
+                eng.pathFinderDest = null;
+                eng.pathFinderWaypoints = [];
+                eng.pathFinderGroup.visible = false;
+                disposeObject3D(eng.pathFinderGroup);
+                eng.pathFinderGroup.clear();
+                eng.pathFinderRig = null;
+                setPathFinderHud(null);
+                storeRef.current.showToast(`Arrived at ${arrivedLabel}`, 'success');
+              } else if (movedThisFrame && now - eng.lastPathRerouteAt > 260) {
+                eng.lastPathRerouteAt = now;
+                const algo = pathAlgorithmRef.current;
+                const pts = eng.navMesh
+                  ? eng.navMesh.findPath(
+                      eng.fpPosX,
+                      eng.fpPosZ,
+                      eng.pathFinderDest.x,
+                      eng.pathFinderDest.z,
+                      { algorithm: algo, noGoZones: noGoZonesRef.current }
+                    )
+                  : [
+                      { x: eng.fpPosX, z: eng.fpPosZ },
+                      { x: eng.pathFinderDest.x, z: eng.pathFinderDest.z },
+                    ];
+                eng.pathFinderWaypoints = pts;
+                eng.pathFinderRig = populatePathFinderVisual(
+                  eng.pathFinderGroup,
+                  pts,
+                  floorElev,
+                  disposeObject3D,
+                  algo
+                );
+                const remM = Number(computePathLengthMeters(pts).toFixed(1));
+                setPathFinderHud((prev) =>
+                  prev
+                    ? { ...prev, remainingM: remM, autoWalking: Boolean(eng.teleportTarget) }
+                    : null
+                );
+              }
+            }
+
+            // High-Arc Vertical Jump Physics (Spacebar / Touch Jump — ~2.14m peak)
             if (!eng.fpOnGround || Math.abs(eng.fpVelY) > 0.001) {
-              eng.fpVelY -= 14.2 * dt;
-              const nextY = eng.perspCamera.position.y + eng.fpVelY * dt;
-              if (nextY <= eyeBaseY) {
-                eng.perspCamera.position.y = eyeBaseY;
+              eng.fpVelY -= 13.5 * dt;
+              const nextJumpY = eng.fpJumpY + eng.fpVelY * dt;
+              if (nextJumpY <= 0) {
+                eng.fpJumpY = 0;
                 eng.fpVelY = 0;
                 eng.fpOnGround = true;
               } else {
-                eng.perspCamera.position.y = nextY;
+                eng.fpJumpY = nextJumpY;
                 needsAnother = true;
               }
             }
 
-            // Throttled live sync for the handheld character tablet
-            if (now - eng.lastFpUiSync > 160) {
+            // Update MAYA 3D Character Avatar (visible in 3rd-person mode, hidden in 1st-person & WebXR)
+            const av = eng.walkAvatar;
+            av.root.visible = isThirdPerson;
+            av.root.position.set(eng.fpPosX, floorElev + eng.fpJumpY, eng.fpPosZ);
+            av.root.rotation.y = eng.fpYaw + Math.PI;
+
+            // Keep ground contact halo anchored cleanly to the floor slab beneath MAYA
+            av.shadowRing.position.y = 0.025 - eng.fpJumpY;
+            const haloScale = Math.max(0.45, 1 - eng.fpJumpY * 0.22);
+            av.shadowRing.scale.setScalar(haloScale);
+
+            const targetBlend = movedThisFrame ? (sprinting ? 1.0 : 0.72) : 0;
+            eng.fpMoveBlend = THREE.MathUtils.damp(eng.fpMoveBlend, targetBlend, 10, dt);
+            if (eng.fpMoveBlend > 0.015) {
+              eng.fpAnimPhase += dt * (sprinting ? 14.2 : 9.4);
+              if (!movedThisFrame) needsAnother = true;
+            }
+
+            if (isThirdPerson && av.mayaController) {
+              const desiredMode: WalkAvatarRig['activeMotionMode'] = !eng.fpOnGround
+                ? 'jump'
+                : movedThisFrame
+                  ? sprinting
+                    ? 'sprint'
+                    : 'walk'
+                  : 'idle';
+
+              if (desiredMode !== av.activeMotionMode) {
+                av.activeMotionMode = desiredMode;
+                if (desiredMode === 'jump') {
+                  av.manualEmoteUntil = 0;
+                  av.mayaController.setState('celebrate', { fade: 0.18, restart: true });
+                } else if (desiredMode === 'sprint') {
+                  av.manualEmoteUntil = 0;
+                  av.mayaController.setState('idle', { expression: 'confident', fade: 0.26 });
+                } else if (desiredMode === 'walk') {
+                  av.manualEmoteUntil = 0;
+                  av.mayaController.setState('idle', { expression: 'happy', fade: 0.3 });
+                } else if (now > av.manualEmoteUntil) {
+                  av.mayaController.setState('idle', { fade: 0.42 });
+                }
+              }
+
+              av.mayaController.update(dt);
+
+              if (!eng.fpOnGround) {
+                if (av.legL) av.legL.rotation.x = THREE.MathUtils.damp(av.legL.rotation.x, -0.52, 12, dt);
+                if (av.legR) av.legR.rotation.x = THREE.MathUtils.damp(av.legR.rotation.x, 0.36, 12, dt);
+                if (av.torsoPivot) {
+                  av.torsoPivot.position.y = THREE.MathUtils.damp(
+                    av.torsoPivot.position.y,
+                    av.baseTorsoY + 0.04,
+                    12,
+                    dt
+                  );
+                }
+              } else {
+                const swing = Math.sin(eng.fpAnimPhase) * eng.fpMoveBlend;
+                const bob = Math.abs(Math.sin(eng.fpAnimPhase)) * 0.055 * eng.fpMoveBlend;
+                if (av.legL) av.legL.rotation.x = THREE.MathUtils.damp(av.legL.rotation.x, swing * 0.72, 16, dt);
+                if (av.legR) av.legR.rotation.x = THREE.MathUtils.damp(av.legR.rotation.x, -swing * 0.72, 16, dt);
+                if (av.torsoPivot) {
+                  av.torsoPivot.position.y = THREE.MathUtils.damp(
+                    av.torsoPivot.position.y,
+                    av.baseTorsoY + bob,
+                    16,
+                    dt
+                  );
+                  if (eng.fpMoveBlend > 0.01) {
+                    _mayaAdditiveQuat.setFromAxisAngle(_mayaAxisX, eng.fpMoveBlend * (sprinting ? 0.16 : 0.06));
+                    av.torsoPivot.quaternion.multiply(_mayaAdditiveQuat);
+                  }
+                }
+                if (eng.fpMoveBlend > 0.01) {
+                  if (av.armL) {
+                    _mayaAdditiveQuat.setFromAxisAngle(_mayaAxisX, -swing * 0.56);
+                    av.armL.quaternion.multiply(_mayaAdditiveQuat);
+                  }
+                  if (av.armR) {
+                    _mayaAdditiveQuat.setFromAxisAngle(_mayaAxisX, swing * 0.56);
+                    av.armR.quaternion.multiply(_mayaAdditiveQuat);
+                  }
+                }
+              }
+
+              if (!isSoftwareGl) needsAnother = true;
+            }
+
+            // Place Camera for 1st Person vs GTA-Style 3rd Person Orbit / Follow-Behind
+            if (isThirdPerson) {
+              const pitchClamped = Math.max(-0.46, Math.min(0.62, eng.fpPitch));
+              const desiredDist = 2.75;
+              const camH = Math.max(1.12, Math.min(3.1, 1.98 - Math.sin(pitchClamped) * 1.25));
+              const rawCamX = eng.fpPosX + Math.sin(eng.fpCamYaw) * desiredDist;
+              const rawCamZ = eng.fpPosZ + Math.cos(eng.fpCamYaw) * desiredDist;
+              // Pull 3rd-person camera inside room walls so camera never clips behind walls
+              const safeCam = resolveStrictWallCollision(
+                eng.fpPosX,
+                eng.fpPosZ,
+                rawCamX,
+                rawCamZ,
+                0.28,
+                flWalls,
+                flOpenings,
+                floorW,
+                floorD,
+                openDoorsMap
+              );
+              eng.perspCamera.position.set(safeCam.x, floorElev + camH + eng.fpJumpY * 0.82, safeCam.z);
+              eng.perspCamera.lookAt(eng.fpPosX, floorElev + 1.15 + eng.fpJumpY, eng.fpPosZ);
+              if (manualWalkActive) needsAnother = true;
+            } else {
+              eng.perspCamera.position.set(eng.fpPosX, floorElev + 1.66 + eng.fpJumpY, eng.fpPosZ);
+              eng.perspCamera.rotation.order = 'YXZ';
+              eng.perspCamera.rotation.set(eng.fpPitch, eng.fpYaw, 0);
+            }
+
+            // Update 3D HRTF Spatial Audio Listener (ambient machines, chillers, server racks & HVAC)
+            if (spatialAudioRef.current && spatialAudioEnabledRef.current) {
+              spatialAudioRef.current.updateListener(
+                eng.fpPosX,
+                floorElev + 1.66 + eng.fpJumpY,
+                eng.fpPosZ,
+                eng.fpYaw,
+                eng.fpPitch
+              );
+            }
+
+            // Throttled live sync for walk HUD, MAYA room tracking & Universal 3D Interaction Sign
+            if (now - eng.lastFpUiSync > 120) {
               eng.lastFpUiSync = now;
-              const cx = Number(eng.perspCamera.position.x.toFixed(1));
-              const cz = Number(eng.perspCamera.position.z.toFixed(1));
-              const jh = Math.max(0, Number((eng.perspCamera.position.y - eyeBaseY).toFixed(2)));
+              if (spatialAudioRef.current && spatialAudioEnabledRef.current) {
+                const tel = spatialAudioRef.current.getTelemetry();
+                setAudioTelemetry((prev) =>
+                  prev &&
+                  prev.active === tel.active &&
+                  prev.dominantLabel === tel.dominantLabel &&
+                  prev.estimatedDb === tel.estimatedDb
+                    ? prev
+                    : tel
+                );
+              }
+              const cx = Number(eng.fpPosX.toFixed(1));
+              const cz = Number(eng.fpPosZ.toFixed(1));
+              const jh = Math.max(0, Number(eng.fpJumpY.toFixed(2)));
               const wp = eng.navMesh?.walkablePercent ?? 82;
               setFpState((prev) =>
                 prev.x === cx && prev.z === cz && prev.jumpHeight === jh && prev.walkablePct === wp
                   ? prev
                   : { x: cx, z: cz, jumpHeight: jh, walkablePct: wp }
               );
+
+              // Sync current room into MAYA Life domain
+              const curRm = storeRef.current.scene.rooms.find(
+                (r) =>
+                  r.floorId === flId &&
+                  eng.fpPosX >= r.x &&
+                  eng.fpPosX <= r.x + r.width &&
+                  eng.fpPosZ >= r.z &&
+                  eng.fpPosZ <= r.z + r.depth
+              );
+              if (curRm) {
+                mayaSnapshot.setActiveLocation(curRm.id, curRm.code, curRm.name);
+              }
+
+              // Find nearest interactable (Door, Light Switch, or Equipment) within 2.65m
+              let bestItem: WalkInteractable | null = null;
+              let bestDist = 2.65;
+
+              eng.animatedDoors.forEach((rig) => {
+                if (rig.floorId !== flId) return;
+                const d = Math.hypot(rig.worldX - eng.fpPosX, rig.worldZ - eng.fpPosZ);
+                if (d < bestDist) {
+                  bestDist = d;
+                  const isOpen = Boolean(openDoorsMap[rig.openingId]);
+                  bestItem = {
+                    kind: 'door',
+                    id: rig.openingId,
+                    code: rig.subtype.replace(/-/g, ' ').toUpperCase(),
+                    title: rig.label,
+                    actionLabel: isOpen ? 'Close Door' : 'Open Door',
+                    detail: `${rig.label} · ${isOpen ? 'Open' : 'Closed'}`,
+                    worldX: rig.worldX,
+                    worldY: rig.worldY + 1.45,
+                    worldZ: rig.worldZ,
+                    roomId: rig.roomId,
+                    isOnOrOpen: isOpen,
+                  };
+                }
+              });
+
+              eng.roomLightRigs.forEach((lr) => {
+                if (lr.floorId !== flId) return;
+                for (const sw of lr.switches) {
+                  const d = Math.hypot(sw.worldX - eng.fpPosX, sw.worldZ - eng.fpPosZ);
+                  if (d < Math.min(bestDist, 2.35)) {
+                    bestDist = d;
+                    const isOn = mayaSnapshot.isSwitchOn(sw.id, lr.roomId, sw.defaultOn);
+                    bestItem = {
+                      kind: 'light',
+                      id: sw.id,
+                      code: lr.roomCode,
+                      title: lr.roomName,
+                      switchId: sw.id,
+                      switchLabel: sw.label,
+                      actionLabel: isOn ? `Switch OFF · ${sw.label}` : `Switch ON · ${sw.label}`,
+                      detail: `${lr.roomCode} · ${isOn ? 'ON (Day)' : 'OFF (Night)'}`,
+                      worldX: sw.worldX,
+                      worldY: sw.worldY + 0.42,
+                      worldZ: sw.worldZ,
+                      roomId: lr.roomId,
+                      isOnOrOpen: isOn,
+                    };
+                  }
+                }
+              });
+
+              if (!bestItem || bestDist > 1.75) {
+                const flAssets = storeRef.current.scene.assets.filter(
+                  (a) => a.floorId === flId && !a.hidden
+                );
+                for (const ast of flAssets) {
+                  const d = Math.hypot(ast.x - eng.fpPosX, ast.z - eng.fpPosZ);
+                  const reach = Math.max(1.8, Math.max(ast.width, ast.depth) * 0.65 + 1.05);
+                  if (d < reach && d < bestDist) {
+                    bestDist = d;
+                    bestItem = {
+                      kind: 'equipment',
+                      id: ast.id,
+                      code: ast.assetId,
+                      title: ast.name,
+                      actionLabel: 'Inspect & Read SOP',
+                      detail: `${ast.assetId} · ${ast.category}`,
+                      worldX: ast.x,
+                      worldY: floorElev + ast.y + Math.min(2.3, ast.height + 0.35),
+                      worldZ: ast.z,
+                      roomId: ast.roomId,
+                    };
+                  }
+                }
+              }
+
+              nearbyInteractableRef.current = bestItem;
+              if (bestItem) {
+                const bi = bestItem as WalkInteractable;
+                _projVec.set(bi.worldX, bi.worldY, bi.worldZ).project(eng.perspCamera);
+                const { w, h } = viewportSizeRef.current;
+                const sx = (_projVec.x * 0.5 + 0.5) * w;
+                const sy = (-_projVec.y * 0.5 + 0.5) * h;
+                const clampedX = Math.max(130, Math.min(w - 130, _projVec.z < 1 ? sx : w / 2));
+                const clampedY = Math.max(76, Math.min(h - 140, _projVec.z < 1 ? sy : h * 0.42));
+                setNearbyInteractable({ ...bi, screenX: clampedX, screenY: clampedY });
+              } else {
+                setNearbyInteractable((prev) => (prev ? null : prev));
+              }
+            }
+          } else {
+            eng.walkAvatar.root.visible = false;
+            eng.teleportRing.visible = false;
+            eng.teleportTarget = null;
+            eng.teleportQueue = [];
+            if (eng.pathFinderGroup.visible) {
+              eng.pathFinderGroup.visible = false;
+              eng.pathFinderDest = null;
+              eng.pathFinderWaypoints = [];
+              setPathFinderHud(null);
+            }
+            if (nearbyInteractableRef.current) {
+              nearbyInteractableRef.current = null;
+              setNearbyInteractable(null);
             }
           }
 
-          // Animated 3D Flow Pulse Beads
-          if (storeRef.current.animateFlows && eng.flowPulses.length > 0) {
-            for (const fp of eng.flowPulses) {
-              fp.phase = (fp.phase + dt * fp.speed) % 1;
-              const pt = fp.curve.getPointAt(fp.phase);
-              fp.mesh.position.copy(pt);
+          // Animated 3D Flow & Network Trace Pulse Beads (Single InstancedMesh, zero-GC pre-sampled LUT)
+          const hasFlowPulses =
+            storeRef.current.animateFlows &&
+            eng.flowPulseInstancedMesh !== null &&
+            eng.flowPulseTracks.length > 0;
+          const hasTracePulses =
+            eng.tracePulseInstancedMesh !== null && eng.tracePulseTracks.length > 0;
+
+          if (hasFlowPulses || hasTracePulses) {
+            const pulseElapsed = now - eng.lastPulseTick;
+            // Pace idle pulse-only frames to ~30fps so GPU/CPU stay cool while keeping animation crisp
+            if (needsAnother || pulseElapsed >= 32) {
+              const stepDt = Math.min(0.08, Math.max(dt, pulseElapsed / 1000));
+              eng.lastPulseTick = now;
+              const curExploded = storeRef.current.explodedFactor;
+
+              const advanceInstanced = (
+                inst: THREE.InstancedMesh | null,
+                tracks: FlowPulseTrack[]
+              ) => {
+                if (!inst || tracks.length === 0) return;
+                for (let i = 0; i < tracks.length; i++) {
+                  const tr = tracks[i];
+                  tr.phase = (tr.phase + stepDt * tr.speed) % 1;
+                  const fIdx = tr.phase * (tr.sampleCount - 1);
+                  const i0 = Math.floor(fIdx);
+                  const i1 = Math.min(tr.sampleCount - 1, i0 + 1);
+                  const frac = fIdx - i0;
+                  const b0 = i0 * 3;
+                  const b1 = i1 * 3;
+                  const x = tr.samples[b0] + (tr.samples[b1] - tr.samples[b0]) * frac;
+                  const y =
+                    tr.samples[b0 + 1] +
+                    (tr.samples[b1 + 1] - tr.samples[b0 + 1]) * frac +
+                    curExploded * tr.levelIndex * 5.2;
+                  const z = tr.samples[b0 + 2] + (tr.samples[b1 + 2] - tr.samples[b0 + 2]) * frac;
+                  _tmpVec3.set(x, y, z);
+                  _tmpScale.setScalar(tr.scale);
+                  _tmpMat4.compose(_tmpVec3, _identityQuat, _tmpScale);
+                  inst.setMatrixAt(i, _tmpMat4);
+                }
+                inst.instanceMatrix.needsUpdate = true;
+              };
+
+              if (hasFlowPulses) advanceInstanced(eng.flowPulseInstancedMesh, eng.flowPulseTracks);
+              if (hasTracePulses) advanceInstanced(eng.tracePulseInstancedMesh, eng.tracePulseTracks);
             }
             if (!isSoftwareGl) needsAnother = true;
           }
@@ -1116,6 +2540,8 @@ export const Viewport3D: React.FC = () => {
               entityType: String(node.userData.entityType),
               entityId: String(node.userData.entityId),
               buildingId: node.userData.buildingId ? String(node.userData.buildingId) : undefined,
+              switchId: node.userData.switchId ? String(node.userData.switchId) : undefined,
+              switchLabel: node.userData.switchLabel ? String(node.userData.switchLabel) : undefined,
             };
           }
           node = node.parent;
@@ -1139,33 +2565,129 @@ export const Viewport3D: React.FC = () => {
       const eng = engineRef.current;
       if (!eng) return;
 
-      // True human-head first-person look rotation (yaw/pitch around eye position, NOT an orbit arc!)
+      // GTA-Style 3rd-Person Free Orbit (idle) vs 1st-Person Head-Look
       if (storeRef.current.firstPersonMode && eng.fpLookDragging) {
         const dx = e.clientX - eng.fpLookLastX;
         const dy = e.clientY - eng.fpLookLastY;
         eng.fpLookLastX = e.clientX;
         eng.fpLookLastY = e.clientY;
-        eng.fpYaw -= dx * 0.0042;
-        eng.fpPitch = Math.max(-1.22, Math.min(1.22, eng.fpPitch - dy * 0.0038));
-        eng.perspCamera.rotation.order = 'YXZ';
-        eng.perspCamera.rotation.set(eng.fpPitch, eng.fpYaw, 0);
+        if (walkCameraModeRef.current === 'third-person') {
+          // Orbit camera freely 360° around MAYA so you can view MAYA's face when idle!
+          eng.fpCamYaw -= dx * 0.0052;
+          eng.fpPitch = Math.max(-0.46, Math.min(0.62, eng.fpPitch - dy * 0.004));
+        } else {
+          eng.fpYaw -= dx * 0.0042;
+          eng.fpCamYaw = eng.fpYaw;
+          eng.fpPitch = Math.max(-1.22, Math.min(1.22, eng.fpPitch - dy * 0.0038));
+          eng.perspCamera.rotation.order = 'YXZ';
+          eng.perspCamera.rotation.set(eng.fpPitch, eng.fpYaw, 0);
+        }
         requestRender();
         return;
       }
 
       const now = performance.now();
-      if (now - lastMoveRaycast < 60) return;
+      if (now - lastMoveRaycast < 50) return;
       lastMoveRaycast = now;
       getPointerNDC(e);
       raycaster.setFromCamera(pointer, eng.activeCamera);
-      const activeFl = storeRef.current.scene.floors.find((f) => f.id === storeRef.current.activeFloorId);
-      groundPlane.constant = -(activeFl?.elevation ?? 0);
+      const st = storeRef.current;
+      const activeFl = st.scene.floors.find((f) => f.id === st.activeFloorId);
+      const flElev = activeFl?.elevation ?? 0;
+      groundPlane.constant = -flElev;
+
       if (raycaster.ray.intersectPlane(groundPlane, hitPoint)) {
-        storeRef.current.setCursorCoords({
+        st.setCursorCoords({
           x: Number(hitPoint.x.toFixed(2)),
-          y: Number((activeFl?.elevation ?? 0).toFixed(2)),
+          y: Number(flElev.toFixed(2)),
           z: Number(hitPoint.z.toFixed(2)),
         });
+
+        // Live 3D Snap-to-Grid & Snap-to-Wall ghost preview for place-object tool
+        if (st.activeTool === 'place-object' && st.workspaceMode !== 'view') {
+          const allObjs = [...OBJECT_LIBRARY, ...st.scene.customObjects];
+          const tpl = allObjs.find((o) => o.id === st.selectedObjectTemplateId) ?? allObjs[0];
+          const flWalls = st.scene.walls.filter((w) => w.floorId === st.activeFloorId);
+          const snapped = computeSnappedPlacement(
+            hitPoint.x,
+            hitPoint.z,
+            tpl?.width ?? 1.2,
+            tpl?.depth ?? 1.0,
+            flWalls,
+            st.snap,
+            { floorWidth: activeFl?.width, floorDepth: activeFl?.depth }
+          );
+
+          disposeObject3D(eng.placeGhostGroup);
+          eng.placeGhostGroup.clear();
+          eng.placeGhostGroup.visible = true;
+
+          const gw = tpl?.width ?? 1.2;
+          const gh = tpl?.height ?? 1.6;
+          const gd = tpl?.depth ?? 1.0;
+          const tint = snapped.snappedWall ? '#22D3EE' : '#A78BFA';
+
+          const ghostBox = new THREE.Mesh(
+            new THREE.BoxGeometry(gw, gh, gd),
+            new THREE.MeshBasicMaterial({
+              color: tint,
+              transparent: true,
+              opacity: 0.24,
+              depthWrite: false,
+            })
+          );
+          ghostBox.position.set(snapped.x, flElev + gh / 2 + 0.04, snapped.z);
+          ghostBox.rotation.y = snapped.rotationY;
+          eng.placeGhostGroup.add(ghostBox);
+
+          const ghostEdges = new THREE.LineSegments(
+            new THREE.EdgesGeometry(new THREE.BoxGeometry(gw, gh, gd)),
+            new THREE.LineBasicMaterial({ color: tint })
+          );
+          ghostEdges.position.copy(ghostBox.position);
+          ghostEdges.rotation.y = snapped.rotationY;
+          eng.placeGhostGroup.add(ghostEdges);
+
+          if (snapped.snappedWall) {
+            const wLineGeo = new THREE.BufferGeometry().setFromPoints([
+              new THREE.Vector3(snapped.snappedWall.ax, flElev + 0.08, snapped.snappedWall.az),
+              new THREE.Vector3(snapped.snappedWall.bx, flElev + 0.08, snapped.snappedWall.bz),
+            ]);
+            eng.placeGhostGroup.add(
+              new THREE.Line(wLineGeo, new THREE.LineBasicMaterial({ color: '#22D3EE' }))
+            );
+          }
+
+          setPlaceSnapBadge({
+            label: snapped.snappedWall
+              ? `WALL SNAP · ${snapped.x}, ${snapped.z}`
+              : snapped.snappedGrid
+                ? `GRID SNAP · ${snapped.x}, ${snapped.z}`
+                : `${snapped.x}, ${snapped.z}`,
+            isWall: Boolean(snapped.snappedWall),
+          });
+          requestRender();
+        } else if (eng.placeGhostGroup.visible) {
+          eng.placeGhostGroup.visible = false;
+          setPlaceSnapBadge(null);
+          requestRender();
+        }
+
+        // Subtle floor teleport preview ring in walk mode
+        if (st.firstPersonMode && !eng.teleportTarget) {
+          const validFloor =
+            (!eng.navMesh || eng.navMesh.isWalkable(hitPoint.x, hitPoint.z)) &&
+            hitPoint.x > 0.4 &&
+            hitPoint.z > 0.4 &&
+            hitPoint.x < (activeFl?.width ?? 60) - 0.4 &&
+            hitPoint.z < (activeFl?.depth ?? 40) - 0.4;
+          eng.teleportRing.visible = validFloor;
+          if (validFloor) {
+            eng.teleportRing.position.set(hitPoint.x, flElev + 0.05, hitPoint.z);
+            eng.teleportRing.scale.setScalar(0.88);
+          }
+          requestRender();
+        }
       }
     };
 
@@ -1185,9 +2707,168 @@ export const Viewport3D: React.FC = () => {
       const flElev = activeFl?.elevation ?? 0;
       groundPlane.constant = -flElev;
 
+      // Walk Mode Point-and-Click A* Path Finder Teleportation & Direct Door/Switch Clicks
+      if (st.firstPersonMode) {
+        if (spatialAudioEnabledRef.current && spatialAudioRef.current) {
+          spatialAudioRef.current.setEnabled(true);
+        }
+        const picked = pickEntityAtEvent(e);
+        if (picked?.entityType === 'door-interact') {
+          const rig = eng.animatedDoors.get(picked.entityId);
+          if (rig) {
+            executeInteractableRef.current({
+              kind: 'door',
+              id: rig.openingId,
+              code: rig.subtype,
+              title: rig.label,
+              actionLabel: 'Toggle Door',
+              detail: rig.label,
+              worldX: rig.worldX,
+              worldY: rig.worldY,
+              worldZ: rig.worldZ,
+              roomId: rig.roomId,
+            });
+            return;
+          }
+        }
+        if (picked?.entityType === 'light-switch') {
+          const lr = eng.roomLightRigs.get(picked.entityId);
+          if (lr) {
+            const matchedSw =
+              lr.switches.find((s) => s.id === picked.switchId) ?? lr.switches[0];
+            executeInteractableRef.current({
+              kind: 'light',
+              id: matchedSw?.id ?? lr.roomId,
+              code: lr.roomCode,
+              title: lr.roomName,
+              switchId: matchedSw?.id,
+              switchLabel: matchedSw?.label ?? picked.switchLabel,
+              actionLabel: 'Toggle Light',
+              detail: lr.roomName,
+              worldX: matchedSw?.worldX ?? 0,
+              worldY: matchedSw?.worldY ?? 1.25,
+              worldZ: matchedSw?.worldZ ?? 0,
+              roomId: lr.roomId,
+            });
+            return;
+          }
+        }
+        if (raycaster.ray.intersectPlane(groundPlane, hitPoint)) {
+          const tx = Math.max(0.65, Math.min((activeFl?.width ?? 40) - 0.65, hitPoint.x));
+          const tz = Math.max(0.65, Math.min((activeFl?.depth ?? 28) - 0.65, hitPoint.z));
+
+          // Interactive Floor Placement Mode for User-Defined Path Finder No-Go Exclusion Zones
+          if (placingNoGoZoneRef.current && activeFl) {
+            const existingCount = noGoZonesRef.current.filter((z) => z.floorId === activeFl.id).length;
+            const customLabel =
+              noGoLabelDraftRef.current.trim() || `No-Go Zone #${existingCount + 1}`;
+            const newZone: NoGoZone = {
+              id: `nogo-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              floorId: activeFl.id,
+              label: customLabel,
+              kind: 'circle',
+              x: Number(tx.toFixed(2)),
+              z: Number(tz.toFixed(2)),
+              radius: noGoRadiusRef.current,
+            };
+            setNoGoZones((prev) => [...prev, newZone]);
+            setPlacingNoGoZone(false);
+            setNoGoLabelDraft('');
+            st.showToast(
+              `Marked "${customLabel}" (r=${newZone.radius?.toFixed(1)}m) as Path Finder No-Go zone`,
+              'info'
+            );
+            requestRender();
+            return;
+          }
+
+          const flWalls = st.scene.walls.filter((w) => w.floorId === st.activeFloorId);
+          const flOpenings = st.scene.openings.filter((o) => o.floorId === st.activeFloorId);
+          const safeDest = resolveStrictWallCollision(
+            tx,
+            tz,
+            tx,
+            tz,
+            0.28,
+            flWalls,
+            flOpenings,
+            activeFl?.width ?? 0,
+            activeFl?.depth ?? 0,
+            useMayaStore.getState().openDoors
+          );
+          if (!eng.navMesh || eng.navMesh.isWalkable(safeDest.x, safeDest.z)) {
+            const destRoom = st.scene.rooms.find(
+              (r) =>
+                r.floorId === st.activeFloorId &&
+                safeDest.x >= r.x &&
+                safeDest.x <= r.x + r.width &&
+                safeDest.z >= r.z &&
+                safeDest.z <= r.z + r.depth
+            );
+            const algo = pathAlgorithmRef.current;
+            const pts = eng.navMesh
+              ? eng.navMesh.findPath(eng.fpPosX, eng.fpPosZ, safeDest.x, safeDest.z, {
+                  algorithm: algo,
+                  noGoZones: noGoZonesRef.current,
+                })
+              : [
+                  { x: eng.fpPosX, z: eng.fpPosZ },
+                  { x: safeDest.x, z: safeDest.z },
+                ];
+            const finalPt = pts[pts.length - 1] ?? { x: safeDest.x, z: safeDest.z };
+            const distM = computePathLengthMeters(pts);
+            const label = destRoom ? destRoom.name : 'Selected Floor Point';
+            const code = destRoom ? destRoom.code : 'POINT';
+
+            eng.pathFinderDest = { label, code, x: finalPt.x, z: finalPt.z };
+            eng.pathFinderWaypoints = pts;
+            eng.pathFinderRig = populatePathFinderVisual(
+              eng.pathFinderGroup,
+              pts,
+              flElev,
+              disposeObject3D,
+              algo
+            );
+            eng.lastPathRerouteAt = performance.now();
+
+            eng.teleportQueue = pts.slice(1);
+            eng.teleportTarget = eng.teleportQueue.shift() ?? { x: finalPt.x, z: finalPt.z };
+            eng.teleportRing.visible = true;
+            eng.teleportRing.position.set(finalPt.x, flElev + 0.055, finalPt.z);
+
+            setPathFinderHud({
+              label,
+              code,
+              remainingM: Number(distM.toFixed(1)),
+              autoWalking: true,
+            });
+            requestRender();
+          }
+        }
+        return;
+      }
+
       if (st.activeTool === 'place-object') {
         if (raycaster.ray.intersectPlane(groundPlane, hitPoint)) {
-          st.addAsset(st.selectedObjectTemplateId, hitPoint.x, hitPoint.z);
+          const allObjs = [...OBJECT_LIBRARY, ...st.scene.customObjects];
+          const tpl = allObjs.find((o) => o.id === st.selectedObjectTemplateId) ?? allObjs[0];
+          const flWalls = st.scene.walls.filter((w) => w.floorId === st.activeFloorId);
+          const snapped = computeSnappedPlacement(
+            hitPoint.x,
+            hitPoint.z,
+            tpl?.width ?? 1.2,
+            tpl?.depth ?? 1.0,
+            flWalls,
+            st.snap,
+            { floorWidth: activeFl?.width, floorDepth: activeFl?.depth }
+          );
+          st.addAsset(st.selectedObjectTemplateId, snapped.x, snapped.z, {
+            x: snapped.x,
+            z: snapped.z,
+            rotationY: snapped.rotationY,
+          });
+          eng.placeGhostGroup.visible = false;
+          setPlaceSnapBadge(null);
           st.setActiveTool('select');
         }
         return;
@@ -1240,6 +2921,30 @@ export const Viewport3D: React.FC = () => {
         return;
       }
 
+      // Direct wall switch click works in Orbit View mode too!
+      if (picked?.entityType === 'light-switch') {
+        const lr = eng.roomLightRigs.get(picked.entityId);
+        if (lr) {
+          const matchedSw =
+            lr.switches.find((s) => s.id === picked.switchId) ?? lr.switches[0];
+          executeInteractableRef.current({
+            kind: 'light',
+            id: matchedSw?.id ?? lr.roomId,
+            code: lr.roomCode,
+            title: lr.roomName,
+            switchId: matchedSw?.id,
+            switchLabel: matchedSw?.label ?? picked.switchLabel,
+            actionLabel: 'Toggle Light',
+            detail: lr.roomName,
+            worldX: matchedSw?.worldX ?? 0,
+            worldY: matchedSw?.worldY ?? 1.25,
+            worldZ: matchedSw?.worldZ ?? 0,
+            roomId: lr.roomId,
+          });
+          return;
+        }
+      }
+
       if (picked) {
         st.selectEntity({ type: picked.entityType as any, id: picked.entityId }, e.shiftKey);
       } else if (!e.shiftKey) {
@@ -1290,6 +2995,22 @@ export const Viewport3D: React.FC = () => {
 
     const onDrop = (e: DragEvent) => {
       e.preventDefault();
+      const st = storeRef.current;
+      if (st.workspaceMode === 'view') {
+        st.showToast('View Mode active — switch to Design Mode to place or paint objects.', 'warning');
+        return;
+      }
+      const aclState = useAclStore.getState();
+      const aclUser = getActiveAclUser(aclState);
+      if (
+        aclUser &&
+        (aclUser.status === 'suspended' ||
+          !computeEffectivePermissions(aclUser, aclState.roles, aclState.groups).includes('spatial.edit'))
+      ) {
+        st.showToast('ACL Read-Only — your active role cannot modify spatial equipment.', 'warning');
+        return;
+      }
+      const smartRoomId = e.dataTransfer?.getData('application/x-gradian-smart-room');
       const templateId = e.dataTransfer?.getData('application/x-gradian-object');
       const materialId = e.dataTransfer?.getData('application/x-gradian-material');
       const eng = engineRef.current;
@@ -1300,11 +3021,14 @@ export const Viewport3D: React.FC = () => {
       pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(pointer, eng.activeCamera);
 
-      const st = storeRef.current;
       const activeFl = st.scene.floors.find((f) => f.id === st.activeFloorId);
       groundPlane.constant = -(activeFl?.elevation ?? 0);
 
-      if (templateId) {
+      if (smartRoomId) {
+        if (raycaster.ray.intersectPlane(groundPlane, hitPoint)) {
+          st.addSmartRoomFromTemplate(smartRoomId, hitPoint.x, hitPoint.z);
+        }
+      } else if (templateId) {
         if (raycaster.ray.intersectPlane(groundPlane, hitPoint)) {
           st.addAsset(templateId, hitPoint.x, hitPoint.z);
         }
@@ -1332,14 +3056,28 @@ export const Viewport3D: React.FC = () => {
         return;
       }
       if (storeRef.current.firstPersonMode) {
+        if (spatialAudioEnabledRef.current && spatialAudioRef.current) {
+          spatialAudioRef.current.setEnabled(true);
+        }
+        if ((e.code === 'Enter' || e.code === 'KeyE') && nearbyInteractableRef.current) {
+          e.preventDefault();
+          executeInteractableRef.current(nearbyInteractableRef.current);
+          return;
+        }
         if (e.code === 'Space') {
           e.preventDefault();
           const eng = engineRef.current;
           if (eng && eng.fpOnGround) {
-            eng.fpVelY = 4.9;
+            eng.fpVelY = 7.6;
             eng.fpOnGround = false;
             requestRender();
           }
+          return;
+        }
+        if (e.code === 'KeyV') {
+          e.preventDefault();
+          setWalkCameraMode((prev) => (prev === 'first-person' ? 'third-person' : 'first-person'));
+          requestRender();
           return;
         }
         keys.add(e.code);
@@ -1353,6 +3091,23 @@ export const Viewport3D: React.FC = () => {
     const onContextLost = (e: Event) => {
       e.preventDefault();
     };
+
+    const detachPinchGuard = attachCanvasPinchGuard(container, (deltaY) => {
+      const eng = engineRef.current;
+      if (!eng || storeRef.current.firstPersonMode) return;
+      const scale = deltaY > 0 ? 1.07 : 0.93;
+      if (eng.activeCamera === eng.orthoCamera) {
+        eng.orthoCamera.zoom = Math.max(0.25, Math.min(8, eng.orthoCamera.zoom / scale));
+        eng.orthoCamera.updateProjectionMatrix();
+      } else {
+        const offset = eng.perspCamera.position.clone().sub(eng.orbit.target);
+        const nextLen = Math.max(2.0, Math.min(180, offset.length() * scale));
+        offset.setLength(nextLen);
+        eng.perspCamera.position.copy(eng.orbit.target).add(offset);
+        eng.orbit.update();
+      }
+      requestRender();
+    });
 
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
     renderer.domElement.addEventListener('pointermove', onPointerMove);
@@ -1368,6 +3123,7 @@ export const Viewport3D: React.FC = () => {
       if (!container || disposed) return;
       const w = container.clientWidth || 800;
       const h = container.clientHeight || 560;
+      viewportSizeRef.current = { w, h };
       perspCamera.aspect = w / h;
       perspCamera.updateProjectionMatrix();
       const asp = w / h;
@@ -1377,6 +3133,7 @@ export const Viewport3D: React.FC = () => {
       orthoCamera.bottom = -frustum / 2;
       orthoCamera.updateProjectionMatrix();
       renderer.setSize(w, h);
+      projectPinsRef.current(true);
       requestRender();
     });
     resizeObserver.observe(container);
@@ -1396,11 +3153,37 @@ export const Viewport3D: React.FC = () => {
       nightLightsGroup,
       navMeshGroup,
       navMesh: null,
-      flowPulses: [],
+      flowsGroup,
+      hvacGroup,
+      traceGroup,
+      placeGhostGroup,
+      pathFinderGroup,
+      noGoZonesGroup,
+      pathFinderRig: null,
+      pathFinderDest: null,
+      pathFinderWaypoints: [],
+      teleportQueue: [],
+      lastPathRerouteAt: 0,
+      teleportRing,
+      teleportTarget: null,
+      animatedDoors,
+      roomLightRigs,
+      flowPulseInstancedMesh: null,
+      flowPulseTracks: [],
+      tracePulseInstancedMesh: null,
+      tracePulseTracks: [],
+      lastPulseTick: 0,
       fpVelY: 0,
       fpOnGround: true,
       fpYaw: 0,
+      fpCamYaw: 0,
       fpPitch: 0,
+      fpPosX: 10,
+      fpPosZ: 8,
+      fpJumpY: 0,
+      fpAnimPhase: 0,
+      fpMoveBlend: 0,
+      walkAvatar,
       fpLookDragging: false,
       fpLookLastX: 0,
       fpLookLastY: 0,
@@ -1428,6 +3211,7 @@ export const Viewport3D: React.FC = () => {
         cancelAnimationFrame(frameId);
         clearTimeout(frameId);
         resizeObserver.disconnect();
+        detachPinchGuard();
         renderer.domElement.removeEventListener('pointerdown', onPointerDown);
         renderer.domElement.removeEventListener('pointermove', onPointerMove);
         renderer.domElement.removeEventListener('pointerup', onPointerUp);
@@ -1446,8 +3230,17 @@ export const Viewport3D: React.FC = () => {
         });
         heatmapCache.clear();
         disposeObject3D(contentGroup);
+        disposeObject3D(flowsGroup);
+        disposeObject3D(hvacGroup);
+        disposeObject3D(traceGroup);
+        disposeObject3D(placeGhostGroup);
+        disposeObject3D(pathFinderGroup);
+        disposeObject3D(noGoZonesGroup);
         disposeObject3D(navMeshGroup);
         disposeObject3D(nightLightsGroup);
+        walkAvatar.disposed = true;
+        walkAvatar.mayaController?.dispose();
+        disposeObject3D(walkAvatar.root);
         disposeObject3D(gridHelper);
         envTex.dispose();
         renderer.dispose();
@@ -1668,6 +3461,13 @@ export const Viewport3D: React.FC = () => {
     eng.navMesh = nm;
     setFpState((prev) => ({ ...prev, walkablePct: nm.walkablePercent }));
 
+    // Sync active floor rooms & equipment into 3D Spatial Audio Engine
+    const flRooms = sceneData.rooms.filter((r) => r.floorId === activeFl.id);
+    if (!spatialAudioRef.current) {
+      spatialAudioRef.current = new FacilitySpatialAudioEngine();
+    }
+    spatialAudioRef.current.syncFloorSources(flRooms, flAssets, activeFl.elevation);
+
     if (showNavMesh) {
       const vis = buildNavMeshVisualGroup(nm, activeFl.elevation + 0.06);
       eng.navMeshGroup.add(vis);
@@ -1676,6 +3476,7 @@ export const Viewport3D: React.FC = () => {
   }, [
     activeFloorId,
     sceneData.floors,
+    sceneData.rooms,
     sceneData.walls,
     sceneData.openings,
     sceneData.assets,
@@ -1731,28 +3532,74 @@ export const Viewport3D: React.FC = () => {
       eng.orbit.object = eng.perspCamera;
       eng.transform.camera = eng.perspCamera;
       if (firstPersonMode) {
-        // Disable OrbitControls so dragging rotates like a human head in-place (not an orbital arc!)
+        // Auto-clear section cuts, floor decomposition & campus multi-building offset so character is grounded 1:1 on the floor
+        if (storeRef.current.sectionCutEnabled) resetSectionCut();
+        if (storeRef.current.explodedFactor > 0.01) setExplodedFactor(0);
+        if (storeRef.current.drillLevel === 'campus' && activeFloorId) {
+          drillInto('floor', activeFloorId);
+        }
+
         eng.orbit.enabled = false;
         eng.camTargetPos = null;
         eng.camTargetLook = null;
-        const spawn = eng.navMesh
-          ? eng.navMesh.findNearestWalkable(cx - 4, cz + 2)
-          : { x: cx - 4, z: cz + 2 };
-        const eyeY = (activeFl?.elevation ?? 0) + 1.68;
-        eng.fpVelY = 0;
-        eng.fpOnGround = true;
-        eng.perspCamera.position.set(spawn.x, eyeY, spawn.z);
-        eng.fpYaw = Math.atan2(-(cx - spawn.x), -(cz - spawn.z));
-        eng.fpPitch = -0.04;
-        eng.perspCamera.rotation.order = 'YXZ';
-        eng.perspCamera.rotation.set(eng.fpPitch, eng.fpYaw, 0);
+
+        const mayaState = useMayaStore.getState();
+        const restorePose =
+          mayaState.pendingRestoreWalkPose && mayaState.savedWalkPose
+            ? mayaState.savedWalkPose
+            : null;
+        const floorElev = activeFl?.elevation ?? 0;
+
+        if (restorePose) {
+          eng.fpPosX = restorePose.x;
+          eng.fpPosZ = restorePose.z;
+          eng.fpJumpY = 0;
+          eng.fpVelY = 0;
+          eng.fpOnGround = true;
+          eng.fpMoveBlend = 0;
+          eng.fpYaw = restorePose.yaw;
+          eng.fpCamYaw = restorePose.camYaw;
+          eng.fpPitch = restorePose.pitch;
+          walkCameraModeRef.current = restorePose.cameraMode;
+          setWalkCameraMode(restorePose.cameraMode);
+          mayaState.clearPendingRestoreWalkPose();
+        } else {
+          const spawn = pickWalkSpawn(activeFl, storeRef.current.scene.rooms, eng.navMesh);
+          eng.fpPosX = spawn.x;
+          eng.fpPosZ = spawn.z;
+          eng.fpJumpY = 0;
+          eng.fpVelY = 0;
+          eng.fpOnGround = true;
+          eng.fpMoveBlend = 0;
+          eng.fpYaw = Math.atan2(-(spawn.lookX - spawn.x), -(spawn.lookZ - spawn.z));
+          eng.fpCamYaw = eng.fpYaw;
+          eng.fpPitch = -0.05;
+        }
+
+        const isThird = walkCameraModeRef.current === 'third-person';
+        eng.walkAvatar.root.visible = isThird;
+        eng.walkAvatar.root.position.set(eng.fpPosX, floorElev, eng.fpPosZ);
+        eng.walkAvatar.root.rotation.y = eng.fpYaw + Math.PI;
+        if (isThird) {
+          eng.perspCamera.position.set(
+            eng.fpPosX + Math.sin(eng.fpCamYaw) * 2.85,
+            floorElev + 2.05,
+            eng.fpPosZ + Math.cos(eng.fpCamYaw) * 2.85
+          );
+          eng.perspCamera.lookAt(eng.fpPosX, floorElev + 1.05, eng.fpPosZ);
+        } else {
+          eng.perspCamera.position.set(eng.fpPosX, floorElev + 1.52, eng.fpPosZ);
+          eng.perspCamera.rotation.order = 'YXZ';
+          eng.perspCamera.rotation.set(eng.fpPitch, eng.fpYaw, 0);
+        }
         setFpState((prev) => ({
           ...prev,
-          x: Number(spawn.x.toFixed(1)),
-          z: Number(spawn.z.toFixed(1)),
+          x: Number(eng.fpPosX.toFixed(1)),
+          z: Number(eng.fpPosZ.toFixed(1)),
           jumpHeight: 0,
         }));
       } else {
+        eng.walkAvatar.root.visible = false;
         eng.orbit.enabled = true;
         eng.fpLookDragging = false;
         // Place orbit target smoothly 5m in front of camera when leaving walk mode
@@ -1776,21 +3623,45 @@ export const Viewport3D: React.FC = () => {
       eng.perspCamera.updateProjectionMatrix();
     }
     if (storeRef.current.firstPersonMode) {
-      // Snap directly inside room at eye-level with human head orientation
+      // Snap character & camera grounded inside the target room
+      const activeFl = storeRef.current.scene.floors.find(
+        (f) => f.id === storeRef.current.activeFloorId
+      );
+      const floorElev = activeFl?.elevation ?? 0;
       const pos = cameraCommand.position;
       const tgt = cameraCommand.target;
       const safePos = eng.navMesh
         ? eng.navMesh.findNearestWalkable(pos[0], pos[2])
         : { x: pos[0], z: pos[2] };
-      eng.perspCamera.position.set(safePos.x, pos[1], safePos.z);
+      eng.fpPosX = safePos.x;
+      eng.fpPosZ = safePos.z;
+      eng.fpJumpY = 0;
+      eng.fpVelY = 0;
+      eng.fpOnGround = true;
       const dx = tgt[0] - safePos.x;
       const dz = tgt[2] - safePos.z;
-      const dy = tgt[1] - pos[1];
+      const dy = tgt[1] - (floorElev + 1.66);
       const horiz = Math.max(0.01, Math.hypot(dx, dz));
       eng.fpYaw = Math.atan2(-dx, -dz);
-      eng.fpPitch = Math.max(-1.1, Math.min(1.1, Math.atan2(dy, horiz)));
-      eng.perspCamera.rotation.order = 'YXZ';
-      eng.perspCamera.rotation.set(eng.fpPitch, eng.fpYaw, 0);
+      eng.fpCamYaw = eng.fpYaw;
+      eng.fpPitch = Math.max(-0.55, Math.min(0.65, Math.atan2(dy, horiz)));
+
+      const isThird = walkCameraModeRef.current === 'third-person';
+      eng.walkAvatar.root.visible = isThird;
+      eng.walkAvatar.root.position.set(safePos.x, floorElev, safePos.z);
+      eng.walkAvatar.root.rotation.y = eng.fpYaw + Math.PI;
+      if (isThird) {
+        eng.perspCamera.position.set(
+          safePos.x + Math.sin(eng.fpYaw) * 2.85,
+          floorElev + 2.05,
+          safePos.z + Math.cos(eng.fpYaw) * 2.85
+        );
+        eng.perspCamera.lookAt(safePos.x, floorElev + 1.12, safePos.z);
+      } else {
+        eng.perspCamera.position.set(safePos.x, floorElev + 1.66, safePos.z);
+        eng.perspCamera.rotation.order = 'YXZ';
+        eng.perspCamera.rotation.set(eng.fpPitch, eng.fpYaw, 0);
+      }
       eng.camTargetPos = null;
       eng.camTargetLook = null;
       setFpState((prev) => ({
@@ -1914,11 +3785,12 @@ export const Viewport3D: React.FC = () => {
                       curZ,
                       navRes.x,
                       navRes.z,
-                      0.36,
+                      0.56,
                       flWalls,
                       flOpenings,
                       activeFl?.width ?? 0,
-                      activeFl?.depth ?? 0
+                      activeFl?.depth ?? 0,
+                      useMayaStore.getState().openDoors
                     );
                     eng.vrRig.position.x = strict.x;
                     eng.vrRig.position.z = strict.z;
@@ -2018,7 +3890,8 @@ export const Viewport3D: React.FC = () => {
     disposeObject3D(eng.contentGroup);
     eng.contentGroup.clear();
     eng.assetGroupMap.clear();
-    eng.flowPulses = [];
+    eng.animatedDoors.clear();
+    eng.roomLightRigs.clear();
 
     const maxAniso = eng.renderer.capabilities.getMaxAnisotropy();
     const allMats: MaterialDef[] = [...DEFAULT_MATERIALS, ...sceneData.customMaterials];
@@ -2080,11 +3953,12 @@ export const Viewport3D: React.FC = () => {
             ? [activeFl]
             : [];
 
-      // Architectural Floor Decomposition Riser Guide Columns when Exploded > 5%
-      if (explodedFactor > 0.04 && bldgFloors.length > 1) {
+      // Architectural Floor Decomposition Riser Guide Columns (scaled in O(1) when explodedFactor changes)
+      const initExploded = storeRef.current.explodedFactor;
+      if (bldgFloors.length > 1) {
         const sortedFloors = [...bldgFloors].sort((a, b) => a.levelIndex - b.levelIndex);
         const topFl = sortedFloors[sortedFloors.length - 1];
-        const totalStackH = topFl.elevation + explodedFactor * topFl.levelIndex * 5.2 + topFl.height;
+        const totalStackH = topFl.elevation + initExploded * topFl.levelIndex * 5.2 + topFl.height;
         const riserCorners: [number, number][] = [
           [0, 0],
           [bldg.width, 0],
@@ -2093,27 +3967,39 @@ export const Viewport3D: React.FC = () => {
         ];
         const riserMat = new THREE.LineDashedMaterial({
           color: '#F59E0B',
-          dashSize: 0.45,
-          gapSize: 0.3,
+          dashSize: 0.05,
+          gapSize: 0.035,
           transparent: true,
-          opacity: 0.6,
+          opacity: 0.62,
         });
         riserCorners.forEach(([rx, rz]) => {
           const lineGeo = new THREE.BufferGeometry().setFromPoints([
             new THREE.Vector3(rx, 0, rz),
-            new THREE.Vector3(rx, totalStackH, rz),
+            new THREE.Vector3(rx, 1, rz),
           ]);
           const line = new THREE.Line(lineGeo, riserMat);
           line.computeLineDistances();
+          line.scale.y = totalStackH;
+          line.visible = initExploded > 0.04;
+          line.userData.decompRiser = {
+            topElevation: topFl.elevation,
+            topHeight: topFl.height,
+            topLevelIndex: topFl.levelIndex,
+          };
           bldgGroup.add(line);
         });
       }
 
       bldgFloors.forEach((floor) => {
         const floorGroup = new THREE.Group();
-        const explodedOffset = explodedFactor * floor.levelIndex * 5.2;
+        const explodedOffset = initExploded * floor.levelIndex * 5.2;
         floorGroup.position.y = floor.elevation + explodedOffset;
-        floorGroup.userData = { entityType: 'floor', entityId: floor.id, buildingId: bldg.id };
+        floorGroup.userData = {
+          entityType: 'floor',
+          entityId: floor.id,
+          buildingId: bldg.id,
+          decompFloor: { baseY: floor.elevation, levelIndex: floor.levelIndex },
+        };
         bldgGroup.add(floorGroup);
 
         const splitMidX = floor.width * 0.5;
@@ -2326,14 +4212,237 @@ export const Viewport3D: React.FC = () => {
                 rmMesh.userData = { entityType: 'room', entityId: room.id, buildingId: bldg.id };
                 floorGroup.add(rmMesh);
 
-                if (isSel || isRoomDrilled || isCategoryXray) {
+                // Per-Room Visible Wall Light Switches + Typed Ceiling Fixtures + Real Day/Night Lighting Effect
+                const floorOpeningsForRoom = sceneData.openings.filter((o) => o.floorId === floor.id);
+                const floorWallsForRoom = sceneData.walls.filter((w) => w.floorId === floor.id);
+                const effLighting = getEffectiveRoomLighting(room, floorOpeningsForRoom, floorWallsForRoom);
+                const mayaLightSnap = useMayaStore.getState();
+
+                const switchRigs: RoomLightRig['switches'] = [];
+                const fixtureRigs: RoomLightRig['fixtures'] = [];
+                const switchStateMap = new Map<string, boolean>();
+
+                for (const sw of effLighting.switches) {
+                  const swOn = mayaLightSnap.isSwitchOn(sw.id, room.id, sw.isOn);
+                  switchStateMap.set(sw.id, swOn);
+                  const tr = computeSwitchLocalTransform(room, sw, 0.22);
+
+                  const swGroup = new THREE.Group();
+                  swGroup.position.set(tr.x, tr.y, tr.z);
+                  swGroup.rotation.y = tr.rotY;
+                  swGroup.userData = {
+                    entityType: 'light-switch',
+                    entityId: room.id,
+                    buildingId: bldg.id,
+                    switchId: sw.id,
+                    switchLabel: sw.label,
+                  };
+
+                  // Outer high-contrast dark frame housing proud of wall face
+                  const swFrame = new THREE.Mesh(
+                    new THREE.BoxGeometry(0.24, 0.34, 0.048),
+                    new THREE.MeshStandardMaterial({ color: '#1E293B', roughness: 0.35, metalness: 0.45 })
+                  );
+                  // Brushed white/silver inner switch face plate
+                  const swPlate = new THREE.Mesh(
+                    new THREE.BoxGeometry(0.19, 0.29, 0.056),
+                    new THREE.MeshStandardMaterial({ color: '#F8FAFC', roughness: 0.22, metalness: 0.15 })
+                  );
+                  swPlate.position.z = 0.004;
+                  // Large tactile rocker paddle
+                  const swRocker = new THREE.Mesh(
+                    new THREE.BoxGeometry(0.095, 0.135, 0.068),
+                    new THREE.MeshStandardMaterial({ color: '#E2E8F0', roughness: 0.25, metalness: 0.2 })
+                  );
+                  swRocker.position.set(0, -0.025, 0.012);
+                  swRocker.rotation.x = swOn ? -0.22 : 0.22;
+                  // Bright glowing LED indicator strip above rocker
+                  const swLedMat = new THREE.MeshBasicMaterial({
+                    color: swOn ? '#34D399' : '#F59E0B',
+                  });
+                  const swLed = new THREE.Mesh(new THREE.BoxGeometry(0.125, 0.028, 0.064), swLedMat);
+                  swLed.position.set(0, 0.095, 0.01);
+
+                  swGroup.add(swFrame, swPlate, swRocker, swLed);
+                  floorGroup.add(swGroup);
+
+                  switchRigs.push({
+                    id: sw.id,
+                    label: sw.label,
+                    defaultOn: sw.isOn,
+                    worldX: (isMultiBuilding ? bldg.originX : 0) + tr.x,
+                    worldY: floor.elevation + tr.y,
+                    worldZ: (isMultiBuilding ? bldg.originZ : 0) + tr.z,
+                    ledMat: swLedMat,
+                    rocker: swRocker,
+                  });
+                }
+
+                let initPrimaryTotal = 0;
+                let initPrimaryOn = 0;
+                const ceilingY = Math.max(2.65, room.height - 0.06);
+
+                for (const fx of effLighting.fixtures) {
+                  const cat = getFixtureCatalogItem(fx.type);
+                  const fxOn = switchStateMap.has(fx.switchId)
+                    ? Boolean(switchStateMap.get(fx.switchId))
+                    : mayaLightSnap.isSwitchOn(fx.switchId, room.id, true);
+                  const isEmergency = fx.type === 'emergency-bulkhead';
+                  if (!isEmergency) {
+                    initPrimaryTotal++;
+                    if (fxOn) initPrimaryOn++;
+                  }
+
+                  const fxColor = kelvinToHex(fx.colorTempK, fx.type);
+                  const maxEmissive =
+                    fx.type === 'uv-c-sterilizer'
+                      ? 1.5
+                      : fx.type === 'high-bay'
+                        ? 1.65
+                        : fx.type === 'emergency-bulkhead'
+                          ? 1.2
+                          : 1.35;
+
+                  const fxLensMat = new THREE.MeshStandardMaterial({
+                    color: fxColor,
+                    emissive: fxColor,
+                    emissiveIntensity: fxOn ? maxEmissive : 0.03,
+                    roughness: 0.18,
+                    metalness: 0.08,
+                  });
+
+                  const fxGroup = new THREE.Group();
+                  const fxWorldX = room.x + Math.max(0.25, Math.min(room.width - 0.25, fx.x));
+                  const fxWorldZ = room.z + Math.max(0.25, Math.min(room.depth - 0.25, fx.z));
+                  fxGroup.position.set(fxWorldX, ceilingY, fxWorldZ);
+
+                  const housingMat = new THREE.MeshStandardMaterial({
+                    color: '#334155',
+                    roughness: 0.4,
+                    metalness: 0.5,
+                  });
+
+                  if (fx.type === 'recessed-downlight' || fx.type === 'high-bay') {
+                    const rad = fx.type === 'high-bay' ? 0.34 : 0.18;
+                    const hgt = fx.type === 'high-bay' ? 0.18 : 0.05;
+                    const housing = new THREE.Mesh(
+                      new THREE.CylinderGeometry(rad * 1.12, rad * 1.18, hgt, 18),
+                      housingMat
+                    );
+                    const lens = new THREE.Mesh(
+                      new THREE.CylinderGeometry(rad, rad, 0.025, 18),
+                      fxLensMat
+                    );
+                    lens.position.y = -hgt / 2 - 0.01;
+                    fxGroup.add(housing, lens);
+                  } else {
+                    const fw = Math.min(room.width * 0.45, cat.width);
+                    const fd = Math.min(room.depth * 0.45, cat.depth);
+                    const housing = new THREE.Mesh(new THREE.BoxGeometry(fw + 0.06, 0.055, fd + 0.06), housingMat);
+                    const lens = new THREE.Mesh(new THREE.BoxGeometry(fw, 0.024, fd), fxLensMat);
+                    lens.position.y = -0.032;
+                    fxGroup.add(housing, lens);
+                  }
+                  floorGroup.add(fxGroup);
+
+                  fixtureRigs.push({
+                    id: fx.id,
+                    switchId: fx.switchId,
+                    defaultOn: fxOn,
+                    mat: fxLensMat,
+                    maxEmissive,
+                    isEmergency,
+                  });
+                }
+
+                const initLitRatio =
+                  initPrimaryTotal > 0
+                    ? initPrimaryOn / initPrimaryTotal
+                    : mayaLightSnap.roomLights[room.id] ?? true
+                      ? 1
+                      : 0;
+
+                // Real 3D Room PointLight on active floor for true local Day/Night illumination
+                let roomPointLight: THREE.PointLight | undefined;
+                const maxLightIntensity = Math.min(2.6, Math.max(1.2, (room.width * room.depth) / 28));
+                if (floor.id === activeFloorId && !isMultiBuilding) {
+                  roomPointLight = new THREE.PointLight(
+                    '#FFFBEB',
+                    maxLightIntensity * initLitRatio,
+                    Math.max(room.width, room.depth) * 1.45 + 3,
+                    1.6
+                  );
+                  roomPointLight.position.set(roomCenterX, Math.max(2.3, room.height - 0.35), room.z + room.depth / 2);
+                  floorGroup.add(roomPointLight);
+                }
+
+                // Floor Dimmer Wash
+                const dimOverlayMat = new THREE.MeshBasicMaterial({
+                  color: '#04060C',
+                  transparent: true,
+                  opacity: (1 - initLitRatio) * 0.62,
+                  depthWrite: false,
+                });
+                const dimOverlayMesh = new THREE.Mesh(
+                  new THREE.PlaneGeometry(Math.max(0.4, room.width - 0.14), Math.max(0.4, room.depth - 0.14)),
+                  dimOverlayMat
+                );
+                dimOverlayMesh.rotation.x = -Math.PI / 2;
+                dimOverlayMesh.position.set(roomCenterX, 0.055, room.z + room.depth / 2);
+                dimOverlayMesh.visible = initLitRatio < 0.99;
+                floorGroup.add(dimOverlayMesh);
+
+                // Full 3D Interior Room Darkening Envelope (BackSide box inside walls/ceiling for unmistakable Day <-> Night feel)
+                const darkEnvelopeMat = new THREE.MeshBasicMaterial({
+                  color: '#03050B',
+                  transparent: true,
+                  opacity: (1 - initLitRatio) * 0.72,
+                  side: THREE.BackSide,
+                  depthWrite: false,
+                });
+                const envH = Math.max(2.4, room.height - 0.12);
+                const darkEnvelopeMesh = new THREE.Mesh(
+                  new THREE.BoxGeometry(
+                    Math.max(0.4, room.width - 0.24),
+                    envH,
+                    Math.max(0.4, room.depth - 0.24)
+                  ),
+                  darkEnvelopeMat
+                );
+                darkEnvelopeMesh.position.set(roomCenterX, envH / 2 + 0.06, room.z + room.depth / 2);
+                darkEnvelopeMesh.visible = initLitRatio < 0.99;
+                floorGroup.add(darkEnvelopeMesh);
+
+                eng.roomLightRigs.set(room.id, {
+                  roomId: room.id,
+                  roomCode: room.code,
+                  roomName: room.name,
+                  floorId: floor.id,
+                  switches: switchRigs,
+                  fixtures: fixtureRigs,
+                  pointLight: roomPointLight,
+                  maxLightIntensity,
+                  dimOverlayMat,
+                  dimOverlayMesh,
+                  darkEnvelopeMat,
+                  darkEnvelopeMesh,
+                });
+
+                const isVoiceHighlightedRoom = voiceHighlightIds.includes(room.id);
+                if (isSel || isRoomDrilled || isCategoryXray || isVoiceHighlightedRoom) {
                   const selOutline = new THREE.LineSegments(
-                    new THREE.EdgesGeometry(new THREE.BoxGeometry(room.width, 0.09, room.depth)),
+                    new THREE.EdgesGeometry(new THREE.BoxGeometry(room.width, isVoiceHighlightedRoom ? 0.35 : 0.09, room.depth)),
                     new THREE.LineBasicMaterial({
-                      color: isRoomDrilled ? '#10B981' : isCategoryXray ? categoryMeta.color : '#3B82F6',
+                      color: isVoiceHighlightedRoom
+                        ? '#F59E0B'
+                        : isRoomDrilled
+                          ? '#10B981'
+                          : isCategoryXray
+                            ? categoryMeta.color
+                            : '#3B82F6',
                     })
                   );
-                  selOutline.position.set(roomCenterX, 0.06, room.z + room.depth / 2);
+                  selOutline.position.set(roomCenterX, isVoiceHighlightedRoom ? 0.2 : 0.06, room.z + room.depth / 2);
                   floorGroup.add(selOutline);
                 }
               }
@@ -2739,20 +4848,45 @@ export const Viewport3D: React.FC = () => {
                       opGroup.add(trans);
                     }
                   } else {
-                    // Realistic architectural door assembly
+                    // Realistic Interactive Animated Architectural Door Assembly (Per Type)
                     const leafW = Math.max(0.35, opW - jambT * 2);
                     const leafH = Math.max(1.2, op.height - jambT);
-                    const doorPivot = new THREE.Group();
-                    // Hinge pivot on left jamb so open state swings realistically
-                    doorPivot.position.set(-leafW / 2, 0, 0);
-                    if (op.status === 'open') {
-                      doorPivot.rotation.y = op.swingDirection === 'left' ? -Math.PI / 3 : Math.PI / 3;
-                    }
+                    const isInitiallyOpen = Boolean(
+                      useMayaStore.getState().openDoors[op.id] ?? op.status === 'open'
+                    );
+                    const initProg = isInitiallyOpen ? 1 : 0;
+                    const swingSign = op.swingDirection === 'left' ? -1 : 1;
+                    const doorWorldX = (isMultiBuilding ? bldg.originX : 0) + wall.x1 + Math.cos(angle) * opCenter;
+                    const doorWorldZ = (isMultiBuilding ? bldg.originZ : 0) + wall.z1 + Math.sin(angle) * opCenter;
+                    const doorLabel =
+                      op.subtype === 'cleanroom-door'
+                        ? 'ISO Cleanroom Door'
+                        : op.subtype === 'airlock-door'
+                          ? 'Airlock Interlock Door'
+                          : op.subtype === 'double-door'
+                            ? 'Double Leaf Door'
+                            : op.subtype === 'sliding-door' || op.subtype === 'automatic-door'
+                              ? 'Automatic Sliding Door'
+                              : op.subtype === 'roller-shutter'
+                                ? 'High-Speed Roll-Up Door'
+                                : op.subtype === 'glass-door'
+                                  ? 'Tempered Glass Door'
+                                  : op.subtype === 'fire-door' || op.subtype === 'emergency-door'
+                                    ? 'Fire Rated Egress Door'
+                                    : 'Facility Door';
 
-                    // Overhead hydraulic door closer arm above header
-                    const closer = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.05, 0.055), hardwareMat);
-                    closer.position.set(-leafW * 0.25, op.height - jambT - 0.035, frameDepth / 2 + 0.015);
+                    opGroup.userData = { entityType: 'door-interact', entityId: op.id, buildingId: bldg.id };
+
+                    const closer = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.055, 0.06), hardwareMat);
+                    closer.position.set(-leafW * 0.22, op.height - jambT - 0.04, frameDepth / 2 + 0.02);
                     opGroup.add(closer);
+
+                    const closerArm = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.022, 0.024), hardwareMat);
+                    closerArm.position.set(-leafW * 0.22, op.height - jambT - 0.015, frameDepth / 2 + 0.055);
+                    closerArm.rotation.y = swingSign * initProg * (Math.PI * 0.36);
+                    opGroup.add(closerArm);
+
+                    let doorLedMat: THREE.MeshBasicMaterial | undefined;
 
                     const addPullHandle = (parent: THREE.Group, hx: number, hy: number, isBar = false) => {
                       for (const side of [-1, 1]) {
@@ -2777,138 +4911,253 @@ export const Viewport3D: React.FC = () => {
                       }
                     };
 
-                    if (op.subtype === 'glass-door') {
-                      // Frameless tempered glass architectural door with stainless patch fittings & dual vertical pull bars
-                      const gLeaf = new THREE.Mesh(new THREE.BoxGeometry(leafW, leafH, 0.024), glassPaneMat);
-                      gLeaf.position.set(leafW / 2, leafH / 2, 0);
-                      gLeaf.renderOrder = 4;
-                      doorPivot.add(gLeaf);
+                    if (op.subtype === 'roller-shutter') {
+                      const drum = new THREE.Mesh(
+                        new THREE.CylinderGeometry(0.14, 0.14, opW + 0.12, 12),
+                        frameMat
+                      );
+                      drum.rotation.z = Math.PI / 2;
+                      drum.position.set(0, op.height + 0.12, 0);
+                      opGroup.add(drum);
 
-                      // Top & bottom stainless patch rails
-                      const botRail = new THREE.Mesh(new THREE.BoxGeometry(leafW, 0.085, 0.036), hardwareMat);
-                      botRail.position.set(leafW / 2, 0.045, 0);
-                      const topPatch = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.06, 0.038), hardwareMat);
-                      topPatch.position.set(0.1, leafH - 0.035, 0);
-                      doorPivot.add(botRail, topPatch);
+                      const curtainMat = new THREE.MeshStandardMaterial({
+                        color: '#94A3B8',
+                        roughness: 0.38,
+                        metalness: 0.55,
+                        clippingPlanes: clipPlanes,
+                      });
+                      const curtain = new THREE.Mesh(new THREE.BoxGeometry(leafW, leafH, 0.045), curtainMat);
+                      const sY = Math.max(0.06, 1 - initProg * 0.92);
+                      curtain.scale.y = sY;
+                      curtain.position.set(0, leafH - (leafH * sY) / 2, 0);
+                      opGroup.add(curtain);
 
-                      addPullHandle(doorPivot, leafW - 0.14, 1.06, true);
-                    } else if (op.subtype === 'double-door' || op.subtype === 'sliding-door' || op.subtype === 'automatic-door') {
-                      const isSliding = op.subtype === 'sliding-door' || op.subtype === 'automatic-door';
-                      const halfW = leafW / 2 - 0.012;
-                      const leafColor = isSliding ? '#D6DCE5' : '#E2E8F0';
+                      eng.animatedDoors.set(op.id, {
+                        openingId: op.id,
+                        floorId: floor.id,
+                        subtype: op.subtype,
+                        label: doorLabel,
+                        roomId: wall.roomId,
+                        worldX: doorWorldX,
+                        worldY: floor.elevation,
+                        worldZ: doorWorldZ,
+                        progress: initProg,
+                        swingSign,
+                        slideTravel: 0,
+                        rollCurtain: curtain,
+                        rollMaxH: leafH,
+                      });
+                    } else if (op.subtype === 'sliding-door' || op.subtype === 'automatic-door') {
+                      const halfW = leafW / 2 - 0.01;
                       const solidLeafMat = new THREE.MeshStandardMaterial({
-                        color: leafColor,
+                        color: '#D6DCE5',
+                        roughness: 0.24,
+                        metalness: 0.38,
+                        clippingPlanes: clipPlanes,
+                      });
+                      const rail = new THREE.Mesh(
+                        new THREE.BoxGeometry(opW + 0.7, 0.095, frameDepth + 0.05),
+                        frameMat
+                      );
+                      rail.position.set(0, op.height + 0.035, 0);
+                      opGroup.add(rail);
+
+                      const slideTravel = halfW * 0.88;
+                      const slideLeft = new THREE.Group();
+                      const slideRight = new THREE.Group();
+                      slideLeft.position.x = -initProg * slideTravel;
+                      slideRight.position.x = initProg * slideTravel;
+
+                      const buildSlideLeaf = (grp: THREE.Group, side: -1 | 1) => {
+                        const cx = side * (halfW / 2 + 0.006);
+                        const leaf = new THREE.Mesh(new THREE.BoxGeometry(halfW, leafH, 0.048), solidLeafMat);
+                        leaf.position.set(cx, leafH / 2, 0);
+                        leaf.castShadow = true;
+                        const vw = Math.min(0.36, halfW * 0.56);
+                        const vh = Math.min(1.05, leafH * 0.5);
+                        const vFrame = new THREE.Mesh(new THREE.BoxGeometry(vw + 0.04, vh + 0.04, 0.054), frameMat);
+                        vFrame.position.set(cx, leafH * 0.58, 0);
+                        const vGlass = new THREE.Mesh(new THREE.BoxGeometry(vw, vh, 0.058), glassPaneMat);
+                        vGlass.position.set(cx, leafH * 0.58, 0);
+                        grp.add(leaf, vFrame, vGlass);
+                        addPullHandle(grp, cx - side * (halfW * 0.34), 1.04, true);
+                      };
+                      buildSlideLeaf(slideLeft, -1);
+                      buildSlideLeaf(slideRight, 1);
+                      opGroup.add(slideLeft, slideRight);
+
+                      doorLedMat = new THREE.MeshBasicMaterial({ color: isInitiallyOpen ? '#22D3EE' : '#10B981' });
+                      const sensorBar = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.04, 0.04), doorLedMat);
+                      sensorBar.position.set(0, op.height + 0.09, frameDepth / 2 + 0.015);
+                      opGroup.add(sensorBar);
+
+                      eng.animatedDoors.set(op.id, {
+                        openingId: op.id,
+                        floorId: floor.id,
+                        subtype: op.subtype,
+                        label: doorLabel,
+                        roomId: wall.roomId,
+                        worldX: doorWorldX,
+                        worldY: floor.elevation,
+                        worldZ: doorWorldZ,
+                        progress: initProg,
+                        swingSign,
+                        slideLeft,
+                        slideRight,
+                        slideTravel,
+                        rollMaxH: leafH,
+                        ledMat: doorLedMat,
+                      });
+                    } else if (op.subtype === 'double-door') {
+                      const halfW = leafW / 2 - 0.012;
+                      const solidLeafMat = new THREE.MeshStandardMaterial({
+                        color: '#E2E8F0',
                         roughness: 0.28,
                         metalness: 0.34,
                         clippingPlanes: clipPlanes,
                       });
-                      const kickMat = new THREE.MeshStandardMaterial({
-                        color: '#CBD5E1',
-                        roughness: 0.2,
-                        metalness: 0.88,
-                        clippingPlanes: clipPlanes,
-                      });
+                      const leftPivot = new THREE.Group();
+                      leftPivot.position.set(-leafW / 2, 0, 0);
+                      leftPivot.rotation.y = -initProg * (Math.PI * 0.46);
 
-                      // Overhead aluminum track for sliding/automatic doors
-                      if (isSliding) {
-                        const rail = new THREE.Mesh(
-                          new THREE.BoxGeometry(opW + 0.5, 0.09, frameDepth + 0.04),
-                          frameMat
-                        );
-                        rail.position.set(0, op.height + 0.03, 0);
-                        opGroup.add(rail);
-                      }
+                      const rightPivot = new THREE.Group();
+                      rightPivot.position.set(leafW / 2, 0, 0);
+                      rightPivot.rotation.y = initProg * (Math.PI * 0.46);
 
-                      for (const side of [-1, 1]) {
-                        const slideShift = isSliding && op.status === 'open' ? side * halfW * 0.65 : 0;
-                        const cx = leafW / 2 + side * (halfW / 2 + 0.008) + slideShift;
+                      const buildSwingLeaf = (pivot: THREE.Group, dir: 1 | -1) => {
+                        const lx = dir * (halfW / 2);
                         const leaf = new THREE.Mesh(new THREE.BoxGeometry(halfW, leafH, 0.05), solidLeafMat);
-                        leaf.position.set(cx, leafH / 2, 0);
+                        leaf.position.set(lx, leafH / 2, 0);
+                        leaf.castShadow = true;
+                        const kick = new THREE.Mesh(new THREE.BoxGeometry(halfW - 0.04, 0.28, 0.056), hardwareMat);
+                        kick.position.set(lx, 0.16, 0);
+                        const vw = Math.min(0.32, halfW * 0.46);
+                        const vh = Math.min(0.84, leafH * 0.38);
+                        const vFrame = new THREE.Mesh(new THREE.BoxGeometry(vw + 0.04, vh + 0.04, 0.056), frameMat);
+                        vFrame.position.set(lx, leafH * 0.62, 0);
+                        const vGlass = new THREE.Mesh(new THREE.BoxGeometry(vw, vh, 0.06), glassPaneMat);
+                        vGlass.position.set(lx, leafH * 0.62, 0);
+                        pivot.add(leaf, kick, vFrame, vGlass);
+                        addPullHandle(pivot, dir * (halfW - 0.12), 1.04, true);
+                      };
+                      buildSwingLeaf(leftPivot, 1);
+                      buildSwingLeaf(rightPivot, -1);
+                      opGroup.add(leftPivot, rightPivot);
+
+                      eng.animatedDoors.set(op.id, {
+                        openingId: op.id,
+                        floorId: floor.id,
+                        subtype: op.subtype,
+                        label: doorLabel,
+                        roomId: wall.roomId,
+                        worldX: doorWorldX,
+                        worldY: floor.elevation,
+                        worldZ: doorWorldZ,
+                        progress: initProg,
+                        swingSign,
+                        leftPivot,
+                        rightPivot,
+                        slideTravel: 0,
+                        rollMaxH: leafH,
+                      });
+                    } else {
+                      // Single-leaf hinged door (Glass, Modern ISO Blue Cleanroom Door, Fire Door, Standard Door)
+                      const doorPivot = new THREE.Group();
+                      doorPivot.position.set(-leafW / 2, 0, 0);
+                      doorPivot.rotation.y = swingSign * initProg * (Math.PI * 0.48);
+
+                      if (op.subtype === 'glass-door') {
+                        const gLeaf = new THREE.Mesh(new THREE.BoxGeometry(leafW, leafH, 0.024), glassPaneMat);
+                        gLeaf.position.set(leafW / 2, leafH / 2, 0);
+                        gLeaf.renderOrder = 4;
+                        const botRail = new THREE.Mesh(new THREE.BoxGeometry(leafW, 0.085, 0.036), hardwareMat);
+                        botRail.position.set(leafW / 2, 0.045, 0);
+                        const topPatch = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.06, 0.038), hardwareMat);
+                        topPatch.position.set(0.1, leafH - 0.035, 0);
+                        doorPivot.add(gLeaf, botRail, topPatch);
+                        addPullHandle(doorPivot, leafW - 0.14, 1.06, true);
+                      } else {
+                        const isFire = op.subtype === 'fire-door' || op.subtype === 'emergency-door';
+                        const isCleanroom = op.subtype === 'cleanroom-door' || op.subtype === 'airlock-door';
+                        // Modern pharmaceutical ISO blue cleanroom door finish matching cleanroom standard
+                        const leafColor = isFire ? '#B91C1C' : isCleanroom ? '#0369A1' : '#CBD5E1';
+                        const solidLeafMat = new THREE.MeshStandardMaterial({
+                          color: leafColor,
+                          roughness: isCleanroom ? 0.22 : 0.36,
+                          metalness: isFire ? 0.45 : isCleanroom ? 0.26 : 0.2,
+                          clippingPlanes: clipPlanes,
+                        });
+                        const leaf = new THREE.Mesh(new THREE.BoxGeometry(leafW, leafH, 0.052), solidLeafMat);
+                        leaf.position.set(leafW / 2, leafH / 2, 0);
                         leaf.castShadow = true;
                         doorPivot.add(leaf);
 
-                        // Stainless kickplate
-                        const kick = new THREE.Mesh(new THREE.BoxGeometry(halfW - 0.04, 0.28, 0.056), kickMat);
-                        kick.position.set(cx, 0.16, 0);
+                        const kick = new THREE.Mesh(new THREE.BoxGeometry(leafW - 0.04, 0.26, 0.058), hardwareMat);
+                        kick.position.set(leafW / 2, 0.15, 0);
                         doorPivot.add(kick);
 
-                        // Recessed glazed vision-lite window
-                        const vw = Math.min(0.32, halfW * 0.44);
-                        const vh = Math.min(0.82, leafH * 0.38);
-                        const vFrame = new THREE.Mesh(new THREE.BoxGeometry(vw + 0.04, vh + 0.04, 0.056), frameMat);
-                        vFrame.position.set(cx, leafH * 0.62, 0);
-                        const vGlass = new THREE.Mesh(new THREE.BoxGeometry(vw, vh, 0.06), glassPaneMat);
-                        vGlass.position.set(cx, leafH * 0.62, 0);
-                        doorPivot.add(vFrame, vGlass);
+                        if (isCleanroom || isFire || leafW >= 0.88) {
+                          const vw = isFire ? 0.18 : Math.min(0.4, leafW * 0.44);
+                          const vh = isFire ? 0.72 : Math.min(0.76, leafH * 0.36);
+                          const vx = isFire ? leafW * 0.72 : leafW * 0.54;
+                          const gasketMat = new THREE.MeshStandardMaterial({
+                            color: '#0F172A',
+                            roughness: 0.4,
+                            metalness: 0.3,
+                          });
+                          const vFrame = new THREE.Mesh(new THREE.BoxGeometry(vw + 0.05, vh + 0.05, 0.06), gasketMat);
+                          vFrame.position.set(vx, leafH * 0.64, 0);
+                          const vGlass = new THREE.Mesh(new THREE.BoxGeometry(vw, vh, 0.064), glassPaneMat);
+                          vGlass.position.set(vx, leafH * 0.64, 0);
+                          doorPivot.add(vFrame, vGlass);
+                        }
 
-                        addPullHandle(doorPivot, cx - side * (halfW * 0.32), 1.04, true);
+                        if (isCleanroom || op.accessControl === 'interlock' || op.accessControl === 'badge') {
+                          const ledColor =
+                            op.status === 'alarm'
+                              ? '#EF4444'
+                              : isInitiallyOpen
+                                ? '#22D3EE'
+                                : op.status === 'interlocked'
+                                  ? '#F59E0B'
+                                  : '#10B981';
+                          doorLedMat = new THREE.MeshBasicMaterial({ color: ledColor });
+                          const led = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.042, 0.03), doorLedMat);
+                          led.position.set(0, op.height + 0.055, frameDepth / 2 + 0.01);
+                          opGroup.add(led);
+                        }
+
+                        if (isFire) {
+                          const crashBar = new THREE.Mesh(
+                            new THREE.BoxGeometry(leafW * 0.74, 0.06, 0.06),
+                            new THREE.MeshStandardMaterial({ color: '#FACC15', roughness: 0.3, metalness: 0.4 })
+                          );
+                          crashBar.position.set(leafW / 2, 1.0, 0.055);
+                          doorPivot.add(crashBar);
+                        } else {
+                          addPullHandle(doorPivot, leafW - 0.12, 1.02, false);
+                        }
                       }
-                    } else {
-                      // Cleanroom, airlock, fire, emergency, security, or standard architectural single door
-                      const isFire = op.subtype === 'fire-door' || op.subtype === 'emergency-door';
-                      const isCleanroom = op.subtype === 'cleanroom-door' || op.subtype === 'airlock-door';
-                      const leafColor = isFire ? '#B91C1C' : isCleanroom ? '#F1F5F9' : '#CBD5E1';
-                      const solidLeafMat = new THREE.MeshStandardMaterial({
-                        color: leafColor,
-                        roughness: isCleanroom ? 0.24 : 0.38,
-                        metalness: isFire ? 0.45 : 0.2,
-                        clippingPlanes: clipPlanes,
+
+                      opGroup.add(doorPivot);
+                      eng.animatedDoors.set(op.id, {
+                        openingId: op.id,
+                        floorId: floor.id,
+                        subtype: op.subtype,
+                        label: doorLabel,
+                        roomId: wall.roomId,
+                        worldX: doorWorldX,
+                        worldY: floor.elevation,
+                        worldZ: doorWorldZ,
+                        progress: initProg,
+                        swingSign,
+                        singlePivot: doorPivot,
+                        slideTravel: 0,
+                        rollMaxH: leafH,
+                        closerArm,
+                        ledMat: doorLedMat,
                       });
-                      const leaf = new THREE.Mesh(new THREE.BoxGeometry(leafW, leafH, 0.052), solidLeafMat);
-                      leaf.position.set(leafW / 2, leafH / 2, 0);
-                      leaf.castShadow = true;
-                      doorPivot.add(leaf);
-
-                      // Stainless kickplate at bottom
-                      const kick = new THREE.Mesh(
-                        new THREE.BoxGeometry(leafW - 0.04, 0.26, 0.058),
-                        hardwareMat
-                      );
-                      kick.position.set(leafW / 2, 0.15, 0);
-                      doorPivot.add(kick);
-
-                      // Flush vision-lite glass window on cleanroom / airlock / fire doors
-                      if (isCleanroom || isFire || leafW >= 0.88) {
-                        const vw = isFire ? 0.18 : Math.min(0.36, leafW * 0.38);
-                        const vh = isFire ? 0.72 : Math.min(0.68, leafH * 0.32);
-                        const vx = isFire ? leafW * 0.72 : leafW * 0.56;
-                        const vFrame = new THREE.Mesh(new THREE.BoxGeometry(vw + 0.045, vh + 0.045, 0.058), frameMat);
-                        vFrame.position.set(vx, leafH * 0.64, 0);
-                        const vGlass = new THREE.Mesh(new THREE.BoxGeometry(vw, vh, 0.062), glassPaneMat);
-                        vGlass.position.set(vx, leafH * 0.64, 0);
-                        doorPivot.add(vFrame, vGlass);
-                      }
-
-                      // Interlock status LED indicator above cleanroom / airlock doors
-                      if (isCleanroom || op.accessControl === 'interlock' || op.accessControl === 'badge') {
-                        const ledColor =
-                          op.status === 'alarm'
-                            ? '#EF4444'
-                            : op.status === 'interlocked'
-                              ? '#F59E0B'
-                              : '#10B981';
-                        const led = new THREE.Mesh(
-                          new THREE.BoxGeometry(0.18, 0.042, 0.03),
-                          new THREE.MeshBasicMaterial({ color: ledColor })
-                        );
-                        led.position.set(0, op.height + 0.055, frameDepth / 2 + 0.01);
-                        opGroup.add(led);
-                      }
-
-                      if (isFire) {
-                        // Horizontal panic crash bar
-                        const crashBar = new THREE.Mesh(
-                          new THREE.BoxGeometry(leafW * 0.74, 0.06, 0.06),
-                          new THREE.MeshStandardMaterial({ color: '#FACC15', roughness: 0.3, metalness: 0.4 })
-                        );
-                        crashBar.position.set(leafW / 2, 1.0, 0.055);
-                        doorPivot.add(crashBar);
-                      } else {
-                        addPullHandle(doorPivot, leafW - 0.12, 1.02, isCleanroom);
-                      }
                     }
-
-                    opGroup.add(doorPivot);
                   }
                   wallGroup.add(opGroup);
                 }
@@ -2972,13 +5221,17 @@ export const Viewport3D: React.FC = () => {
               );
             }
 
-            // Glowing beacon ring around matched assets during Org-Wide Isolation, Category X-Ray, OR Production Line Eligibility Check
-            if (isOrgIsolation || isLineFailAsset || isLineOkAsset || (isCategoryXray && assetMatchesCategory)) {
-              const beaconHex = isLineFailAsset
-                ? '#EF4444'
-                : isCategoryXray && assetMatchesCategory
-                  ? categoryMeta.color
-                  : '#10B981';
+            const isVoiceHighlightedAsset = voiceHighlightIds.includes(asset.id);
+
+            // Glowing beacon ring around matched assets during Voice Query, Org-Wide Isolation, Category X-Ray, OR Production Line Eligibility Check
+            if (isVoiceHighlightedAsset || isOrgIsolation || isLineFailAsset || isLineOkAsset || (isCategoryXray && assetMatchesCategory)) {
+              const beaconHex = isVoiceHighlightedAsset
+                ? '#F59E0B'
+                : isLineFailAsset
+                  ? '#EF4444'
+                  : isCategoryXray && assetMatchesCategory
+                    ? categoryMeta.color
+                    : '#10B981';
               const ringR = Math.max(asset.width, asset.depth) * 0.68 + 0.32;
               const ring = new THREE.Mesh(
                 new THREE.RingGeometry(ringR - 0.12, ringR, 36),
@@ -3246,106 +5499,7 @@ export const Viewport3D: React.FC = () => {
             });
         }
 
-        // 7. 3D Flow & Connectivity Ribbons + Isolation Mode + Room Sequence Markers + Animated Pulse Beads
-        if (showFlows && isLayerVisible('layer-flows') && !isOrgIsolation) {
-          sceneData.flows
-            .filter((f) => {
-              if (f.floorId !== floor.id || f.points.length < 2) return false;
-              if (isolatedFlowId) return f.id === isolatedFlowId;
-              return !hiddenFlowIds.includes(f.id);
-            })
-            .forEach((flow) => {
-              const isIsolated = isolatedFlowId === flow.id;
-              const pts = flow.points.map((p) => new THREE.Vector3(p.x, isIsolated ? 0.32 : 0.24, p.z));
-              const curve = new THREE.CatmullRomCurve3(pts, false, 'catmullrom', 0.15);
-              const tubeGeo = new THREE.TubeGeometry(
-                curve,
-                Math.max(16, pts.length * 10),
-                isIsolated ? 0.115 : 0.085,
-                8,
-                false
-              );
-              const isSel = selectedSet.has(`flow:${flow.id}`);
-              const tubeMat = new THREE.MeshStandardMaterial({
-                color: isSel ? '#FFFFFF' : flow.color,
-                emissive: flow.color,
-                emissiveIntensity: isIsolated ? 1.15 : lightingMode === 'night' ? 0.85 : 0.42,
-                roughness: 0.26,
-                metalness: 0.22,
-              });
-              const mesh = new THREE.Mesh(tubeGeo, tubeMat);
-              mesh.userData = { entityType: 'flow', entityId: flow.id, buildingId: bldg.id };
-              floorGroup.add(mesh);
-
-              // When this flow is isolated, highlight every room it traverses with a glowing floor rim
-              if (isIsolated) {
-                const seq = computeFlowRoomSequence(flow, sceneData.rooms);
-                seq.steps.forEach((st) => {
-                  const rm = sceneData.rooms.find((r) => r.id === st.roomId);
-                  if (!rm) return;
-                  const rimGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(rm.width - 0.14, 0.06, rm.depth - 0.14));
-                  const rim = new THREE.LineSegments(
-                    rimGeo,
-                    new THREE.LineBasicMaterial({ color: flow.color })
-                  );
-                  rim.position.set(rm.x + rm.width / 2, 0.08, rm.z + rm.depth / 2);
-                  floorGroup.add(rim);
-
-                  const beacon = new THREE.Mesh(
-                    new THREE.CylinderGeometry(0.26, 0.32, 0.08, 16),
-                    new THREE.MeshBasicMaterial({ color: flow.color })
-                  );
-                  beacon.position.set(st.centerX, 0.07, st.centerZ);
-                  floorGroup.add(beacon);
-                });
-              }
-
-              // Animated glowing flow packets traveling along the route
-              if (animateFlows && flow.animated !== false) {
-                const pulseCount = Math.min(5, Math.max(2, Math.round(curve.getLength() / 5.5)));
-                for (let pIdx = 0; pIdx < pulseCount; pIdx++) {
-                  const bead = new THREE.Mesh(
-                    new THREE.SphereGeometry(isIsolated ? 0.21 : 0.17, 10, 10),
-                    new THREE.MeshBasicMaterial({ color: '#FFFFFF' })
-                  );
-                  const halo = new THREE.Mesh(
-                    new THREE.SphereGeometry(isIsolated ? 0.34 : 0.28, 10, 10),
-                    new THREE.MeshBasicMaterial({
-                      color: flow.color,
-                      transparent: true,
-                      opacity: isIsolated ? 0.62 : 0.45,
-                      depthWrite: false,
-                    })
-                  );
-                  bead.add(halo);
-                  const phase = pIdx / pulseCount;
-                  bead.position.copy(curve.getPointAt(phase));
-                  floorGroup.add(bead);
-                  eng.flowPulses.push({
-                    mesh: bead,
-                    curve,
-                    phase,
-                    speed: 0.18 + (pIdx % 2) * 0.03,
-                  });
-                }
-              }
-
-              const last = pts[pts.length - 1];
-              const prev = pts[pts.length - 2];
-              const dir = new THREE.Vector3().subVectors(last, prev).normalize();
-              const arrow = new THREE.Mesh(
-                new THREE.ConeGeometry(isIsolated ? 0.3 : 0.24, isIsolated ? 0.64 : 0.52, 10),
-                new THREE.MeshStandardMaterial({
-                  color: flow.color,
-                  emissive: flow.color,
-                  emissiveIntensity: isIsolated ? 1.2 : lightingMode === 'night' ? 0.9 : 0.45,
-                })
-              );
-              arrow.position.copy(last);
-              arrow.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
-              floorGroup.add(arrow);
-            });
-        }
+        // (Flows, HVAC, and Network Trace are built in dedicated lightweight layer effects below so toggling them never rebuilds building geometry)
 
         // 8. Measurement Tape Line in 3D
         if (measurePoints.length === 2 && floor.id === activeFloorId) {
@@ -3385,258 +5539,6 @@ export const Viewport3D: React.FC = () => {
           });
         }
 
-        // 9.5. 3D HVAC Ductwork, HEPA Terminal Diffusers & Airflow Indicators
-        if (showHvacOverlay && !isOrgIsolation) {
-          const floorHvacRooms = sceneData.rooms.filter((r) => {
-            if (r.floorId !== floor.id) return false;
-            if (hvacAhuFilter === 'all') return true;
-            return getEffectiveRoomHvac(r).ahuId === hvacAhuFilter;
-          });
-
-          if (floorHvacRooms.length > 0) {
-            const ductY = Math.max(2.5, floor.height - 0.36);
-            const returnY = Math.max(2.3, ductY - 0.26);
-            const spineZ = Number((floor.depth * 0.5).toFixed(2));
-            const minRoomX = Math.max(1.2, Math.min(...floorHvacRooms.map((r) => r.x + r.width / 2)));
-            const maxRoomX = Math.min(floor.width - 1.2, Math.max(...floorHvacRooms.map((r) => r.x + r.width / 2)));
-            const trunkLen = Math.max(2.0, maxRoomX - minRoomX + 1.2);
-            const trunkCenterX = (minRoomX + maxRoomX) / 2;
-
-            const supplyTrunkMat = new THREE.MeshStandardMaterial({
-              color: '#0EA5E9',
-              metalness: 0.58,
-              roughness: 0.28,
-              emissive: '#0284C7',
-              emissiveIntensity: 0.25,
-              clippingPlanes: clipPlanes,
-            });
-            const returnTrunkMat = new THREE.MeshStandardMaterial({
-              color: '#F59E0B',
-              metalness: 0.45,
-              roughness: 0.38,
-              emissive: '#B45309',
-              emissiveIntensity: 0.18,
-              clippingPlanes: clipPlanes,
-            });
-
-            // Main horizontal supply & return plenum trunks
-            const supplyTrunk = new THREE.Mesh(
-              new THREE.BoxGeometry(trunkLen, 0.26, 0.42),
-              supplyTrunkMat
-            );
-            supplyTrunk.position.set(trunkCenterX, ductY, spineZ - 0.26);
-            floorGroup.add(supplyTrunk);
-
-            const returnTrunk = new THREE.Mesh(
-              new THREE.BoxGeometry(trunkLen, 0.22, 0.34),
-              returnTrunkMat
-            );
-            returnTrunk.position.set(trunkCenterX, returnY, spineZ + 0.28);
-            floorGroup.add(returnTrunk);
-
-            // Per-room branch ducts, HEPA ceiling diffusers, damper status collars & airflow cones
-            floorHvacRooms.forEach((rm) => {
-              const cfg = getEffectiveRoomHvac(rm);
-              const ahuColor = getAhuColor(cfg.ahuId);
-              const rcx = rm.x + rm.width / 2;
-              const rcz = rm.z + rm.depth / 2;
-
-              const branchMat = new THREE.MeshStandardMaterial({
-                color: ahuColor,
-                metalness: 0.52,
-                roughness: 0.3,
-                emissive: ahuColor,
-                emissiveIntensity: 0.22,
-                clippingPlanes: clipPlanes,
-              });
-
-              const branchLen = Math.abs(rcz - (spineZ - 0.26));
-              if (branchLen > 0.35) {
-                const branch = new THREE.Mesh(
-                  new THREE.BoxGeometry(0.24, 0.18, branchLen),
-                  branchMat
-                );
-                branch.position.set(rcx, ductY, (rcz + (spineZ - 0.26)) / 2);
-                floorGroup.add(branch);
-              }
-
-              // Return stub
-              const retLen = Math.abs(rcz - (spineZ + 0.28));
-              if (retLen > 0.35) {
-                const retBranch = new THREE.Mesh(
-                  new THREE.BoxGeometry(0.18, 0.14, retLen),
-                  returnTrunkMat
-                );
-                retBranch.position.set(rcx + 0.34, returnY, (rcz + (spineZ + 0.28)) / 2);
-                floorGroup.add(retBranch);
-              }
-
-              // HEPA diffuser terminal boxes distributed cleanly across room ceiling
-              const diffCount = Math.max(1, Math.min(8, cfg.diffuserCount));
-              const cols = diffCount <= 2 ? diffCount : Math.ceil(Math.sqrt(diffCount * (rm.width / Math.max(1, rm.depth))));
-              const rows = Math.max(1, Math.ceil(diffCount / Math.max(1, cols)));
-              const statusHex =
-                cfg.systemStatus === 'alarm'
-                  ? '#F43F5E'
-                  : cfg.systemStatus === 'maintenance'
-                    ? '#F59E0B'
-                    : cfg.systemStatus === 'standby'
-                      ? '#71717A'
-                      : ahuColor;
-
-              const diffuserMat = new THREE.MeshStandardMaterial({
-                color: '#E4E4E7',
-                metalness: 0.65,
-                roughness: 0.25,
-                clippingPlanes: clipPlanes,
-              });
-              const collarMat = new THREE.MeshStandardMaterial({
-                color: statusHex,
-                emissive: statusHex,
-                emissiveIntensity: cfg.systemStatus === 'alarm' ? 0.9 : 0.45,
-                roughness: 0.3,
-                clippingPlanes: clipPlanes,
-              });
-              const coneMat = new THREE.MeshBasicMaterial({
-                color: cfg.targetPressurePa < 0 ? '#F59E0B' : '#38BDF8',
-                transparent: true,
-                opacity: 0.32,
-                depthWrite: false,
-                clippingPlanes: clipPlanes,
-              });
-
-              let placed = 0;
-              for (let rIdx = 0; rIdx < rows && placed < diffCount; rIdx++) {
-                for (let cIdx = 0; cIdx < cols && placed < diffCount; cIdx++) {
-                  const dx = rm.x + ((cIdx + 0.5) / cols) * rm.width;
-                  const dz = rm.z + ((rIdx + 0.5) / rows) * rm.depth;
-                  const diffBox = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.12, 0.62), diffuserMat);
-                  diffBox.position.set(dx, ductY - 0.16, dz);
-                  diffBox.userData = { entityType: 'room', entityId: rm.id, buildingId: bldg.id };
-                  floorGroup.add(diffBox);
-
-                  const collar = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.04, 0.68), collarMat);
-                  collar.position.set(dx, ductY - 0.22, dz);
-                  floorGroup.add(collar);
-
-                  // Subtle airflow plume cone (downward for supply/positive, upward for negative exhaust)
-                  const cone = new THREE.Mesh(new THREE.ConeGeometry(0.28, 0.55, 8, 1, true), coneMat);
-                  cone.position.set(dx, ductY - 0.54, dz);
-                  if (cfg.targetPressurePa >= 0) {
-                    cone.rotation.x = Math.PI;
-                  }
-                  floorGroup.add(cone);
-
-                  // Tie diffuser to room branch manifold if offset from center
-                  const dDist = Math.hypot(dx - rcx, dz - rcz);
-                  if (dDist > 0.35) {
-                    const flex = new THREE.Mesh(
-                      new THREE.CylinderGeometry(0.06, 0.06, dDist, 6),
-                      branchMat
-                    );
-                    flex.position.set((dx + rcx) / 2, ductY - 0.04, (dz + rcz) / 2);
-                    flex.rotation.z = Math.PI / 2;
-                    flex.rotation.y = -Math.atan2(dz - rcz, dx - rcx);
-                    floorGroup.add(flex);
-                  }
-                  placed++;
-                }
-              }
-            });
-          }
-        }
-
-        // 10. Active IT Network Port & Cable End-to-End 3D Trace (Overhead Cable Tray + Drop Risers + Hop Beacons)
-        if (activeNetworkTrace && floor.id === activeFloorId) {
-          const floorHops = activeNetworkTrace.hops.filter(
-            (h) => !h.floorId || h.floorId === floor.id
-          );
-          const traceHops = floorHops.length > 0 ? floorHops : activeNetworkTrace.hops;
-          const traceHex =
-            activeNetworkTrace.status === 'error'
-              ? '#F43F5E'
-              : activeNetworkTrace.status === 'warning'
-                ? '#F59E0B'
-                : '#06B6D4';
-
-          const trayY = Math.max(2.65, floor.height - 0.55);
-          const beaconMat = new THREE.MeshStandardMaterial({
-            color: traceHex,
-            emissive: traceHex,
-            emissiveIntensity: 1.35,
-            roughness: 0.2,
-          });
-          const riserMat = new THREE.MeshStandardMaterial({
-            color: traceHex,
-            emissive: traceHex,
-            emissiveIntensity: 0.9,
-            transparent: true,
-            opacity: 0.85,
-          });
-
-          // Render hop beacons + vertical cable risers to overhead tray
-          traceHops.forEach((hop) => {
-            const baseY = hop.kind === 'user-node' ? 1.1 : 1.7;
-            const beacon = new THREE.Mesh(new THREE.SphereGeometry(0.24, 16, 16), beaconMat);
-            beacon.position.set(hop.x, baseY, hop.z);
-            floorGroup.add(beacon);
-
-            const ring = new THREE.Mesh(
-              new THREE.TorusGeometry(0.42, 0.04, 10, 28),
-              riserMat
-            );
-            ring.rotation.x = Math.PI / 2;
-            ring.position.set(hop.x, 0.08, hop.z);
-            floorGroup.add(ring);
-
-            const riserH = Math.max(0.4, trayY - baseY);
-            const riser = new THREE.Mesh(
-              new THREE.CylinderGeometry(0.045, 0.045, riserH, 8),
-              riserMat
-            );
-            riser.position.set(hop.x, baseY + riserH / 2, hop.z);
-            floorGroup.add(riser);
-          });
-
-          // Overhead glowing conduit connecting all hops in order
-          if (traceHops.length >= 2) {
-            const cablePts: THREE.Vector3[] = [];
-            traceHops.forEach((hop, idx) => {
-              const baseY = hop.kind === 'user-node' ? 1.1 : 1.7;
-              if (idx === 0) cablePts.push(new THREE.Vector3(hop.x, baseY, hop.z));
-              cablePts.push(new THREE.Vector3(hop.x, trayY, hop.z));
-              if (idx === traceHops.length - 1) {
-                cablePts.push(new THREE.Vector3(hop.x, baseY, hop.z));
-              }
-            });
-            const curve = new THREE.CatmullRomCurve3(cablePts, false, 'catmullrom', 0.12);
-            const tube = new THREE.Mesh(
-              new THREE.TubeGeometry(curve, Math.max(32, traceHops.length * 24), 0.075, 10, false),
-              new THREE.MeshStandardMaterial({
-                color: traceHex,
-                emissive: traceHex,
-                emissiveIntensity: 1.25,
-                roughness: 0.18,
-              })
-            );
-            floorGroup.add(tube);
-
-            // Animated data packet pulses travelling along traced cable
-            const pulseMat = new THREE.MeshBasicMaterial({ color: '#FFFFFF' });
-            for (let pIdx = 0; pIdx < 4; pIdx++) {
-              const bead = new THREE.Mesh(new THREE.SphereGeometry(0.14, 10, 10), pulseMat);
-              const phase = pIdx / 4;
-              bead.position.copy(curve.getPointAt(phase));
-              floorGroup.add(bead);
-              eng.flowPulses.push({
-                mesh: bead,
-                curve,
-                phase,
-                speed: 0.28,
-              });
-            }
-          }
-        }
       });
     });
 
@@ -3670,19 +5572,598 @@ export const Viewport3D: React.FC = () => {
     sectionCutAxis,
     sectionCutFlipped,
     lightingMode,
-    animateFlows,
-    showFlows,
-    isolatedFlowId,
-    hiddenFlowIds,
-    explodedFactor,
     timelineDate,
     activeTool,
     pendingAIActions,
     measurePoints,
     activeLineHighlight,
-    activeNetworkTrace,
+    voiceHighlightIds,
+  ]);
+
+  // Independent 3D Flows Layer + Single InstancedMesh Animated Pulses (Toggling flows never rebuilds buildings!)
+  useEffect(() => {
+    const eng = engineRef.current;
+    if (!eng) return;
+
+    disposeObject3D(eng.flowsGroup);
+    eng.flowsGroup.clear();
+    eng.flowPulseInstancedMesh = null;
+    eng.flowPulseTracks = [];
+
+    const isOrgIsolation = isolatedAssetType !== null;
+    const flowLayer = sceneData.layers.find((x) => x.id === 'layer-flows');
+    const flowLayerVisible = flowLayer ? flowLayer.visible : true;
+
+    if (!showFlows || !flowLayerVisible || isOrgIsolation) {
+      eng.requestRender();
+      return;
+    }
+
+    const isMultiBuilding = drillLevel === 'campus';
+    const activeFl = sceneData.floors.find((f) => f.id === activeFloorId);
+    const buildingsToRender = isMultiBuilding
+      ? sceneData.buildings
+      : sceneData.buildings.filter((b) => b.id === activeBuildingId);
+    const selectedSet = new Set(selected.map((s) => `${s.type}:${s.id}`));
+
+    const pulseTracks: FlowPulseTrack[] = [];
+    const pulseColors: string[] = [];
+    const arrowGeoNormal = new THREE.ConeGeometry(0.15, 0.34, 8);
+    const arrowGeoIso = new THREE.ConeGeometry(0.2, 0.42, 8);
+    const upVec = new THREE.Vector3(0, 1, 0);
+
+    buildingsToRender.forEach((bldg) => {
+      const ox = isMultiBuilding ? bldg.originX : 0;
+      const oz = isMultiBuilding ? bldg.originZ : 0;
+      const bldgFloors =
+        isMultiBuilding || showAllFloors || drillLevel === 'building'
+          ? sceneData.floors.filter((f) => f.buildingId === bldg.id)
+          : activeFl && activeFl.buildingId === bldg.id
+            ? [activeFl]
+            : [];
+
+      bldgFloors.forEach((floor) => {
+        const curExploded = storeRef.current.explodedFactor;
+        const oy = floor.elevation + curExploded * floor.levelIndex * 5.2;
+        const flFlows = sceneData.flows.filter((f) => {
+          if (f.floorId !== floor.id || f.points.length < 2) return false;
+          if (isolatedFlowId) return f.id === isolatedFlowId;
+          return !hiddenFlowIds.includes(f.id);
+        });
+        if (flFlows.length === 0) return;
+
+        const floorFlowGrp = new THREE.Group();
+        floorFlowGrp.position.set(ox, oy, oz);
+        floorFlowGrp.userData.decompFloor = { baseY: floor.elevation, levelIndex: floor.levelIndex };
+        eng.flowsGroup.add(floorFlowGrp);
+
+        flFlows.forEach((flow) => {
+          const isIsolated = isolatedFlowId === flow.id;
+          // Flush architectural floor-level illuminated flow strips (y = 0.045m) so flows NEVER pierce MAYA's body
+          const pts = flow.points.map((p) => new THREE.Vector3(p.x, isIsolated ? 0.065 : 0.045, p.z));
+          const curve = new THREE.CatmullRomCurve3(pts, false, 'catmullrom', 0.15);
+          const tubeGeo = new THREE.TubeGeometry(
+            curve,
+            Math.max(14, Math.min(48, pts.length * 8)),
+            isIsolated ? 0.068 : 0.046,
+            6,
+            false
+          );
+          const isSel = selectedSet.has(`flow:${flow.id}`);
+          const tubeMat = new THREE.MeshStandardMaterial({
+            color: isSel ? '#FFFFFF' : flow.color,
+            emissive: flow.color,
+            emissiveIntensity: isIsolated ? 1.15 : lightingMode === 'night' ? 0.85 : 0.42,
+            roughness: 0.26,
+            metalness: 0.22,
+          });
+          const mesh = new THREE.Mesh(tubeGeo, tubeMat);
+          mesh.userData = { entityType: 'flow', entityId: flow.id, buildingId: bldg.id };
+          floorFlowGrp.add(mesh);
+
+          if (isIsolated) {
+            const seq = computeFlowRoomSequence(flow, sceneData.rooms);
+            seq.steps.forEach((st) => {
+              const rm = sceneData.rooms.find((r) => r.id === st.roomId);
+              if (!rm) return;
+              const rimGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(rm.width - 0.14, 0.06, rm.depth - 0.14));
+              const rim = new THREE.LineSegments(rimGeo, new THREE.LineBasicMaterial({ color: flow.color }));
+              rim.position.set(rm.x + rm.width / 2, 0.08, rm.z + rm.depth / 2);
+              floorFlowGrp.add(rim);
+
+              const beacon = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.24, 0.3, 0.05, 12),
+                new THREE.MeshBasicMaterial({ color: flow.color })
+              );
+              beacon.position.set(st.centerX, 0.05, st.centerZ);
+              floorFlowGrp.add(beacon);
+            });
+          }
+
+          if (animateFlows && flow.animated !== false) {
+            const samples = sampleCurveWorld(curve, ox, floor.elevation, oz);
+            const pulseCount = Math.min(4, Math.max(2, Math.round(curve.getLength() / 6.5)));
+            for (let pIdx = 0; pIdx < pulseCount; pIdx++) {
+              pulseTracks.push({
+                samples,
+                sampleCount: PULSE_SAMPLES,
+                phase: pIdx / pulseCount,
+                speed: 0.18 + (pIdx % 2) * 0.03,
+                scale: isIsolated ? 0.95 : 0.72,
+                levelIndex: floor.levelIndex,
+              });
+              pulseColors.push(flow.color);
+            }
+          }
+
+          const last = pts[pts.length - 1];
+          const prev = pts[pts.length - 2];
+          const dir = new THREE.Vector3().subVectors(last, prev).normalize();
+          const arrow = new THREE.Mesh(
+            isIsolated ? arrowGeoIso : arrowGeoNormal,
+            tubeMat
+          );
+          arrow.position.copy(last);
+          arrow.quaternion.setFromUnitVectors(upVec, dir);
+          floorFlowGrp.add(arrow);
+        });
+      });
+    });
+
+    if (pulseTracks.length > 0) {
+      const pulseGeo = new THREE.SphereGeometry(0.11, 8, 8);
+      const pulseMat = new THREE.MeshBasicMaterial({ color: '#FFFFFF' });
+      const inst = new THREE.InstancedMesh(pulseGeo, pulseMat, pulseTracks.length);
+      inst.frustumCulled = false;
+      const initExp = storeRef.current.explodedFactor;
+      for (let i = 0; i < pulseTracks.length; i++) {
+        const tr = pulseTracks[i];
+        const idx = Math.floor(tr.phase * (tr.sampleCount - 1)) * 3;
+        _tmpVec3.set(
+          tr.samples[idx],
+          tr.samples[idx + 1] + initExp * tr.levelIndex * 5.2,
+          tr.samples[idx + 2]
+        );
+        _tmpScale.setScalar(tr.scale);
+        _tmpMat4.compose(_tmpVec3, _identityQuat, _tmpScale);
+        inst.setMatrixAt(i, _tmpMat4);
+        _tmpColor.set(pulseColors[i]).lerp(_tmpColor.clone().set('#FFFFFF'), 0.45);
+        inst.setColorAt(i, _tmpColor);
+      }
+      inst.instanceMatrix.needsUpdate = true;
+      if (inst.instanceColor) inst.instanceColor.needsUpdate = true;
+      inst.computeBoundingSphere();
+      eng.flowsGroup.add(inst);
+      eng.flowPulseInstancedMesh = inst;
+      eng.flowPulseTracks = pulseTracks;
+    }
+
+    eng.requestRender();
+  }, [
+    showFlows,
+    animateFlows,
+    isolatedFlowId,
+    hiddenFlowIds,
+    isolatedAssetType,
+    sceneData.flows,
+    sceneData.rooms,
+    sceneData.floors,
+    sceneData.buildings,
+    sceneData.layers,
+    activeFloorId,
+    activeBuildingId,
+    drillLevel,
+    showAllFloors,
+    lightingMode,
+    selected,
+  ]);
+
+  // Independent InstancedMesh 3D HVAC Ductwork & HEPA Diffuser Overlay (~12 draw calls, <2ms toggle!)
+  useEffect(() => {
+    const eng = engineRef.current;
+    if (!eng) return;
+
+    disposeObject3D(eng.hvacGroup);
+    eng.hvacGroup.clear();
+
+    const isOrgIsolation = isolatedAssetType !== null;
+    if (!showHvacOverlay || isOrgIsolation) {
+      eng.requestRender();
+      return;
+    }
+
+    const isMultiBuilding = drillLevel === 'campus';
+    const activeFl = sceneData.floors.find((f) => f.id === activeFloorId);
+    const buildingsToRender = isMultiBuilding
+      ? sceneData.buildings
+      : sceneData.buildings.filter((b) => b.id === activeBuildingId);
+    const clipPlanes = sectionCutEnabled ? [eng.clippingPlane] : [];
+
+    // Shared unit geometries + pooled materials across all visible floors
+    const unitBoxGeo = new THREE.BoxGeometry(1, 1, 1);
+    const unitFlexGeo = new THREE.CylinderGeometry(0.06, 0.06, 1, 6);
+    const supplyTrunkMat = new THREE.MeshStandardMaterial({
+      color: '#0EA5E9',
+      metalness: 0.58,
+      roughness: 0.28,
+      emissive: '#0284C7',
+      emissiveIntensity: 0.25,
+      clippingPlanes: clipPlanes,
+    });
+    const returnTrunkMat = new THREE.MeshStandardMaterial({
+      color: '#F59E0B',
+      metalness: 0.45,
+      roughness: 0.38,
+      emissive: '#B45309',
+      emissiveIntensity: 0.18,
+      clippingPlanes: clipPlanes,
+    });
+    const branchMatCache = new Map<string, THREE.MeshStandardMaterial>();
+    const getBranchMat = (hex: string) => {
+      let m = branchMatCache.get(hex);
+      if (!m) {
+        m = new THREE.MeshStandardMaterial({
+          color: hex,
+          metalness: 0.52,
+          roughness: 0.3,
+          emissive: hex,
+          emissiveIntensity: 0.22,
+          clippingPlanes: clipPlanes,
+        });
+        branchMatCache.set(hex, m);
+      }
+      return m;
+    };
+
+    interface DiffuserInstance {
+      x: number;
+      y: number;
+      z: number;
+      statusHex: string;
+      positivePressure: boolean;
+    }
+    const diffGeo = new THREE.BoxGeometry(0.62, 0.12, 0.62);
+    const diffMat = new THREE.MeshStandardMaterial({
+      color: '#E4E4E7',
+      metalness: 0.65,
+      roughness: 0.25,
+      clippingPlanes: clipPlanes,
+    });
+    const collarGeo = new THREE.BoxGeometry(0.68, 0.04, 0.68);
+    const collarMat = new THREE.MeshStandardMaterial({
+      color: '#FFFFFF',
+      roughness: 0.3,
+      clippingPlanes: clipPlanes,
+    });
+    const coneGeo = new THREE.ConeGeometry(0.28, 0.55, 8, 1, true);
+    const coneMat = new THREE.MeshBasicMaterial({
+      color: '#FFFFFF',
+      transparent: true,
+      opacity: 0.32,
+      depthWrite: false,
+      clippingPlanes: clipPlanes,
+    });
+
+    const initExplodedHvac = storeRef.current.explodedFactor;
+
+    buildingsToRender.forEach((bldg) => {
+      const ox = isMultiBuilding ? bldg.originX : 0;
+      const oz = isMultiBuilding ? bldg.originZ : 0;
+      const bldgFloors =
+        isMultiBuilding || showAllFloors || drillLevel === 'building'
+          ? sceneData.floors.filter((f) => f.buildingId === bldg.id)
+          : activeFl && activeFl.buildingId === bldg.id
+            ? [activeFl]
+            : [];
+
+      bldgFloors.forEach((floor) => {
+        const floorHvacRooms = sceneData.rooms.filter((r) => {
+          if (r.floorId !== floor.id) return false;
+          if (hvacAhuFilter === 'all') return true;
+          return getEffectiveRoomHvac(r).ahuId === hvacAhuFilter;
+        });
+        if (floorHvacRooms.length === 0) return;
+
+        // Per-floor HVAC group allows O(1) floor decomposition without rebuilding any ducts or diffusers
+        const floorHvacGrp = new THREE.Group();
+        floorHvacGrp.position.set(
+          ox,
+          floor.elevation + initExplodedHvac * floor.levelIndex * 5.2,
+          oz
+        );
+        floorHvacGrp.userData.decompFloor = {
+          baseY: floor.elevation,
+          levelIndex: floor.levelIndex,
+        };
+        eng.hvacGroup.add(floorHvacGrp);
+
+        const ductY = Math.max(2.5, floor.height - 0.36);
+        const returnY = Math.max(2.3, ductY - 0.26);
+        const spineZ = Number((floor.depth * 0.5).toFixed(2));
+        const floorDiffusers: DiffuserInstance[] = [];
+
+        let minRoomX = Infinity;
+        let maxRoomX = -Infinity;
+        for (const r of floorHvacRooms) {
+          const cx = r.x + r.width / 2;
+          if (cx < minRoomX) minRoomX = cx;
+          if (cx > maxRoomX) maxRoomX = cx;
+        }
+        minRoomX = Math.max(1.2, minRoomX);
+        maxRoomX = Math.min(floor.width - 1.2, maxRoomX);
+        const trunkLen = Math.max(2.0, maxRoomX - minRoomX + 1.2);
+        const trunkCenterX = (minRoomX + maxRoomX) / 2;
+
+        const supplyTrunk = new THREE.Mesh(unitBoxGeo, supplyTrunkMat);
+        supplyTrunk.scale.set(trunkLen, 0.26, 0.42);
+        supplyTrunk.position.set(trunkCenterX, ductY, spineZ - 0.26);
+        floorHvacGrp.add(supplyTrunk);
+
+        const returnTrunk = new THREE.Mesh(unitBoxGeo, returnTrunkMat);
+        returnTrunk.scale.set(trunkLen, 0.22, 0.34);
+        returnTrunk.position.set(trunkCenterX, returnY, spineZ + 0.28);
+        floorHvacGrp.add(returnTrunk);
+
+        floorHvacRooms.forEach((rm) => {
+          const cfg = getEffectiveRoomHvac(rm);
+          const ahuColor = getAhuColor(cfg.ahuId);
+          const rcx = rm.x + rm.width / 2;
+          const rcz = rm.z + rm.depth / 2;
+          const bMat = getBranchMat(ahuColor);
+
+          const branchLen = Math.abs(rcz - (spineZ - 0.26));
+          if (branchLen > 0.35) {
+            const branch = new THREE.Mesh(unitBoxGeo, bMat);
+            branch.scale.set(0.24, 0.18, branchLen);
+            branch.position.set(rcx, ductY, (rcz + (spineZ - 0.26)) / 2);
+            floorHvacGrp.add(branch);
+          }
+
+          const retLen = Math.abs(rcz - (spineZ + 0.28));
+          if (retLen > 0.35) {
+            const retBranch = new THREE.Mesh(unitBoxGeo, returnTrunkMat);
+            retBranch.scale.set(0.18, 0.14, retLen);
+            retBranch.position.set(rcx + 0.34, returnY, (rcz + (spineZ + 0.28)) / 2);
+            floorHvacGrp.add(retBranch);
+          }
+
+          const diffCount = Math.max(1, Math.min(8, cfg.diffuserCount));
+          const cols =
+            diffCount <= 2
+              ? diffCount
+              : Math.ceil(Math.sqrt(diffCount * (rm.width / Math.max(1, rm.depth))));
+          const rows = Math.max(1, Math.ceil(diffCount / Math.max(1, cols)));
+          const statusHex =
+            cfg.systemStatus === 'alarm'
+              ? '#F43F5E'
+              : cfg.systemStatus === 'maintenance'
+                ? '#F59E0B'
+                : cfg.systemStatus === 'standby'
+                  ? '#71717A'
+                  : ahuColor;
+
+          let placed = 0;
+          for (let rIdx = 0; rIdx < rows && placed < diffCount; rIdx++) {
+            for (let cIdx = 0; cIdx < cols && placed < diffCount; cIdx++) {
+              const dx = rm.x + ((cIdx + 0.5) / cols) * rm.width;
+              const dz = rm.z + ((rIdx + 0.5) / rows) * rm.depth;
+              floorDiffusers.push({
+                x: dx,
+                y: ductY,
+                z: dz,
+                statusHex,
+                positivePressure: cfg.targetPressurePa >= 0,
+              });
+
+              const dDist = Math.hypot(dx - rcx, dz - rcz);
+              if (dDist > 0.35) {
+                const flex = new THREE.Mesh(unitFlexGeo, bMat);
+                flex.scale.set(1, dDist, 1);
+                flex.position.set((dx + rcx) / 2, ductY - 0.04, (dz + rcz) / 2);
+                flex.rotation.z = Math.PI / 2;
+                flex.rotation.y = -Math.atan2(dz - rcz, dx - rcx);
+                floorHvacGrp.add(flex);
+              }
+              placed++;
+            }
+          }
+        });
+
+        if (floorDiffusers.length > 0) {
+          const count = floorDiffusers.length;
+          const diffInst = new THREE.InstancedMesh(diffGeo, diffMat, count);
+          const collarInst = new THREE.InstancedMesh(collarGeo, collarMat, count);
+          const coneInst = new THREE.InstancedMesh(coneGeo, coneMat, count);
+          diffInst.frustumCulled = false;
+          collarInst.frustumCulled = false;
+          coneInst.frustumCulled = false;
+
+          _tmpScale.set(1, 1, 1);
+          for (let i = 0; i < count; i++) {
+            const d = floorDiffusers[i];
+            _tmpVec3.set(d.x, d.y - 0.16, d.z);
+            _tmpMat4.compose(_tmpVec3, _identityQuat, _tmpScale);
+            diffInst.setMatrixAt(i, _tmpMat4);
+
+            _tmpVec3.set(d.x, d.y - 0.22, d.z);
+            _tmpMat4.compose(_tmpVec3, _identityQuat, _tmpScale);
+            collarInst.setMatrixAt(i, _tmpMat4);
+            _tmpColor.set(d.statusHex);
+            collarInst.setColorAt(i, _tmpColor);
+
+            _tmpVec3.set(d.x, d.y - 0.54, d.z);
+            _tmpMat4.compose(_tmpVec3, d.positivePressure ? _flipQuatX : _identityQuat, _tmpScale);
+            coneInst.setMatrixAt(i, _tmpMat4);
+            _tmpColor.set(d.positivePressure ? '#38BDF8' : '#F59E0B');
+            coneInst.setColorAt(i, _tmpColor);
+          }
+
+          diffInst.instanceMatrix.needsUpdate = true;
+          collarInst.instanceMatrix.needsUpdate = true;
+          if (collarInst.instanceColor) collarInst.instanceColor.needsUpdate = true;
+          coneInst.instanceMatrix.needsUpdate = true;
+          if (coneInst.instanceColor) coneInst.instanceColor.needsUpdate = true;
+
+          diffInst.computeBoundingSphere();
+          collarInst.computeBoundingSphere();
+          coneInst.computeBoundingSphere();
+
+          floorHvacGrp.add(diffInst, collarInst, coneInst);
+        }
+      });
+    });
+
+    eng.requestRender();
+  }, [
     showHvacOverlay,
     hvacAhuFilter,
+    isolatedAssetType,
+    sceneData.rooms,
+    sceneData.floors,
+    sceneData.buildings,
+    activeFloorId,
+    activeBuildingId,
+    drillLevel,
+    showAllFloors,
+    sectionCutEnabled,
+    sectionCutHeight,
+    sectionCutAxis,
+    sectionCutFlipped,
+  ]);
+
+  // Independent 3D IT Network Port & Cable Trace Overlay
+  useEffect(() => {
+    const eng = engineRef.current;
+    if (!eng) return;
+
+    disposeObject3D(eng.traceGroup);
+    eng.traceGroup.clear();
+    eng.tracePulseInstancedMesh = null;
+    eng.tracePulseTracks = [];
+
+    if (!activeNetworkTrace) {
+      eng.requestRender();
+      return;
+    }
+
+    const activeFl = sceneData.floors.find((f) => f.id === activeFloorId);
+    if (!activeFl) return;
+    const bldg = sceneData.buildings.find((b) => b.id === activeFl.buildingId);
+    const isMultiBuilding = drillLevel === 'campus' || isolatedAssetType !== null;
+    const ox = isMultiBuilding ? bldg?.originX ?? 0 : 0;
+    const oz = isMultiBuilding ? bldg?.originZ ?? 0 : 0;
+    const oy = activeFl.elevation + storeRef.current.explodedFactor * activeFl.levelIndex * 5.2;
+
+    const floorHops = activeNetworkTrace.hops.filter(
+      (h) => !h.floorId || h.floorId === activeFl.id
+    );
+    const traceHops = floorHops.length > 0 ? floorHops : activeNetworkTrace.hops;
+    const traceHex =
+      activeNetworkTrace.status === 'error'
+        ? '#F43F5E'
+        : activeNetworkTrace.status === 'warning'
+          ? '#F59E0B'
+          : '#06B6D4';
+
+    const trayY = Math.max(2.65, activeFl.height - 0.55);
+    const beaconMat = new THREE.MeshStandardMaterial({
+      color: traceHex,
+      emissive: traceHex,
+      emissiveIntensity: 1.35,
+      roughness: 0.2,
+    });
+    const riserMat = new THREE.MeshStandardMaterial({
+      color: traceHex,
+      emissive: traceHex,
+      emissiveIntensity: 0.9,
+      transparent: true,
+      opacity: 0.85,
+    });
+
+    const traceFloorGrp = new THREE.Group();
+    traceFloorGrp.position.set(ox, oy, oz);
+    traceFloorGrp.userData.decompFloor = {
+      baseY: activeFl.elevation,
+      levelIndex: activeFl.levelIndex,
+    };
+    eng.traceGroup.add(traceFloorGrp);
+
+    const sphereGeo = new THREE.SphereGeometry(0.24, 12, 12);
+    const ringGeo = new THREE.TorusGeometry(0.42, 0.04, 8, 22);
+    const unitRiserGeo = new THREE.CylinderGeometry(0.045, 0.045, 1, 8);
+
+    traceHops.forEach((hop) => {
+      const baseY = hop.kind === 'user-node' ? 1.1 : 1.7;
+      const beacon = new THREE.Mesh(sphereGeo, beaconMat);
+      beacon.position.set(hop.x, baseY, hop.z);
+      traceFloorGrp.add(beacon);
+
+      const ring = new THREE.Mesh(ringGeo, riserMat);
+      ring.rotation.x = Math.PI / 2;
+      ring.position.set(hop.x, 0.08, hop.z);
+      traceFloorGrp.add(ring);
+
+      const riserH = Math.max(0.4, trayY - baseY);
+      const riser = new THREE.Mesh(unitRiserGeo, riserMat);
+      riser.scale.set(1, riserH, 1);
+      riser.position.set(hop.x, baseY + riserH / 2, hop.z);
+      traceFloorGrp.add(riser);
+    });
+
+    if (traceHops.length >= 2) {
+      const cablePts: THREE.Vector3[] = [];
+      traceHops.forEach((hop, idx) => {
+        const baseY = hop.kind === 'user-node' ? 1.1 : 1.7;
+        if (idx === 0) cablePts.push(new THREE.Vector3(hop.x, baseY, hop.z));
+        cablePts.push(new THREE.Vector3(hop.x, trayY, hop.z));
+        if (idx === traceHops.length - 1) {
+          cablePts.push(new THREE.Vector3(hop.x, baseY, hop.z));
+        }
+      });
+      const curve = new THREE.CatmullRomCurve3(cablePts, false, 'catmullrom', 0.12);
+      const tube = new THREE.Mesh(
+        new THREE.TubeGeometry(curve, Math.max(24, traceHops.length * 18), 0.075, 8, false),
+        new THREE.MeshStandardMaterial({
+          color: traceHex,
+          emissive: traceHex,
+          emissiveIntensity: 1.25,
+          roughness: 0.18,
+        })
+      );
+      traceFloorGrp.add(tube);
+
+      const samples = sampleCurveWorld(curve, ox, activeFl.elevation, oz);
+      const tracks: FlowPulseTrack[] = [];
+      for (let pIdx = 0; pIdx < 4; pIdx++) {
+        tracks.push({
+          samples,
+          sampleCount: PULSE_SAMPLES,
+          phase: pIdx / 4,
+          speed: 0.28,
+          scale: 0.75,
+          levelIndex: activeFl.levelIndex,
+        });
+      }
+      const pulseInst = new THREE.InstancedMesh(
+        new THREE.SphereGeometry(0.18, 8, 8),
+        new THREE.MeshBasicMaterial({ color: '#FFFFFF' }),
+        tracks.length
+      );
+      pulseInst.frustumCulled = false;
+      pulseInst.computeBoundingSphere();
+      eng.traceGroup.add(pulseInst);
+      eng.tracePulseInstancedMesh = pulseInst;
+      eng.tracePulseTracks = tracks;
+    }
+
+    eng.requestRender();
+  }, [
+    activeNetworkTrace,
+    activeFloorId,
+    sceneData.floors,
+    sceneData.buildings,
+    drillLevel,
+    isolatedAssetType,
   ]);
 
   // Real-Time 3D Environmental Heatmap Overlay (Updates CanvasTexture in-place without rebuilding geometry)
@@ -3748,7 +6229,7 @@ export const Viewport3D: React.FC = () => {
           floor,
           sceneData.rooms,
           sensors,
-          readings,
+          useTelemetryStore.getState().readings,
           heatmapMetric
         );
         entry.texture.needsUpdate = true;
@@ -3758,7 +6239,11 @@ export const Viewport3D: React.FC = () => {
 
         const ox = isMultiBuilding ? bldg.originX : 0;
         const oz = isMultiBuilding ? bldg.originZ : 0;
-        const explodedOffset = explodedFactor * floor.levelIndex * 5.2;
+        const explodedOffset = storeRef.current.explodedFactor * floor.levelIndex * 5.2;
+        entry.mesh.userData.decompFloor = {
+          baseY: floor.elevation + 0.085,
+          levelIndex: floor.levelIndex,
+        };
         entry.mesh.position.set(
           ox + floor.width / 2,
           floor.elevation + explodedOffset + 0.085,
@@ -3774,11 +6259,24 @@ export const Viewport3D: React.FC = () => {
     });
 
     eng.requestRender();
+
+    // Subscribe directly to telemetry readings ONLY while heatmap is active (avoids full Viewport3D re-renders)
+    const unsub = useTelemetryStore.subscribe((state, prev) => {
+      if (state.readings === prev.readings) return;
+      eng.heatmapCache.forEach((entry, flId) => {
+        if (!entry.mesh.visible) return;
+        const fl = sceneData.floors.find((f) => f.id === flId);
+        if (!fl) return;
+        renderFloorHeatmapCanvas(entry.canvas, fl, sceneData.rooms, state.sensors, state.readings, heatmapMetric);
+        entry.texture.needsUpdate = true;
+      });
+      eng.requestRender();
+    });
+    return unsub;
   }, [
     heatmapMetric,
     heatmapOpacity,
     sensors,
-    readings,
     sceneData.buildings,
     sceneData.floors,
     sceneData.rooms,
@@ -3786,9 +6284,71 @@ export const Viewport3D: React.FC = () => {
     activeBuildingId,
     drillLevel,
     showAllFloors,
-    explodedFactor,
     isolatedAssetType,
   ]);
+
+  // Zero-Rebuild O(N) Floor Decomposition Transform Effect (60fps smooth slider on mobile & desktop!)
+  useEffect(() => {
+    const eng = engineRef.current;
+    if (!eng) return;
+
+    const applyDecomp = (root: THREE.Object3D) => {
+      root.traverse((obj) => {
+        const floorMeta = obj.userData?.decompFloor as
+          | { baseY: number; levelIndex: number }
+          | undefined;
+        if (floorMeta) {
+          obj.position.y = floorMeta.baseY + explodedFactor * floorMeta.levelIndex * 5.2;
+        }
+        const riserMeta = obj.userData?.decompRiser as
+          | { topElevation: number; topHeight: number; topLevelIndex: number }
+          | undefined;
+        if (riserMeta) {
+          obj.visible = explodedFactor > 0.04;
+          obj.scale.y =
+            riserMeta.topElevation +
+            explodedFactor * riserMeta.topLevelIndex * 5.2 +
+            riserMeta.topHeight;
+        }
+      });
+    };
+
+    applyDecomp(eng.contentGroup);
+    applyDecomp(eng.flowsGroup);
+    applyDecomp(eng.hvacGroup);
+    applyDecomp(eng.traceGroup);
+    applyDecomp(eng.heatmapGroup);
+
+    // Immediately reposition animated pulse beads to match new floor elevations
+    const syncPulses = (inst: THREE.InstancedMesh | null, tracks: FlowPulseTrack[]) => {
+      if (!inst || tracks.length === 0) return;
+      for (let i = 0; i < tracks.length; i++) {
+        const tr = tracks[i];
+        const fIdx = tr.phase * (tr.sampleCount - 1);
+        const i0 = Math.floor(fIdx);
+        const i1 = Math.min(tr.sampleCount - 1, i0 + 1);
+        const frac = fIdx - i0;
+        const b0 = i0 * 3;
+        const b1 = i1 * 3;
+        const x = tr.samples[b0] + (tr.samples[b1] - tr.samples[b0]) * frac;
+        const y =
+          tr.samples[b0 + 1] +
+          (tr.samples[b1 + 1] - tr.samples[b0 + 1]) * frac +
+          explodedFactor * tr.levelIndex * 5.2;
+        const z = tr.samples[b0 + 2] + (tr.samples[b1 + 2] - tr.samples[b0 + 2]) * frac;
+        _tmpVec3.set(x, y, z);
+        _tmpScale.setScalar(tr.scale);
+        _tmpMat4.compose(_tmpVec3, _identityQuat, _tmpScale);
+        inst.setMatrixAt(i, _tmpMat4);
+      }
+      inst.instanceMatrix.needsUpdate = true;
+    };
+    syncPulses(eng.flowPulseInstancedMesh, eng.flowPulseTracks);
+    syncPulses(eng.tracePulseInstancedMesh, eng.tracePulseTracks);
+
+    projectPinsRef.current(true);
+    eng.requestRender();
+  }, [explodedFactor]);
 
   // Compute Visible 3D Equipment & Room Sensor Indicator Anchors (Bioreactors, HPLCs, Skids, Rooms)
   const visibleSensorPins = useMemo(() => {
@@ -3958,15 +6518,84 @@ export const Viewport3D: React.FC = () => {
     isolatedFlowStepMap,
   ]);
 
-  // Project 3D sensor & architectural room pin coordinates directly onto DOM elements (zero React re-renders during orbit)
+  // Pre-compute FMEA summaries for visible pins so rendering never scans incident lists on every frame
+  const sensorPinFmeaMap = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof getTargetFmeaSummary>>();
+    if (!showFmeaIndicators) return map;
+    for (const pin of visibleSensorPins) {
+      map.set(
+        pin.key,
+        getTargetFmeaSummary(
+          riskIncidents,
+          pin.targetKind === 'room' ? 'room' : 'asset',
+          pin.targetId
+        )
+      );
+    }
+    return map;
+  }, [showFmeaIndicators, visibleSensorPins, riskIncidents]);
+
+  const roomPinFmeaMap = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof getTargetFmeaSummary>>();
+    if (!showFmeaIndicators) return map;
+    for (const rp of visibleRoomPins) {
+      map.set(rp.room.id, getTargetFmeaSummary(riskIncidents, 'room', rp.room.id, true));
+    }
+    return map;
+  }, [showFmeaIndicators, visibleRoomPins, riskIncidents]);
+
+  const registerSensorPinDom = useCallback((key: string, el: HTMLDivElement | null) => {
+    if (el) pinDomRefs.current.set(key, el);
+    else pinDomRefs.current.delete(key);
+  }, []);
+
+  const handleToggleInspectPin = useCallback((key: string) => {
+    setInspectedPinKey((prev) => (prev === key ? null : key));
+  }, []);
+
+  const handleOpenPinRisk = useCallback(
+    (incidentId: string) => {
+      openRiskModal({ mode: 'resolve', incidentId });
+    },
+    [openRiskModal]
+  );
+
+  // Project 3D sensor & architectural room pins with cached viewport size, camera dirty check, and 2D collision culling
   useEffect(() => {
-    const projectAll = () => {
+    const projectAll = (force = false) => {
       const eng = engineRef.current;
-      const container = mountRef.current;
-      if (!eng || !container) return;
-      const w = container.clientWidth;
-      const h = container.clientHeight;
+      if (!eng) return;
+      const { w, h } = viewportSizeRef.current;
       if (!w || !h) return;
+
+      // Skip DOM work completely if camera projection*view matrix hasn't moved
+      _projViewMat.multiplyMatrices(
+        eng.activeCamera.projectionMatrix,
+        eng.activeCamera.matrixWorldInverse
+      );
+      const elems = _projViewMat.elements;
+      const last = lastCamProjRef.current;
+      if (!force) {
+        let changed = false;
+        for (let i = 0; i < 16; i++) {
+          if (Math.abs(elems[i] - last[i]) > 1e-5) {
+            changed = true;
+            break;
+          }
+        }
+        if (!changed) return;
+      }
+      for (let i = 0; i < 16; i++) last[i] = elems[i];
+
+      // Fast 2D AABB collision list so tags never overlap each other
+      const placedBoxes: [number, number, number, number][] = [];
+      const collides = (x1: number, y1: number, x2: number, y2: number) => {
+        for (let i = 0; i < placedBoxes.length; i++) {
+          const b = placedBoxes[i];
+          if (x1 < b[2] && x2 > b[0] && y1 < b[3] && y2 > b[1]) return true;
+        }
+        return false;
+      };
 
       visibleSensorPins.forEach((pin) => {
         const el = pinDomRefs.current.get(pin.key);
@@ -3981,9 +6610,17 @@ export const Viewport3D: React.FC = () => {
         const px = (_projVec.x * 0.5 + 0.5) * w;
         const py = (-_projVec.y * 0.5 + 0.5) * h;
         const inBounds = px > 40 && px < w - 40 && py > 54 && py < h - 60;
-        el.style.opacity = inBounds ? '1' : '0';
-        el.style.pointerEvents = inBounds ? 'auto' : 'none';
-        el.style.transform = `translate3d(${px.toFixed(1)}px, ${py.toFixed(1)}px, 0) translate(-50%, -100%)`;
+        const bx1 = px - 68;
+        const by1 = py - 32;
+        const bx2 = px + 68;
+        const by2 = py + 2;
+        const show = inBounds && (inspectedPinKey === pin.key || !collides(bx1, by1, bx2, by2));
+        if (show) placedBoxes.push([bx1, by1, bx2, by2]);
+        el.style.opacity = show ? '1' : '0';
+        el.style.pointerEvents = show ? 'auto' : 'none';
+        if (show) {
+          el.style.transform = `translate3d(${px.toFixed(1)}px, ${py.toFixed(1)}px, 0) translate(-50%, -100%)`;
+        }
       });
 
       visibleRoomPins.forEach((rp) => {
@@ -3999,15 +6636,23 @@ export const Viewport3D: React.FC = () => {
         const px = (_projVec.x * 0.5 + 0.5) * w;
         const py = (-_projVec.y * 0.5 + 0.5) * h;
         const inBounds = px > 44 && px < w - 58 && py > 56 && py < h - 64;
-        el.style.opacity = inBounds ? '1' : '0';
-        el.style.pointerEvents = inBounds ? 'auto' : 'none';
-        el.style.transform = `translate3d(${px.toFixed(1)}px, ${py.toFixed(1)}px, 0) translate(-50%, -50%)`;
+        const bx1 = px - 46;
+        const by1 = py - 15;
+        const bx2 = px + 46;
+        const by2 = py + 15;
+        const show = inBounds && (spotlightRoomId === rp.room.id || !collides(bx1, by1, bx2, by2));
+        if (show) placedBoxes.push([bx1, by1, bx2, by2]);
+        el.style.opacity = show ? '1' : '0';
+        el.style.pointerEvents = show ? 'auto' : 'none';
+        if (show) {
+          el.style.transform = `translate3d(${px.toFixed(1)}px, ${py.toFixed(1)}px, 0) translate(-50%, -50%)`;
+        }
       });
     };
 
     projectPinsRef.current = projectAll;
-    projectAll();
-  }, [visibleSensorPins, visibleRoomPins, readings]);
+    projectAll(true);
+  }, [visibleSensorPins, visibleRoomPins, inspectedPinKey, spotlightRoomId]);
 
   // Derived breadcrumbs for Spatial Drill-Down HUD
   const activeBuilding = sceneData.buildings.find((b) => b.id === activeBuildingId);
@@ -4045,10 +6690,10 @@ export const Viewport3D: React.FC = () => {
     );
   };
 
-  const renderStyleOptions: { id: RenderStyle; label: string }[] = [
-    { id: 'realistic', label: 'Studio PBR' },
-    { id: 'blueprint-split', label: 'Twin Split' },
-    { id: 'wireframe', label: 'X-Ray CAD' },
+  const renderStyleOptions: { id: RenderStyle; label: string; title: string }[] = [
+    { id: 'realistic', label: 'PBR', title: 'Studio PBR Shaded View' },
+    { id: 'blueprint-split', label: 'Split', title: 'Twin Split Cutaway View' },
+    { id: 'wireframe', label: 'X-Ray', title: 'X-Ray CAD Wireframe View' },
   ];
 
   const inspectedPin = useMemo(
@@ -4092,8 +6737,21 @@ export const Viewport3D: React.FC = () => {
   };
 
   return (
-    <div className="relative w-full h-full overflow-hidden select-none">
-      <div ref={mountRef} className="w-full h-full" />
+    <div className="relative w-full h-full overflow-hidden select-none touch-none">
+      <div ref={mountRef} className="w-full h-full touch-none" />
+
+      {/* Live 3D Snap-to-Grid / Snap-to-Wall Placement Indicator */}
+      {!firstPersonMode && activeTool === 'place-object' && placeSnapBadge && (
+        <div
+          className={`pointer-events-none absolute top-14 left-1/2 -translate-x-1/2 z-30 px-3 py-1 rounded-xl border text-[11px] font-mono font-bold shadow-xl ${
+            placeSnapBadge.isWall
+              ? 'bg-cyan-950/95 border-cyan-400 text-cyan-200'
+              : 'bg-violet-950/95 border-violet-400 text-violet-200'
+          }`}
+        >
+          {placeSnapBadge.label}
+        </div>
+      )}
 
       {/* Physical QR Scan Instant Highlight HUD */}
       {qrHighlight && !firstPersonMode && (
@@ -4127,179 +6785,221 @@ export const Viewport3D: React.FC = () => {
         </div>
       )}
 
-      {/* Top-Left: Spatial 3D Drill-Down Breadcrumb HUD (hidden during Walk Mode for clean viewport) */}
-      {!firstPersonMode && (
-        <div className="absolute top-3 left-3 flex items-center gap-1 px-2 py-1.5 rounded-2xl bg-white dark:bg-[#131319] border border-zinc-200 dark:border-zinc-800 shadow-xl text-[11px] max-w-[calc(100%-220px)] sm:max-w-[calc(100%-340px)] overflow-x-auto z-20">
-          {drillLevel !== 'campus' && (
+      {/* MAYA Global Voice Command Highlight Banner */}
+      {voiceHighlightBanner && (
+        <div className="absolute top-14 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2.5 px-3.5 py-2 rounded-2xl bg-[#111118]/95 border border-amber-400/70 shadow-2xl text-[11px] text-zinc-100 max-w-[calc(100%-24px)]">
+          <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+          <div className="min-w-0">
+            <div className="font-semibold text-white truncate">{voiceHighlightBanner.title}</div>
+            <div className="text-[10px] text-amber-300/90 truncate">{voiceHighlightBanner.subtitle}</div>
+          </div>
+          {voiceHighlightIds.length > 0 && (
             <button
-              onClick={handleDrillStepBack}
-              className="flex items-center gap-1 px-2 py-1 rounded-xl bg-zinc-100 dark:bg-[#1C1C26] text-zinc-700 dark:text-zinc-200 hover:bg-violet-600 hover:text-white transition-colors shrink-0 mr-0.5 cursor-pointer"
-              title="Step Back Up One Spatial Level"
+              type="button"
+              onClick={() => {
+                const firstId = voiceHighlightIds[0];
+                const isRoom = sceneData.rooms.some((r) => r.id === firstId);
+                focusEntity({ type: isRoom ? 'room' : 'asset', id: firstId });
+              }}
+              className="px-2 py-0.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-zinc-950 font-bold shrink-0 cursor-pointer"
             >
-              <ArrowLeft className="w-3 h-3" />
+              Focus
             </button>
           )}
-
           <button
-            onClick={() => drillInto('campus')}
-            className={`flex items-center gap-1 px-2 py-1 rounded-xl whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
-              drillLevel === 'campus'
-                ? 'bg-violet-600 text-white font-semibold'
-                : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
-            }`}
-            title="Zoom out to Full Campus"
+            type="button"
+            onClick={clearVoiceHighlight}
+            className="p-1 rounded-lg text-zinc-400 hover:text-white cursor-pointer shrink-0"
+            title="Clear Voice Highlight"
           >
-            <Globe className="w-3 h-3" />
-            Campus
-          </button>
-
-          {activeBuilding && (
-            <>
-              <ChevronRight className="w-3 h-3 text-zinc-400 shrink-0" />
-              <button
-                onClick={() => drillInto('building', activeBuilding.id)}
-                className={`flex items-center gap-1 px-2 py-1 rounded-xl whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
-                  drillLevel === 'building'
-                    ? 'bg-violet-600 text-white font-semibold'
-                    : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
-                }`}
-              >
-                <Building2 className="w-3 h-3" />
-                {activeBuilding.code}
-              </button>
-            </>
-          )}
-
-          {activeFloor && (
-            <>
-              <ChevronRight className="w-3 h-3 text-zinc-400 shrink-0" />
-              <button
-                onClick={() => drillInto('floor', activeFloor.id)}
-                className={`flex items-center gap-1 px-2 py-1 rounded-xl whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
-                  drillLevel === 'floor'
-                    ? 'bg-violet-600 text-white font-semibold'
-                    : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
-                }`}
-              >
-                <Layers className="w-3 h-3" />
-                {activeFloor.code}
-              </button>
-            </>
-          )}
-
-          {activeDept && (
-            <>
-              <ChevronRight className="w-3 h-3 text-zinc-400 shrink-0" />
-              <button
-                onClick={() => drillInto('department', activeDept.id)}
-                className={`px-2 py-1 rounded-xl whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
-                  drillLevel === 'department'
-                    ? 'bg-violet-600 text-white font-semibold'
-                    : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
-                }`}
-              >
-                {activeDept.name}
-              </button>
-            </>
-          )}
-
-          {activeRoom && (
-            <>
-              <ChevronRight className="w-3 h-3 text-zinc-400 shrink-0" />
-              <button
-                onClick={() => drillInto('room', activeRoom.id)}
-                className={`px-2 py-1 rounded-xl whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
-                  drillLevel === 'room'
-                    ? 'bg-violet-600 text-white font-semibold'
-                    : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
-                }`}
-              >
-                {activeRoom.code}
-              </button>
-            </>
-          )}
-
-          {activeAsset && drillLevel === 'asset' && (
-            <>
-              <ChevronRight className="w-3 h-3 text-zinc-400 shrink-0" />
-              <span className="px-2 py-1 rounded-xl bg-amber-500 text-zinc-950 font-mono font-semibold whitespace-nowrap shrink-0">
-                {activeAsset.assetId}
-              </span>
-            </>
-          )}
-
-          <button
-            onClick={() => {
-              const url = buildDirectUrl();
-              navigator.clipboard?.writeText(url).catch(() => {});
-              showToast('Direct deep-link URL copied to clipboard', 'success');
-            }}
-            className="ml-1 pl-1.5 border-l border-zinc-200 dark:border-zinc-800 p-1 text-zinc-500 hover:text-violet-500 shrink-0 cursor-pointer"
-            title="Copy Direct URL to current 3D view & layer"
-          >
-            <Link2 className="w-3.5 h-3.5" />
+            <X className="w-3.5 h-3.5" />
           </button>
         </div>
       )}
 
-      {/* Top-Right: Room Pins + Night Mode Architectural Spotlights + Render Style Switcher */}
-      <div className="absolute top-3 right-3 flex items-center gap-1.5 z-20">
-        {!firstPersonMode && (
-          <button
-            onClick={() => setShowRoomPins(!showRoomPins)}
-            className={`flex items-center gap-1 px-2.5 py-1.5 rounded-2xl border shadow-xl text-[11px] font-semibold transition-colors cursor-pointer ${
-              showRoomPins
-                ? 'bg-[#151520] border-violet-500/60 text-violet-300'
-                : 'bg-white dark:bg-[#131319] border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400 hover:border-violet-500'
-            }`}
-            title="Toggle Floating 3D Room Number Pins & Walk-Inside Cards"
-          >
-            <MapPin className="w-3.5 h-3.5" />
-            <span className="hidden md:inline">Rooms</span>
-          </button>
-        )}
-
-        <button
-          onClick={toggleLightingMode}
-          className={`flex items-center gap-1 px-2.5 py-1.5 rounded-2xl border shadow-xl text-[11px] font-semibold transition-colors cursor-pointer ${
-            lightingMode === 'night'
-              ? 'bg-[#151520] border-amber-500/70 text-amber-300'
-              : 'bg-white dark:bg-[#131319] border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 hover:border-violet-500'
-          }`}
-          title="Toggle Day / Night Mode Architectural Spotlights"
-        >
-          {lightingMode === 'night' ? (
-            <>
-              <Moon className="w-3.5 h-3.5 text-amber-400" />
-              <span className="hidden sm:inline">Night Spots</span>
-            </>
-          ) : (
-            <>
-              <Sun className="w-3.5 h-3.5 text-amber-500" />
-              <span className="hidden sm:inline">Daylight</span>
-            </>
-          )}
-        </button>
-
-        {!firstPersonMode && (
-          <div className="hidden sm:flex items-center gap-0.5 p-1 rounded-2xl bg-white dark:bg-[#131319] border border-zinc-200 dark:border-zinc-800 shadow-xl text-[11px]">
-            {renderStyleOptions.map((opt) => (
+      {/* Unified Non-Overlapping Top HUD Bar: Spatial Breadcrumb (left) + View Controls (right) */}
+      <div className="absolute top-2.5 inset-x-2.5 z-20 flex items-center justify-between gap-2 pointer-events-none">
+        {/* Left: Spatial 3D Drill-Down Breadcrumb HUD (hidden during Walk Mode) */}
+        {!firstPersonMode ? (
+          <div className="pointer-events-auto flex items-center gap-0.5 px-1.5 py-1 rounded-xl bg-white/95 dark:bg-[#131319]/95 backdrop-blur-md border border-zinc-200 dark:border-zinc-800 shadow-lg text-[11px] min-w-0 overflow-x-auto no-scrollbar">
+            {drillLevel !== 'campus' && (
               <button
-                key={opt.id}
-                onClick={() => setRenderStyle(opt.id)}
-                className={`px-2.5 py-1 rounded-xl font-medium whitespace-nowrap transition-colors cursor-pointer ${
-                  renderStyle === opt.id
-                    ? opt.id === 'realistic'
-                      ? 'bg-violet-600 text-white'
-                      : 'bg-amber-500 text-zinc-950 font-semibold'
-                    : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100'
-                }`}
+                onClick={handleDrillStepBack}
+                className="flex items-center justify-center p-1 rounded-lg bg-zinc-100 dark:bg-[#1C1C26] text-zinc-700 dark:text-zinc-200 hover:bg-violet-600 hover:text-white transition-colors shrink-0 mr-0.5 cursor-pointer"
+                title="Step Back Up One Spatial Level"
               >
-                {opt.label}
+                <ArrowLeft className="w-3 h-3" />
               </button>
-            ))}
+            )}
+
+            <button
+              onClick={() => drillInto('campus')}
+              className={`flex items-center gap-1 px-1.5 py-1 rounded-lg whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                drillLevel === 'campus'
+                  ? 'bg-violet-600 text-white font-semibold'
+                  : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
+              }`}
+              title="Zoom out to Full Campus"
+            >
+              <Globe className="w-3 h-3" />
+              <span className="hidden sm:inline">Campus</span>
+            </button>
+
+            {activeBuilding && (
+              <>
+                <ChevronRight className="w-3 h-3 text-zinc-400 shrink-0" />
+                <button
+                  onClick={() => drillInto('building', activeBuilding.id)}
+                  className={`flex items-center gap-1 px-1.5 py-1 rounded-lg whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                    drillLevel === 'building'
+                      ? 'bg-violet-600 text-white font-semibold'
+                      : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
+                  }`}
+                  title={activeBuilding.name}
+                >
+                  <Building2 className="w-3 h-3" />
+                  <span>{activeBuilding.code}</span>
+                </button>
+              </>
+            )}
+
+            {activeFloor && (
+              <>
+                <ChevronRight className="w-3 h-3 text-zinc-400 shrink-0" />
+                <button
+                  onClick={() => drillInto('floor', activeFloor.id)}
+                  className={`flex items-center gap-1 px-1.5 py-1 rounded-lg whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                    drillLevel === 'floor'
+                      ? 'bg-violet-600 text-white font-semibold'
+                      : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
+                  }`}
+                  title={activeFloor.name}
+                >
+                  <Layers className="w-3 h-3" />
+                  <span>{activeFloor.code}</span>
+                </button>
+              </>
+            )}
+
+            {activeDept && (
+              <>
+                <ChevronRight className="w-3 h-3 text-zinc-400 shrink-0 hidden md:block" />
+                <button
+                  onClick={() => drillInto('department', activeDept.id)}
+                  className={`hidden md:inline-flex px-1.5 py-1 rounded-lg whitespace-nowrap shrink-0 max-w-[130px] truncate transition-colors cursor-pointer ${
+                    drillLevel === 'department'
+                      ? 'bg-violet-600 text-white font-semibold'
+                      : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
+                  }`}
+                  title={activeDept.name}
+                >
+                  {activeDept.name}
+                </button>
+              </>
+            )}
+
+            {activeRoom && (
+              <>
+                <ChevronRight className="w-3 h-3 text-zinc-400 shrink-0" />
+                <button
+                  onClick={() => drillInto('room', activeRoom.id)}
+                  className={`px-1.5 py-1 rounded-lg whitespace-nowrap shrink-0 transition-colors cursor-pointer ${
+                    drillLevel === 'room'
+                      ? 'bg-violet-600 text-white font-semibold'
+                      : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
+                  }`}
+                  title={`${activeRoom.code} · ${activeRoom.name}`}
+                >
+                  {activeRoom.code}
+                </button>
+              </>
+            )}
+
+            {activeAsset && drillLevel === 'asset' && (
+              <>
+                <ChevronRight className="w-3 h-3 text-zinc-400 shrink-0" />
+                <span className="px-1.5 py-0.5 rounded-lg bg-amber-500 text-zinc-950 font-mono font-semibold whitespace-nowrap shrink-0">
+                  {activeAsset.assetId}
+                </span>
+              </>
+            )}
+
+            <button
+              onClick={() => {
+                const url = buildDirectUrl();
+                navigator.clipboard?.writeText(url).catch(() => {});
+                showToast('Direct deep-link URL copied to clipboard', 'success');
+              }}
+              className="ml-0.5 pl-1.5 border-l border-zinc-200 dark:border-zinc-800 p-1 text-zinc-500 hover:text-violet-500 shrink-0 cursor-pointer"
+              title="Copy Direct URL to current 3D view & layer"
+            >
+              <Link2 className="w-3.5 h-3.5" />
+            </button>
           </div>
+        ) : (
+          <div />
         )}
+
+        {/* Right: Compact Room Pins + Day/Night + Render Style Switcher */}
+        <div className="pointer-events-auto flex items-center gap-1 shrink-0">
+          {!firstPersonMode && (
+            <button
+              onClick={() => setShowRoomPins(!showRoomPins)}
+              className={`flex items-center gap-1 px-2 py-1.5 rounded-xl border shadow-lg text-[11px] font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                showRoomPins
+                  ? 'bg-[#151520] border-violet-500/60 text-violet-300'
+                  : 'bg-white/95 dark:bg-[#131319]/95 border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400 hover:border-violet-500'
+              }`}
+              title="Toggle Floating 3D Room Number Pins & Walk-Inside Cards"
+            >
+              <MapPin className="w-3.5 h-3.5" />
+              <span className="hidden xl:inline">Rooms</span>
+            </button>
+          )}
+
+          <button
+            onClick={toggleLightingMode}
+            className={`flex items-center gap-1 px-2 py-1.5 rounded-xl border shadow-lg text-[11px] font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+              lightingMode === 'night'
+                ? 'bg-[#151520] border-amber-500/70 text-amber-300'
+                : 'bg-white/95 dark:bg-[#131319]/95 border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 hover:border-violet-500'
+            }`}
+            title={lightingMode === 'night' ? 'Night Architectural Spotlights (click for Daylight)' : 'Daylight Mode (click for Night Spotlights)'}
+          >
+            {lightingMode === 'night' ? (
+              <>
+                <Moon className="w-3.5 h-3.5 text-amber-400" />
+                <span className="hidden lg:inline">Night</span>
+              </>
+            ) : (
+              <>
+                <Sun className="w-3.5 h-3.5 text-amber-500" />
+                <span className="hidden lg:inline">Day</span>
+              </>
+            )}
+          </button>
+
+          {!firstPersonMode && (
+            <div className="hidden sm:flex items-center gap-0.5 p-0.5 rounded-xl bg-white/95 dark:bg-[#131319]/95 backdrop-blur-md border border-zinc-200 dark:border-zinc-800 shadow-lg text-[11px]">
+              {renderStyleOptions.map((opt) => (
+                <button
+                  key={opt.id}
+                  onClick={() => setRenderStyle(opt.id)}
+                  title={opt.title}
+                  className={`px-2 py-1 rounded-lg font-medium whitespace-nowrap transition-colors cursor-pointer ${
+                    renderStyle === opt.id
+                      ? opt.id === 'realistic'
+                        ? 'bg-violet-600 text-white'
+                        : 'bg-amber-500 text-zinc-950 font-semibold'
+                      : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Active IT Port & Cable Trace HUD (3D Mode) */}
@@ -4417,24 +7117,85 @@ export const Viewport3D: React.FC = () => {
             <span className="text-[8px] font-mono uppercase tracking-wider text-zinc-500">
               DEC
             </span>
-            <button
-              type="button"
-              onClick={() => {
-                const next = explodedFactor < 0.25 ? 0.5 : explodedFactor < 0.85 ? 1 : 0;
-                setExplodedFactor(next);
-                if (next > 0 && !showAllFloors && drillLevel !== 'campus') {
-                  setShowAllFloors(true);
-                }
-              }}
-              className={`min-w-[38px] h-7 px-1.5 rounded-xl font-mono text-[9.5px] font-bold tabular-nums transition-colors cursor-pointer ${
-                explodedFactor > 0.04
-                  ? 'bg-amber-500 text-zinc-950 shadow-md'
-                  : 'text-zinc-400 hover:text-white hover:bg-zinc-800'
-              }`}
-              title="Cycle Floor Decomposition / Exploded View (0% → 50% → 100%)"
-            >
-              {explodedFactor > 0.04 ? `${Math.round(explodedFactor * 100)}%` : 'EXP'}
-            </button>
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setShowDecompPopover((v) => !v)}
+                className={`min-w-[38px] h-7 px-1.5 rounded-xl font-mono text-[9.5px] font-bold tabular-nums transition-colors cursor-pointer touch-manipulation ${
+                  explodedFactor > 0.04 || showDecompPopover
+                    ? 'bg-amber-500 text-zinc-950 shadow-md'
+                    : 'text-zinc-400 hover:text-white hover:bg-zinc-800'
+                }`}
+                title="Floor Decomposition Slider (Smooth 0–100% Exploded Stack)"
+              >
+                {explodedFactor > 0.04 ? `${Math.round(explodedFactor * 100)}%` : 'EXP'}
+              </button>
+
+              {showDecompPopover && (
+                <div className="absolute right-12 bottom-0 w-56 rounded-2xl bg-[#111118] border border-amber-500/50 shadow-2xl p-3 text-zinc-100 z-30">
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <span className="text-[10.5px] font-bold uppercase tracking-wider text-amber-300 flex items-center gap-1.5">
+                      <Layers className="w-3.5 h-3.5" />
+                      Floor Decomp
+                    </span>
+                    <div className="flex items-center gap-1">
+                      <span className="font-mono text-[11px] font-bold tabular-nums text-white">
+                        {Math.round(explodedFactor * 100)}%
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setShowDecompPopover(false)}
+                        className="p-0.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 cursor-pointer"
+                        title="Close"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.02}
+                    value={explodedFactor}
+                    onChange={(e) => {
+                      const val = Number(e.target.value);
+                      if (val > 0.02 && !showAllFloors && drillLevel !== 'campus') {
+                        setShowAllFloors(true);
+                      }
+                      setExplodedFactor(val);
+                    }}
+                    className="w-full h-2 accent-amber-500 cursor-pointer touch-pan-x"
+                  />
+
+                  <div className="grid grid-cols-4 gap-1 mt-2">
+                    {[0, 0.35, 0.7, 1].map((preset) => {
+                      const activePreset = Math.abs(explodedFactor - preset) < 0.05;
+                      return (
+                        <button
+                          key={preset}
+                          type="button"
+                          onClick={() => {
+                            if (preset > 0 && !showAllFloors && drillLevel !== 'campus') {
+                              setShowAllFloors(true);
+                            }
+                            setExplodedFactor(preset);
+                          }}
+                          className={`py-1 rounded-lg font-mono text-[10px] font-bold tabular-nums transition-colors cursor-pointer touch-manipulation ${
+                            activePreset
+                              ? 'bg-amber-500 text-zinc-950'
+                              : 'bg-zinc-800/90 text-zinc-300 hover:bg-zinc-700'
+                          }`}
+                        >
+                          {Math.round(preset * 100)}%
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         );
       })()}
@@ -4445,9 +7206,7 @@ export const Viewport3D: React.FC = () => {
           {visibleRoomPins.map((rp) => {
             const isActiveSpot = spotlightRoomId === rp.room.id;
             const hasFlowStep = rp.flowStep !== null;
-            const fmea = showFmeaIndicators
-              ? getTargetFmeaSummary(riskIncidents, 'room', rp.room.id, true)
-              : null;
+            const fmea = roomPinFmeaMap.get(rp.room.id) ?? null;
             const fmeaBadgeCls =
               fmea?.level === 'critical'
                 ? 'bg-rose-500 text-white'
@@ -4466,7 +7225,7 @@ export const Viewport3D: React.FC = () => {
                   else roomPinDomRefs.current.delete(rp.room.id);
                 }}
                 style={{ opacity: 0, willChange: 'transform' }}
-                className="absolute top-0 left-0 transition-opacity duration-150 flex items-center gap-1"
+                className="absolute top-0 left-0 flex items-center gap-1"
               >
                 <button
                   type="button"
@@ -4682,8 +7441,8 @@ export const Viewport3D: React.FC = () => {
         );
       })()}
 
-      {/* Floating Multi-Axis Section Cut Bar with Instant Reset */}
-      {sectionCutEnabled && (
+      {/* Floating Multi-Axis Section Cut Bar with Instant Reset (hidden during Walk / VR so walls & banners stay clear) */}
+      {sectionCutEnabled && !firstPersonMode && !vrSessionActive && (
         <div className="absolute top-16 right-3 z-20 px-3 py-2.5 rounded-2xl bg-white dark:bg-[#131319] border border-violet-500/50 shadow-2xl flex flex-col gap-2 w-64 text-[11px]">
           <div className="flex items-center justify-between gap-2">
             <span className="font-semibold text-zinc-900 dark:text-white flex items-center gap-1.5">
@@ -4775,6 +7534,21 @@ export const Viewport3D: React.FC = () => {
                   <span className="text-cyan-800">|</span>
                   <button
                     type="button"
+                    onClick={() =>
+                      setWalkCameraMode((m) => (m === 'first-person' ? 'third-person' : 'first-person'))
+                    }
+                    className={`flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                      walkCameraMode === 'third-person'
+                        ? 'bg-violet-600 text-white'
+                        : 'bg-zinc-800 text-cyan-200 hover:bg-zinc-700'
+                    }`}
+                    title="Toggle 1st-Person Eye View vs 3rd-Person MAYA Character (V)"
+                  >
+                    <User className="w-3 h-3" />
+                    {walkCameraMode === 'third-person' ? '3rd Person · MAYA' : '1st Person'}
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setVrStereoSplit((v) => !v)}
                     className={`px-2 py-0.5 rounded-lg text-[10px] font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
                       vrStereoSplit
@@ -4805,9 +7579,24 @@ export const Viewport3D: React.FC = () => {
               </span>
               <span className="hidden md:inline text-zinc-600">|</span>
               <span className="hidden md:inline font-mono text-[10px] text-zinc-300 whitespace-nowrap">
-                Joystick / WASD · Drag to Look
+                WASD / Joystick · Space Jump · V Camera
               </span>
               <span className="text-zinc-600">|</span>
+              <button
+                type="button"
+                onClick={() =>
+                  setWalkCameraMode((m) => (m === 'first-person' ? 'third-person' : 'first-person'))
+                }
+                className={`flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                  walkCameraMode === 'third-person'
+                    ? 'bg-violet-600 text-white'
+                    : 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700'
+                }`}
+                title="Toggle 1st-Person Eye View vs 3rd-Person MAYA Character (V)"
+              >
+                <User className="w-3 h-3" />
+                {walkCameraMode === 'third-person' ? '3rd Person · MAYA' : '1st Person'}
+              </button>
               <button
                 type="button"
                 onClick={() => setShowNavMesh(!showNavMesh)}
@@ -4930,97 +7719,34 @@ export const Viewport3D: React.FC = () => {
         </div>
       )}
 
-      {/* 3D Projected Compact Non-Overlapping Sensor Beacon Chips with FMEA Indicators */}
+      {/* 3D Projected Compact Non-Overlapping Sensor Beacon Chips with FMEA Indicators (Local Telemetry Subscribers) */}
       {show3DSensorPins && visibleSensorPins.length > 0 && (
         <div className="absolute inset-0 pointer-events-none overflow-hidden z-10">
-          {visibleSensorPins.map((pin) => {
-            const snap = readings[pin.mainSensor.id];
-            const val = snap?.value ?? pin.mainSensor.nominal;
-            const status = snap?.status ?? 'nominal';
-            const isInspected = inspectedPinKey === pin.key;
-            const pinFmea = showFmeaIndicators
-              ? getTargetFmeaSummary(
-                  riskIncidents,
-                  pin.targetKind === 'room' ? 'room' : 'asset',
-                  pin.targetId
-                )
-              : null;
-            const dotCls =
-              status === 'alarm' || pinFmea?.level === 'critical'
-                ? 'bg-rose-500'
-                : status === 'warning' || pinFmea?.level === 'high'
-                  ? 'bg-amber-400'
-                  : 'bg-emerald-400';
-            const borderCls = isInspected
-              ? 'border-violet-400 ring-2 ring-violet-500/40'
-              : status === 'alarm' || pinFmea?.level === 'critical'
-                ? 'border-rose-500/90'
-                : status === 'warning' || pinFmea?.level === 'high'
-                  ? 'border-amber-500/80'
-                  : 'border-zinc-700/90 hover:border-violet-400';
-
-            return (
-              <div
-                key={pin.key}
-                ref={(el) => {
-                  if (el) pinDomRefs.current.set(pin.key, el);
-                  else pinDomRefs.current.delete(pin.key);
-                }}
-                style={{ opacity: 0, willChange: 'transform' }}
-                className="absolute top-0 left-0 transition-opacity duration-150"
-              >
-                <div className="flex items-center gap-1">
-                  <button
-                    type="button"
-                    onClick={() => setInspectedPinKey(isInspected ? null : pin.key)}
-                    className={`group flex items-center gap-1.5 rounded-full bg-[#131319] text-zinc-100 border ${borderCls} shadow-lg px-2.5 py-1 text-[10.5px] font-mono tabular-nums whitespace-nowrap transition-colors cursor-pointer`}
-                    title={`${pin.targetName} — Click to inspect 3D model & live sensors`}
-                  >
-                    <span className={`w-2 h-2 rounded-full shrink-0 ${dotCls}`} />
-                    <span className="font-semibold text-zinc-100">{pin.targetCode}</span>
-                    <span className="text-zinc-500">·</span>
-                    <span className="text-amber-300 font-semibold">
-                      {val.toFixed(pin.mainSensor.precision)}
-                      <span className="text-zinc-400 font-normal ml-0.5">{pin.mainSensor.unit}</span>
-                    </span>
-                  </button>
-                  {pinFmea && pinFmea.level !== 'clear' && pinFmea.worstIncident && (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        openRiskModal({ mode: 'resolve', incidentId: pinFmea.worstIncident!.id });
-                      }}
-                      className={`px-1.5 py-0.5 rounded-md text-[9.5px] font-mono font-bold tabular-nums shadow-lg cursor-pointer ${
-                        pinFmea.level === 'critical'
-                          ? 'bg-rose-500 text-white'
-                          : pinFmea.level === 'high'
-                            ? 'bg-amber-400 text-zinc-950'
-                            : pinFmea.level === 'mitigated'
-                              ? 'bg-emerald-500 text-zinc-950'
-                              : 'bg-violet-500 text-white'
-                      }`}
-                      title={`FMEA ${pinFmea.shortLabel}: ${pinFmea.worstIncident.title}`}
-                    >
-                      {pinFmea.shortLabel}
-                    </button>
-                  )}
-                </div>
-                <div className="mx-auto w-px h-2.5 bg-violet-500/60" />
-              </div>
-            );
-          })}
+          {visibleSensorPins.map((pin) => (
+            <Viewport3DSensorPinChip
+              key={pin.key}
+              pin={pin}
+              isInspected={inspectedPinKey === pin.key}
+              fmea={sensorPinFmeaMap.get(pin.key) ?? null}
+              onToggleInspect={handleToggleInspectPin}
+              onOpenRisk={handleOpenPinRisk}
+              registerDom={registerSensorPinDom}
+            />
+          ))}
         </div>
       )}
 
-      {/* Focused Single-Object 3D & Live Telemetry Inspection Dialog (Opaque Charcoal, Zero WebGL Blur) */}
+      {/* Focused Single-Object 3D & Live Telemetry Inspection Dialog (Opaque Charcoal, Zero WebGL Blur, Pinch-Protected) */}
       {inspectedPin && (
-        <div className="absolute top-16 left-3 z-30 w-[356px] max-w-[calc(100%-24px)] rounded-3xl bg-white dark:bg-[#13131A] border border-zinc-200 dark:border-zinc-800 shadow-2xl overflow-hidden">
+        <div
+          ref={focusedInspectorRef}
+          className="absolute top-16 left-3 z-30 w-[364px] max-w-[calc(100%-24px)] rounded-3xl bg-white dark:bg-[#13131A] border border-zinc-200 dark:border-zinc-800 shadow-2xl overflow-hidden"
+        >
           <div className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#181822] flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 min-w-0">
               <button
                 onClick={() => setInspectedPinKey(null)}
-                className="p-1.5 rounded-xl bg-white dark:bg-[#22222F] border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:border-violet-500 hover:text-violet-500 transition-colors shrink-0"
+                className="p-1.5 rounded-xl bg-white dark:bg-[#22222F] border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:border-violet-500 hover:text-violet-500 transition-colors shrink-0 cursor-pointer"
                 title="Back to 3D Floor View"
               >
                 <ArrowLeft className="w-3.5 h-3.5" />
@@ -5036,7 +7762,7 @@ export const Viewport3D: React.FC = () => {
             </div>
             <button
               onClick={() => setInspectedPinKey(null)}
-              className="p-1.5 rounded-xl text-zinc-400 hover:text-zinc-900 dark:hover:text-white shrink-0"
+              className="p-1.5 rounded-xl text-zinc-400 hover:text-zinc-900 dark:hover:text-white shrink-0 cursor-pointer"
               title="Close Inspector"
             >
               <X className="w-4 h-4" />
@@ -5044,59 +7770,31 @@ export const Viewport3D: React.FC = () => {
           </div>
 
           <div className="p-3.5 space-y-3">
-            {/* Dedicated Focused 3D Turntable Viewer for THIS Specific Object */}
-            <AssetMini3DViewer
-              asset={inspectedAssetObj}
-              room={inspectedRoomObj}
-              height={186}
-              statusAccent={readings[inspectedPin.mainSensor.id]?.status ?? 'nominal'}
+            <Viewport3DInspectedPinBody
+              inspectedAssetObj={inspectedAssetObj}
+              inspectedRoomObj={inspectedRoomObj}
+              mainSensor={inspectedPin.mainSensor}
+              secondarySensors={inspectedPin.secondarySensors}
             />
 
-            {/* Primary & Secondary Live Sensors */}
-            {(() => {
-              const allCh = [inspectedPin.mainSensor, ...inspectedPin.secondarySensors];
-              return (
-                <div className="space-y-1.5 max-h-40 overflow-y-auto pr-0.5">
-                  {allCh.map((s) => {
-                    const snap = readings[s.id];
-                    const v = snap?.value ?? s.nominal;
-                    const st = snap?.status ?? 'nominal';
-                    const color =
-                      st === 'alarm'
-                        ? '#F43F5E'
-                        : st === 'warning'
-                          ? '#F59E0B'
-                          : METRIC_PRESETS[s.metric]?.color ?? '#8B5CF6';
-                    return (
-                      <div
-                        key={s.id}
-                        className="px-3 py-2 rounded-2xl bg-zinc-50 dark:bg-[#191923] border border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-2"
-                      >
-                        <div className="min-w-0">
-                          <div className="text-[10px] font-mono text-zinc-500 dark:text-zinc-400 truncate">
-                            {s.tag} {s.isMainSensor ? '★' : ''}
-                          </div>
-                          <div className="text-[11px] font-medium text-zinc-800 dark:text-zinc-200 truncate">
-                            {s.name.split('·').pop()?.trim() || s.name}
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-2 shrink-0">
-                          <MiniSparkline points={snap?.history ?? []} color={color} width={48} height={18} />
-                          <span className="font-mono tabular-nums text-xs font-bold text-zinc-900 dark:text-white">
-                            {v.toFixed(s.precision)}
-                            <span className="text-[10px] font-normal text-zinc-400 ml-0.5">{s.unit}</span>
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              );
-            })()}
-
-            {/* Action Buttons */}
-            <div className="flex items-center gap-2 pt-1">
+            {/* Action Buttons: Equipment Info (SOPs & History) + Live Trends & Tags + New Tab */}
+            <div className="flex flex-wrap items-center gap-1.5 pt-1">
               <button
+                type="button"
+                onClick={() => {
+                  openEntityInfo({
+                    type: inspectedPin.targetKind === 'asset' ? 'asset' : 'room',
+                    id: inspectedPin.targetId,
+                  });
+                  setInspectedPinKey(null);
+                }}
+                className="flex-1 flex items-center justify-center gap-1.5 py-2 px-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 text-xs font-bold transition-colors cursor-pointer"
+              >
+                <Info className="w-3.5 h-3.5" />
+                {inspectedPin.targetKind === 'asset' ? 'Equipment Info' : 'Room Info'}
+              </button>
+              <button
+                type="button"
                 onClick={() => {
                   openDashboard({
                     tab: 'trends',
@@ -5106,10 +7804,10 @@ export const Viewport3D: React.FC = () => {
                   });
                   setInspectedPinKey(null);
                 }}
-                className="flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold transition-colors"
+                className="flex-1 flex items-center justify-center gap-1.5 py-2 px-2.5 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold transition-colors cursor-pointer"
               >
                 <Activity className="w-3.5 h-3.5" />
-                Live Trends &amp; Tags
+                Live Trends
               </button>
               <a
                 href={buildTelemetryTabUrl({
@@ -5120,11 +7818,10 @@ export const Viewport3D: React.FC = () => {
                 })}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="flex items-center gap-1.5 py-2 px-3 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#1C1C26] hover:border-amber-500 text-zinc-700 dark:text-zinc-200 text-xs font-medium transition-colors"
+                className="flex items-center justify-center p-2 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#1C1C26] hover:border-amber-500 text-zinc-700 dark:text-zinc-200 transition-colors"
                 title="Open Detailed Telemetry in New Tab"
               >
                 <ExternalLink className="w-3.5 h-3.5 text-amber-500" />
-                New Tab
               </a>
             </div>
           </div>
@@ -5916,8 +8613,26 @@ export const Viewport3D: React.FC = () => {
                 </div>
               </div>
 
-              {/* Sprint Toggle & Jump Action Buttons */}
+              {/* 1st/3rd Person Camera Toggle, Sprint & High-Jump Action Buttons */}
               <div className="flex flex-col gap-2 pb-1">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setWalkCameraMode((m) => (m === 'first-person' ? 'third-person' : 'first-person'))
+                  }
+                  className={`w-10 h-10 rounded-full border flex items-center justify-center shadow-lg transition cursor-pointer ${
+                    walkCameraMode === 'third-person'
+                      ? 'bg-violet-600 border-violet-300 text-white'
+                      : 'bg-[#12131A]/90 border-zinc-700 text-zinc-300 hover:border-violet-400'
+                  }`}
+                  title={
+                    walkCameraMode === 'third-person'
+                      ? '3rd-Person MAYA View (Click or V for 1st-Person)'
+                      : '1st-Person View (Click or V for 3rd-Person MAYA)'
+                  }
+                >
+                  <User className="w-4 h-4" />
+                </button>
                 <button
                   type="button"
                   onClick={() => {
@@ -5934,151 +8649,494 @@ export const Viewport3D: React.FC = () => {
                 >
                   <Zap className="w-4 h-4" />
                 </button>
-                <button
-                  type="button"
-                  onClick={triggerWalkJump}
-                  className="w-10 h-10 rounded-full bg-[#12131A]/90 border border-zinc-700 hover:border-violet-400 text-zinc-200 flex items-center justify-center shadow-lg active:scale-95 transition cursor-pointer"
-                  title="Jump (Space)"
-                >
-                  <ArrowUp className="w-4 h-4" />
-                </button>
+                {/* Mobile: swap Jump for prominent Interact button when near Door/Switch/Equipment; Desktop: show dedicated Interact + Jump */}
+                {nearbyInteractable ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => executeInteractable(nearbyInteractable)}
+                      className={`w-11 h-11 rounded-full border-2 flex items-center justify-center shadow-[0_0_22px_rgba(34,211,238,0.55)] active:scale-95 transition cursor-pointer ${
+                        nearbyInteractable.kind === 'door'
+                          ? 'bg-cyan-500 border-cyan-200 text-zinc-950'
+                          : nearbyInteractable.kind === 'light'
+                            ? 'bg-amber-400 border-amber-200 text-zinc-950'
+                            : 'bg-violet-500 border-violet-200 text-white'
+                      }`}
+                      title={`${nearbyInteractable.actionLabel} (Enter)`}
+                    >
+                      {nearbyInteractable.kind === 'door' ? (
+                        <DoorOpen className="w-5 h-5" />
+                      ) : nearbyInteractable.kind === 'light' ? (
+                        <Lightbulb className="w-5 h-5" />
+                      ) : (
+                        <FileText className="w-5 h-5" />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={triggerWalkJump}
+                      className="hidden sm:flex w-10 h-10 rounded-full bg-[#12131A]/95 border border-zinc-700 hover:border-violet-400 text-zinc-200 items-center justify-center shadow-lg active:scale-95 transition cursor-pointer"
+                      title="High Jump (Space)"
+                    >
+                      <ArrowUp className="w-4 h-4" />
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={triggerWalkJump}
+                    className="w-10 h-10 rounded-full bg-[#12131A]/95 border border-zinc-700 hover:border-violet-400 text-zinc-200 flex items-center justify-center shadow-lg active:scale-95 transition cursor-pointer"
+                    title="High Jump (Space)"
+                  >
+                    <ArrowUp className="w-4 h-4" />
+                  </button>
+                )}
               </div>
             </div>
 
-            {/* Ruggedized Field Pad — anchored bottom-right on mobile/tablet and bottom-center on lg+ so it NEVER collides with the bottom-left Joystick */}
+            {/* Universal 3D-Anchored Floating Interaction Sign (Doors, Light Switches, Equipment — ENTER Key) */}
+            {nearbyInteractable && (
+              <div
+                style={{
+                  transform: `translate3d(${nearbyInteractable.screenX}px, ${nearbyInteractable.screenY}px, 0) translate(-50%, -100%)`,
+                }}
+                className="absolute top-0 left-0 z-30 pointer-events-auto transition-transform duration-75"
+              >
+                <button
+                  type="button"
+                  onClick={() => executeInteractable(nearbyInteractable)}
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-2xl border shadow-[0_12px_32px_rgba(0,0,0,0.8)] text-left cursor-pointer transition hover:scale-[1.03] ${
+                    nearbyInteractable.kind === 'door'
+                      ? 'bg-[#0C1524] border-cyan-400/80 text-cyan-50'
+                      : nearbyInteractable.kind === 'light'
+                        ? 'bg-[#19160C] border-amber-400/80 text-amber-50'
+                        : 'bg-[#141122] border-violet-400/80 text-violet-50'
+                  }`}
+                >
+                  <span className="px-1.5 py-0.5 rounded-md bg-white text-zinc-950 font-mono text-[10px] font-extrabold tracking-wide shrink-0">
+                    ENTER
+                  </span>
+                  {nearbyInteractable.kind === 'door' ? (
+                    <DoorOpen className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                  ) : nearbyInteractable.kind === 'light' ? (
+                    <Lightbulb className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  ) : (
+                    <FileText className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                  )}
+                  <div className="min-w-0 leading-tight">
+                    <div className="text-[11px] font-bold whitespace-nowrap">
+                      {nearbyInteractable.actionLabel}
+                    </div>
+                    <div className="text-[9.5px] font-mono opacity-80 truncate max-w-[180px]">
+                      {nearbyInteractable.detail}
+                    </div>
+                  </div>
+                </button>
+              </div>
+            )}
+
+            {/* Walk Mode Quick Equipment Info & SOP Inspection Card (Opened via Spacebar beside Equipment) */}
+            {walkInspectAssetId && (() => {
+              const inspAsset = sceneData.assets.find((a) => a.id === walkInspectAssetId);
+              if (!inspAsset) return null;
+              const assetSops = useGmpStore
+                .getState()
+                .sops.filter(
+                  (d) =>
+                    d.id === `sop-asset-${inspAsset.id}` ||
+                    (d.archetypes ?? []).includes(inspAsset.archetype) ||
+                    d.equipmentCategory === inspAsset.category
+                );
+              const primarySop = assetSops[0];
+              return (
+                <div className="absolute top-16 right-3 z-30 w-[300px] max-w-[calc(100%-24px)] rounded-2xl bg-[#111118]/95 border border-violet-500/60 shadow-2xl p-3 text-zinc-100 space-y-2.5 backdrop-blur-md">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="font-mono text-[10px] font-bold text-amber-400">
+                        {inspAsset.assetId} · {inspAsset.category}
+                      </div>
+                      <div className="text-xs font-bold text-white truncate">{inspAsset.name}</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setWalkInspectAssetId(null)}
+                      className="p-1 rounded-lg text-zinc-400 hover:text-white cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-3 gap-1.5 text-[10px] font-mono tabular-nums">
+                    <div className="px-2 py-1 rounded-lg bg-[#1A1A24] border border-zinc-800">
+                      <div className="text-zinc-400">Status</div>
+                      <div className="font-bold text-emerald-400 capitalize">{inspAsset.operationalStatus}</div>
+                    </div>
+                    <div className="px-2 py-1 rounded-lg bg-[#1A1A24] border border-zinc-800">
+                      <div className="text-zinc-400">Power</div>
+                      <div className="font-bold text-zinc-100">{inspAsset.energyKw} kW</div>
+                    </div>
+                    <div className="px-2 py-1 rounded-lg bg-[#1A1A24] border border-zinc-800">
+                      <div className="text-zinc-400">SOPs</div>
+                      <div className="font-bold text-violet-300">{assetSops.length}</div>
+                    </div>
+                  </div>
+                  {primarySop && (
+                    <div className="rounded-xl bg-[#181822] border border-zinc-800 p-2 text-[10.5px]">
+                      <div className="font-mono text-[9.5px] font-bold text-violet-400">
+                        {primarySop.docNumber} · v{primarySop.version}
+                      </div>
+                      <div className="font-semibold text-zinc-100 line-clamp-1 mt-0.5">{primarySop.title}</div>
+                    </div>
+                  )}
+                  <div className="flex items-center gap-1.5">
+                    {primarySop && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          saveCurrentWalkPose();
+                          useMayaStore
+                            .getState()
+                            .startReadingSop(primarySop.id, primarySop.title, inspAsset.id, inspAsset.assetId);
+                          setWalkInspectAssetId(null);
+                          useTwinStore.getState().setScreen('maya-life');
+                        }}
+                        className="flex-1 flex items-center justify-center gap-1 py-1.5 px-2.5 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-semibold cursor-pointer"
+                      >
+                        <Sparkles className="w-3 h-3" />
+                        MAYA Read SOP
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setWalkInspectAssetId(null);
+                        openEntityInfo({ type: 'asset', id: inspAsset.id });
+                      }}
+                      className="px-2.5 py-1.5 rounded-xl bg-[#1C1C28] border border-zinc-700 hover:border-violet-400 text-[11px] font-semibold text-zinc-200 cursor-pointer"
+                    >
+                      Details
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Ultra-Minimal Floating Walk Field Pad with Path Finder & Spatial Audio */}
             {firstPersonTabletVisible && (
               <div
-                className="absolute bottom-3 right-3 lg:bottom-0 lg:left-1/2 lg:-translate-x-1/2 lg:right-auto z-20 pointer-events-auto flex items-end justify-center transition-transform duration-150"
-                style={{ transform: `translateY(${Math.min(18, fpState.jumpHeight * 14)}px)` }}
+                className="absolute bottom-3 right-3 sm:left-1/2 sm:-translate-x-1/2 sm:right-auto z-20 pointer-events-auto transition-transform duration-150 flex flex-col items-center gap-2"
+                style={{ transform: `translateY(${Math.min(14, fpState.jumpHeight * 10)}px)` }}
               >
-                {/* Left Character Forearm & Cleanroom Gloved Hand (Desktop lg+ only) */}
-                <svg
-                  width="84"
-                  height="140"
-                  viewBox="0 0 92 154"
-                  className="-mr-5 z-20 drop-shadow-2xl hidden lg:block select-none pointer-events-none"
-                >
-                  <defs>
-                    <linearGradient id="fpSleeveL" x1="0" y1="0" x2="1" y2="1">
-                      <stop offset="0%" stopColor="#27272A" />
-                      <stop offset="100%" stopColor="#121216" />
-                    </linearGradient>
-                    <linearGradient id="fpGloveL" x1="0" y1="0" x2="1" y2="1">
-                      <stop offset="0%" stopColor="#E4E4E7" />
-                      <stop offset="100%" stopColor="#A1A1AA" />
-                    </linearGradient>
-                  </defs>
-                  <path d="M 8 154 L 30 92 L 66 102 L 46 154 Z" fill="url(#fpSleeveL)" stroke="#3F3F46" strokeWidth="1.5" />
-                  <path d="M 28 92 L 67 101 L 64 111 L 25 102 Z" fill="#7C3AED" />
-                  <path d="M 32 90 C 30 62, 54 44, 78 50 C 89 53, 88 67, 74 71 L 68 98 Z" fill="url(#fpGloveL)" stroke="#71717A" strokeWidth="1.2" />
-                  <ellipse cx="77" cy="60" rx="11" ry="7" fill="#F4F4F5" stroke="#71717A" strokeWidth="1" />
-                </svg>
+                {/* Active No-Go Floor Placement Mode Indicator */}
+                {placingNoGoZone && (
+                  <div className="px-3 py-1.5 rounded-xl bg-rose-600 text-white text-[11px] font-semibold shadow-lg flex items-center gap-2">
+                    <span>Click any spot on the 3D floor to place a {noGoRadius.toFixed(1)}m No-Go Zone</span>
+                    <button
+                      type="button"
+                      onClick={() => setPlacingNoGoZone(false)}
+                      className="px-2 py-0.5 rounded-md bg-black/25 hover:bg-black/40 text-[10px] cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                )}
 
-                {/* Ruggedized Field Tablet Bezel + Live Room Telemetry Display */}
-                <div className="w-[210px] sm:w-[300px] lg:w-[410px] rounded-2xl lg:rounded-b-none lg:rounded-t-3xl bg-[#101015] border-2 lg:border-b-0 lg:border-t-4 lg:border-x-4 border-zinc-700 shadow-[0_-14px_50px_rgba(0,0,0,0.75)] overflow-hidden">
-                  <div className="px-3 py-1.5 bg-[#09090D] border-b border-zinc-800 flex items-center justify-between text-[10px] font-mono">
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <span className="w-2 h-2 rounded-full bg-emerald-400 shrink-0" />
-                      <span className="text-violet-400 font-semibold truncate">FIELD PAD</span>
+                {/* Spatial Audio Settings Popover (Rolloff Distance & Falloff Curves) */}
+                {spatialAudioSettingsOpen && (
+                  <SpatialAudioSettingsPopover
+                    settings={spatialAudioSettings}
+                    enabled={spatialAudioEnabled}
+                    telemetry={audioTelemetry}
+                    onToggleEnabled={() => setSpatialAudioEnabled((v) => !v)}
+                    onChange={(next) => setSpatialAudioSettings(next)}
+                    onTestChannel={(ch) => {
+                      if (!spatialAudioEnabled) setSpatialAudioEnabled(true);
+                      spatialAudioRef.current?.setEnabled(true);
+                      spatialAudioRef.current?.playTestCue(ch);
+                    }}
+                    onClose={() => setSpatialAudioSettingsOpen(false)}
+                  />
+                )}
+
+                {/* Path Finder Destinations, Routing Algorithm & No-Go Zones Popover */}
+                {pathFinderOpen && (
+                  <PathFinderConfigPopover
+                    activeFloorId={activeFloorId}
+                    floorRooms={sceneData.rooms.filter((r) => r.floorId === activeFloorId)}
+                    floorAssets={sceneData.assets.filter((a) => a.floorId === activeFloorId && !a.hidden)}
+                    algorithm={pathAlgorithm}
+                    noGoZones={noGoZones}
+                    placingNoGo={placingNoGoZone}
+                    noGoRadius={noGoRadius}
+                    noGoLabelDraft={noGoLabelDraft}
+                    onChangeAlgorithm={(algo) => {
+                      setPathAlgorithm(algo);
+                      storeRef.current.showToast(
+                        algo === 'least-congested'
+                          ? 'Path Finder switched to Least Congested routing'
+                          : 'Path Finder switched to Shortest Distance routing',
+                        'info'
+                      );
+                    }}
+                    onTogglePlacingNoGo={() => {
+                      setPlacingNoGoZone((v) => !v);
+                      setPathFinderOpen(false);
+                    }}
+                    onChangeNoGoRadius={setNoGoRadius}
+                    onChangeNoGoLabelDraft={setNoGoLabelDraft}
+                    onToggleRoomNoGo={(rm) => {
+                      setNoGoZones((prev) => {
+                        const exists = prev.find(
+                          (z) => z.floorId === activeFloorId && z.kind === 'room' && z.roomId === rm.id
+                        );
+                        if (exists) {
+                          return prev.filter((z) => z.id !== exists.id);
+                        }
+                        return [
+                          ...prev,
+                          {
+                            id: `nogo-room-${rm.id}`,
+                            floorId: activeFloorId,
+                            label: `${rm.code} · ${rm.name}`,
+                            kind: 'room',
+                            roomId: rm.id,
+                            x: rm.x,
+                            z: rm.z,
+                            width: rm.width,
+                            depth: rm.depth,
+                          },
+                        ];
+                      });
+                    }}
+                    onRemoveNoGoZone={(id) =>
+                      setNoGoZones((prev) => prev.filter((z) => z.id !== id))
+                    }
+                    onClearNoGoZones={() =>
+                      setNoGoZones((prev) => prev.filter((z) => z.floorId !== activeFloorId))
+                    }
+                    onSelectDestination={(dest, autoWalk) => setPathFinderRoute(dest, autoWalk)}
+                    onClose={() => setPathFinderOpen(false)}
+                  />
+                )}
+
+                <div className="rounded-2xl bg-[#0F1016]/95 border border-zinc-700/80 shadow-[0_12px_36px_rgba(0,0,0,0.72)] text-zinc-100 overflow-hidden min-w-[290px] max-w-[480px]">
+                  {/* Active Path Finder Route Strip */}
+                  {pathFinderHud && (
+                    <div
+                      className={`px-3 py-1.5 border-b flex items-center justify-between gap-2 text-[10.5px] ${
+                        pathAlgorithm === 'least-congested'
+                          ? 'bg-emerald-500/12 border-emerald-500/30'
+                          : 'bg-cyan-500/12 border-cyan-500/30'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <Navigation
+                          className={`w-3.5 h-3.5 shrink-0 ${
+                            pathAlgorithm === 'least-congested' ? 'text-emerald-400' : 'text-cyan-400'
+                          }`}
+                        />
+                        <span className="font-mono font-bold text-cyan-300 shrink-0">
+                          {pathFinderHud.code}
+                        </span>
+                        <span className="text-zinc-200 truncate">{pathFinderHud.label}</span>
+                        <span className="font-mono text-emerald-300 font-semibold tabular-nums shrink-0">
+                          {pathFinderHud.remainingM}m (~{Math.max(1, Math.round(pathFinderHud.remainingM / 3.4))}s)
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        {!pathFinderHud.autoWalking && engineRef.current?.pathFinderDest && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const d = engineRef.current?.pathFinderDest;
+                              if (d) setPathFinderRoute(d, true);
+                            }}
+                            className="px-1.5 py-0.5 rounded-md bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 font-semibold text-[9.5px] cursor-pointer"
+                          >
+                            Auto-Walk
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={clearPathFinderRoute}
+                          className="p-0.5 rounded text-zinc-400 hover:text-white cursor-pointer"
+                          title="Clear Path Finder route"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-1.5 text-zinc-400 shrink-0 tabular-nums">
-                      <span>
-                        {fpState.x},{fpState.z}
+                  )}
+
+                  <div className="px-3 py-1.5 flex items-center justify-between gap-2 text-[11px]">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="font-mono text-[10.5px] font-bold text-violet-300 shrink-0">
+                        {curRoom ? curRoom.code : activeFloor?.code ?? 'FLOOR'}
                       </span>
+                      <span className="text-xs font-semibold text-white truncate max-w-[115px]">
+                        {curRoom ? curRoom.name : 'Corridor'}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      {/* Spatial Audio Mute Toggle */}
+                      <button
+                        type="button"
+                        onClick={() => setSpatialAudioEnabled((v) => !v)}
+                        className={`px-1.5 py-1 rounded-lg border text-[10px] font-mono flex items-center gap-1 cursor-pointer transition ${
+                          spatialAudioEnabled
+                            ? 'bg-emerald-500/15 border-emerald-400/45 text-emerald-300'
+                            : 'bg-zinc-800 border-zinc-700 text-zinc-400'
+                        }`}
+                        title={
+                          spatialAudioEnabled
+                            ? `3D Spatial Audio ON (${audioTelemetry?.estimatedDb ?? 42} dB · ${audioTelemetry?.dominantLabel ?? 'Ambient'})`
+                            : 'Enable 3D Spatial Audio (Equipment & HVAC)'
+                        }
+                      >
+                        {spatialAudioEnabled ? (
+                          <Volume2 className="w-3 h-3" />
+                        ) : (
+                          <VolumeX className="w-3 h-3" />
+                        )}
+                        {spatialAudioEnabled && audioTelemetry?.active && (
+                          <span className="hidden sm:inline text-[9.5px] tabular-nums">
+                            {audioTelemetry.estimatedDb}dB
+                          </span>
+                        )}
+                      </button>
+
+                      {/* Spatial Audio Settings Menu Trigger */}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSpatialAudioSettingsOpen((v) => !v);
+                          setPathFinderOpen(false);
+                        }}
+                        className={`p-1 rounded-lg border text-[10px] cursor-pointer transition ${
+                          spatialAudioSettingsOpen
+                            ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
+                            : 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:border-emerald-400/40'
+                        }`}
+                        title="Spatial Audio Settings (Rolloff Distance & Falloff Curves)"
+                        aria-label="Spatial Audio Settings"
+                      >
+                        <SlidersHorizontal className="w-3 h-3" />
+                      </button>
+
+                      {/* Path Finder & Routing Config Trigger */}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPathFinderOpen((v) => !v);
+                          setSpatialAudioSettingsOpen(false);
+                        }}
+                        className={`px-1.5 py-1 rounded-lg border text-[10px] font-semibold flex items-center gap-1 cursor-pointer transition ${
+                          pathFinderOpen || pathFinderHud
+                            ? pathAlgorithm === 'least-congested'
+                              ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
+                              : 'bg-cyan-500/20 border-cyan-400/50 text-cyan-200'
+                            : 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:border-cyan-400/40'
+                        }`}
+                        title="Open 3D Path Finder, Routing Mode & No-Go Zones"
+                      >
+                        <Route className="w-3 h-3" />
+                        <span className="hidden sm:inline">Path</span>
+                        {noGoZones.filter((z) => z.floorId === activeFloorId).length > 0 && (
+                          <span className="font-mono text-[9px] text-rose-300 tabular-nums">
+                            ·{noGoZones.filter((z) => z.floorId === activeFloorId).length}
+                          </span>
+                        )}
+                      </button>
+
+                      {curRoom && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const nextOn = useMayaStore
+                              .getState()
+                              .toggleRoomLight(curRoom.id, curRoom.code, curRoom.name);
+                            spatialAudioRef.current?.playSwitchCue(nextOn);
+                          }}
+                          className={`p-1 rounded-lg border text-[10px] cursor-pointer transition ${
+                            (roomLightsState[curRoom.id] ?? true)
+                              ? 'bg-amber-500/20 border-amber-400/50 text-amber-300'
+                              : 'bg-zinc-800 border-zinc-700 text-zinc-400'
+                          }`}
+                          title="Toggle Current Room Lighting"
+                        >
+                          <Lightbulb className="w-3 h-3" />
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          saveCurrentWalkPose();
+                          useTwinStore.getState().setScreen('maya-life');
+                        }}
+                        className="px-2 py-0.5 rounded-lg bg-violet-600/90 hover:bg-violet-500 text-white text-[10px] font-semibold flex items-center gap-1 cursor-pointer"
+                        title="Open MAYA Life AI Studio (saves your current game position)"
+                      >
+                        <Sparkles className="w-3 h-3" />
+                        MAYA
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setFpExpandedPad((v) => !v)}
+                        className="p-1 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 cursor-pointer"
+                        title={fpExpandedPad ? 'Compact Pad' : 'Expand Room Telemetry & Audio'}
+                      >
+                        {fpExpandedPad ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
+                      </button>
                       <button
                         type="button"
                         onClick={() => setFirstPersonTabletVisible(false)}
-                        className="p-0.5 rounded hover:bg-zinc-800 text-zinc-400 hover:text-white cursor-pointer"
-                        title="Hide Field Pad"
+                        className="p-1 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 cursor-pointer"
+                        title="Hide Minimal Pad"
                       >
                         <EyeOff className="w-3 h-3" />
                       </button>
                     </div>
                   </div>
 
-                  <div className="p-2.5 sm:p-3 bg-gradient-to-b from-[#14141D] to-[#0D0D13] space-y-2 text-zinc-100">
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="min-w-0">
-                        <div className="text-[9.5px] font-mono text-violet-400 uppercase tracking-wider truncate">
-                          {curRoom ? `${curRoom.code} · ZONE` : `${activeFloor?.code ?? 'FLOOR'} · CORRIDOR`}
+                  {fpExpandedPad && (
+                    <div className="px-3 pb-2.5 pt-1.5 border-t border-zinc-800/80 space-y-2">
+                      <Viewport3DWalkRoomMetrics
+                        tempSnap={tempSnap}
+                        rhSnap={rhSnap}
+                        dpSnap={dpSnap}
+                        curRoom={curRoom}
+                      />
+                      {spatialAudioEnabled && audioTelemetry?.active && (
+                        <div className="px-2 py-1 rounded-lg bg-emerald-500/10 border border-emerald-500/25 flex items-center justify-between gap-2 text-[10px] font-mono tabular-nums">
+                          <span className="text-emerald-300 truncate flex items-center gap-1.5">
+                            <Volume2 className="w-3 h-3 shrink-0" />
+                            <span className="truncate">{audioTelemetry.dominantLabel}</span>
+                          </span>
+                          <span className="text-emerald-200 shrink-0">
+                            {audioTelemetry.estimatedDb} dB · {audioTelemetry.activeSources} src
+                          </span>
                         </div>
-                        <div className="text-xs sm:text-sm font-bold text-white truncate">
-                          {curRoom ? curRoom.name : `${activeFloor?.name ?? 'Facility Floor'}`}
-                        </div>
+                      )}
+                      <div className="flex items-center justify-between gap-2 text-[10px] text-zinc-400 font-mono tabular-nums">
+                        <span>Pos {fpState.x}, {fpState.z} · Click floor for Path Teleport</span>
+                        <span>{Object.values(openDoorsState).filter(Boolean).length} doors open</span>
                       </div>
-                      <span className="hidden sm:inline-block px-2 py-0.5 rounded-lg bg-violet-500/20 border border-violet-500/40 text-violet-300 font-mono text-[10px] font-semibold shrink-0">
-                        {curRoom ? curRoom.environmental.cleanroomGrade : 'Navigable'}
-                      </span>
+                      {nearbyAssets.length > 0 && (
+                        <div className="flex items-center gap-1 overflow-x-auto no-scrollbar">
+                          {nearbyAssets.map(({ asset, dist }) => (
+                            <button
+                              key={asset.id}
+                              type="button"
+                              onClick={() => setWalkInspectAssetId(asset.id)}
+                              className="px-2 py-0.5 rounded-lg bg-[#1A1A26] border border-zinc-700/80 hover:border-violet-400 font-mono text-[9.5px] text-zinc-200 whitespace-nowrap cursor-pointer"
+                            >
+                              {asset.assetId} ({dist.toFixed(1)}m)
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </div>
-
-                    <div className="grid grid-cols-3 gap-1.5 font-mono tabular-nums">
-                      <div className="p-1.5 sm:p-2 rounded-xl bg-[#1A1A25] border border-zinc-800">
-                        <div className="text-[9px] text-zinc-400 flex items-center gap-0.5">
-                          <Thermometer className="w-2.5 h-2.5 text-amber-400" /> T
-                        </div>
-                        <div className="text-[11px] sm:text-xs font-bold text-white mt-0.5">
-                          {(tempSnap ? readings[tempSnap.id]?.value ?? tempSnap.nominal : curRoom?.environmental.temperatureC ?? 21.0).toFixed(1)}°
-                        </div>
-                      </div>
-                      <div className="p-1.5 sm:p-2 rounded-xl bg-[#1A1A25] border border-zinc-800">
-                        <div className="text-[9px] text-zinc-400 flex items-center gap-0.5">
-                          <Droplets className="w-2.5 h-2.5 text-cyan-400" /> RH
-                        </div>
-                        <div className="text-[11px] sm:text-xs font-bold text-white mt-0.5">
-                          {(rhSnap ? readings[rhSnap.id]?.value ?? rhSnap.nominal : curRoom?.environmental.humidityPct ?? 45).toFixed(0)}%
-                        </div>
-                      </div>
-                      <div className="p-1.5 sm:p-2 rounded-xl bg-[#1A1A25] border border-zinc-800">
-                        <div className="text-[9px] text-zinc-400 flex items-center gap-0.5">
-                          <Gauge className="w-2.5 h-2.5 text-emerald-400" /> ΔP
-                        </div>
-                        <div className="text-[11px] sm:text-xs font-bold text-emerald-400 mt-0.5">
-                          {(dpSnap ? readings[dpSnap.id]?.value ?? dpSnap.nominal : curRoom?.environmental.pressurePa ?? 15) >= 0 ? '+' : ''}
-                          {(dpSnap ? readings[dpSnap.id]?.value ?? dpSnap.nominal : curRoom?.environmental.pressurePa ?? 15).toFixed(0)}Pa
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="hidden sm:flex items-center justify-between gap-2 pt-1 border-t border-zinc-800/80 text-[10px]">
-                      <span className="text-zinc-400 shrink-0">Nearby:</span>
-                      <div className="flex items-center gap-1.5 overflow-x-auto">
-                        {nearbyAssets.map(({ asset, dist }) => (
-                          <button
-                            key={asset.id}
-                            type="button"
-                            onClick={() => openDashboard({ tab: 'trends', assetId: asset.id })}
-                            className="px-2 py-0.5 rounded-lg bg-[#1C1C28] border border-zinc-700/80 hover:border-violet-400 font-mono text-[10px] text-zinc-200 whitespace-nowrap cursor-pointer"
-                          >
-                            {asset.assetId} ({dist.toFixed(1)}m)
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  </div>
+                  )}
                 </div>
-
-                {/* Right Character Forearm & Cleanroom Gloved Hand (Desktop lg+ only) */}
-                <svg
-                  width="84"
-                  height="140"
-                  viewBox="0 0 92 154"
-                  className="-ml-5 z-20 drop-shadow-2xl hidden lg:block select-none pointer-events-none"
-                >
-                  <defs>
-                    <linearGradient id="fpSleeveR" x1="1" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#27272A" />
-                      <stop offset="100%" stopColor="#121216" />
-                    </linearGradient>
-                    <linearGradient id="fpGloveR" x1="1" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#E4E4E7" />
-                      <stop offset="100%" stopColor="#A1A1AA" />
-                    </linearGradient>
-                  </defs>
-                  <path d="M 84 154 L 62 92 L 26 102 L 46 154 Z" fill="url(#fpSleeveR)" stroke="#3F3F46" strokeWidth="1.5" />
-                  <path d="M 64 92 L 25 101 L 28 111 L 67 102 Z" fill="#7C3AED" />
-                  <path d="M 60 90 C 62 62, 38 44, 14 50 C 3 53, 4 67, 18 71 L 24 98 Z" fill="url(#fpGloveR)" stroke="#71717A" strokeWidth="1.2" />
-                  <ellipse cx="15" cy="60" rx="11" ry="7" fill="#F4F4F5" stroke="#71717A" strokeWidth="1" />
-                </svg>
               </div>
             )}
           </>

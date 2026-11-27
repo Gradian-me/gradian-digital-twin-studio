@@ -56,7 +56,7 @@ function targetFromYawPitch(
   ];
 }
 
-const LiveCctvCanvas: React.FC<{
+export const LiveCctvCanvas: React.FC<{
   camera: SceneCamera;
   floorName: string;
   room: Room | null;
@@ -596,8 +596,8 @@ export const CameraManagerModal: React.FC = () => {
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-3 sm:p-5">
-      <div className="w-full max-w-6xl h-[88vh] bg-white dark:bg-[#111116] border border-zinc-200 dark:border-zinc-800 rounded-3xl shadow-2xl flex flex-col overflow-hidden">
+    <div className="fixed inset-0 z-50 bg-black/75 flex items-end sm:items-center justify-center p-0 sm:p-4">
+      <div className="w-full max-w-6xl h-[100dvh] sm:h-[88vh] bg-white dark:bg-[#111116] border-0 sm:border border-zinc-200 dark:border-zinc-800 rounded-none sm:rounded-3xl shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-5 py-3.5 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-3 bg-zinc-50 dark:bg-[#0E0E12] shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
@@ -665,7 +665,7 @@ export const CameraManagerModal: React.FC = () => {
               </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-2.5 space-y-1.5">
+            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-2.5 space-y-1.5">
               {filteredCameras.map((cam) => {
                 const fl = scene.floors.find((f) => f.id === cam.floorId);
                 const rm = cam.roomId ? scene.rooms.find((r) => r.id === cam.roomId) : undefined;
@@ -821,7 +821,7 @@ export const CameraManagerModal: React.FC = () => {
                   </div>
                 </div>
 
-                <div className="flex-1 overflow-y-auto p-5 space-y-5">
+                <div key={viewTab} className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-4 sm:p-5 space-y-5">
                   {viewTab === 'live' ? (
                     <div className="space-y-4">
                       <LiveCctvCanvas

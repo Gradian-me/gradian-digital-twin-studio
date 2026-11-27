@@ -1,16 +1,19 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
   ArrowLeft,
   ArrowUpRight,
+  BookOpen,
   Building2,
+  Camera,
   CheckCircle2,
   ClipboardCheck,
   Cpu,
   DollarSign,
   Eye,
   FileText,
+  Flame,
   Footprints,
   History,
   Info,
@@ -20,6 +23,7 @@ import {
   Radio,
   ShieldAlert,
   ShieldCheck,
+  Sparkles,
   Tag,
   UserCheck,
   Wind,
@@ -30,7 +34,11 @@ import { useTwinStore } from '../store/useTwinStore';
 import { useGmpStore } from '../store/useGmpStore';
 import { useTelemetryStore } from '../store/useTelemetryStore';
 import { useRiskIncidentStore, getTargetFmeaSummary } from '../store/useRiskIncidentStore';
+import { useAclStore, getActiveAclUser, computeEffectivePermissions } from '../store/useAclStore';
+import { useMayaStore } from '../store/useMayaStore';
 import { EntityRisksSection } from './RiskFmeaCenter';
+import { LiveCctvCanvas } from './CameraManagerModal';
+import { RichMarkdownRenderer } from './RichMarkdownRenderer';
 import { enrichAssetHistory } from '../data/cinnagenDemo';
 import {
   AHU_CATALOG,
@@ -40,6 +48,12 @@ import {
   getAhuColor,
   getEffectiveRoomHvac,
 } from '../utils/hvac';
+import {
+  getDefaultRoomOwner,
+  getDepartmentCostCenter,
+  getEffectiveRoomFireSafety,
+  getSceneDepartments,
+} from '../utils/fireSafety';
 import type { Room, SpatialAsset } from '../types/twin';
 
 interface EligibilityFinding {
@@ -68,6 +82,8 @@ interface RoomEligibilityReport {
 export const EntityInfoModal: React.FC = () => {
   const entityInfoTarget = useTwinStore((s) => s.entityInfoTarget);
   const entityInfoAutoEligibility = useTwinStore((s) => s.entityInfoAutoEligibility);
+  const entityInfoInitialTab = useTwinStore((s) => s.entityInfoInitialTab);
+  const auditLog = useTwinStore((s) => s.auditLog);
   const closeEntityInfo = useTwinStore((s) => s.closeEntityInfo);
   const openEntityInfo = useTwinStore((s) => s.openEntityInfo);
   const scene = useTwinStore((s) => s.scene);
@@ -79,9 +95,13 @@ export const EntityInfoModal: React.FC = () => {
   const walkInsideRoom = useTwinStore((s) => s.walkInsideRoom);
   const setScreen = useTwinStore((s) => s.setScreen);
   const showToast = useTwinStore((s) => s.showToast);
+  const updateRoom = useTwinStore((s) => s.updateRoom);
   const updateRoomHvac = useTwinStore((s) => s.updateRoomHvac);
+  const openLiveCamera = useTwinStore((s) => s.openLiveCamera);
   const setShowHvacOverlay = useTwinStore((s) => s.setShowHvacOverlay);
   const workspaceMode = useTwinStore((s) => s.workspaceMode);
+  const startReadingSop = useMayaStore((s) => s.startReadingSop);
+  const mayaInteractions = useMayaStore((s) => s.interactions);
 
   const sops = useGmpStore((s) => s.sops);
   const complianceByAssetId = useGmpStore((s) => s.complianceByAssetId);
@@ -95,10 +115,25 @@ export const EntityInfoModal: React.FC = () => {
   const openDashboard = useTelemetryStore((s) => s.openDashboard);
 
   const [eligibilityReport, setEligibilityReport] = useState<RoomEligibilityReport | null>(null);
-  const [activeSubTab, setActiveSubTab] = useState<'overview' | 'history' | 'relations' | 'risks'>('overview');
+  const [activeSubTab, setActiveSubTab] = useState<'overview' | 'sops' | 'history' | 'relations' | 'risks'>('overview');
+  const [selectedSopId, setSelectedSopId] = useState<string | null>(null);
+  const [highlightFireSection, setHighlightFireSection] = useState(false);
+  const fireSafetyRef = useRef<HTMLElement | null>(null);
   const riskIncidents = useRiskIncidentStore((s) => s.incidents);
   const openRiskModal = useRiskIncidentStore((s) => s.openRiskModal);
   const openAssetPdfModal = useRiskIncidentStore((s) => s.openAssetPdfModal);
+
+  const aclUsers = useAclStore((s) => s.users);
+  const aclRoles = useAclStore((s) => s.roles);
+  const aclGroups = useAclStore((s) => s.groups);
+  const activeAclUserId = useAclStore((s) => s.activeAclUserId);
+  const isReadOnly = useMemo(() => {
+    if (workspaceMode === 'view') return true;
+    const activeUser = getActiveAclUser({ users: aclUsers, activeAclUserId });
+    if (!activeUser) return false;
+    if (activeUser.status === 'suspended') return true;
+    return !computeEffectivePermissions(activeUser, aclRoles, aclGroups).includes('spatial.edit');
+  }, [workspaceMode, aclUsers, aclRoles, aclGroups, activeAclUserId]);
 
   const isDark = theme === 'dark';
 
@@ -306,6 +341,32 @@ export const EntityInfoModal: React.FC = () => {
       warnings,
     };
   };
+
+  useEffect(() => {
+    if (!entityInfoTarget) return;
+    if (entityInfoInitialTab === 'fire') {
+      setActiveSubTab('overview');
+      setHighlightFireSection(true);
+      const t = window.setTimeout(() => {
+        fireSafetyRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, 120);
+      const t2 = window.setTimeout(() => setHighlightFireSection(false), 3600);
+      return () => {
+        window.clearTimeout(t);
+        window.clearTimeout(t2);
+      };
+    } else if (
+      entityInfoInitialTab === 'sops' ||
+      entityInfoInitialTab === 'history' ||
+      entityInfoInitialTab === 'relations' ||
+      entityInfoInitialTab === 'risks'
+    ) {
+      setActiveSubTab(entityInfoInitialTab);
+    } else {
+      setActiveSubTab('overview');
+    }
+    setHighlightFireSection(false);
+  }, [entityInfoTarget?.id, entityInfoInitialTab]);
 
   useEffect(() => {
     if (entityInfoTarget?.type === 'room' && room && entityInfoAutoEligibility) {
@@ -568,7 +629,7 @@ export const EntityInfoModal: React.FC = () => {
           }`}
         >
           <div className="flex items-center gap-1.5 overflow-x-auto max-w-full pb-0.5 sm:pb-0">
-            {(['overview', 'history', 'relations', 'risks'] as const).map((tab) => (
+            {(['overview', 'sops', 'history', 'relations', 'risks'] as const).map((tab) => (
               <button
                 key={tab}
                 type="button"
@@ -582,14 +643,16 @@ export const EntityInfoModal: React.FC = () => {
                 }`}
               >
                 {tab === 'overview'
-                  ? 'Identification & SOPs'
-                  : tab === 'history'
-                    ? isAssetMode
-                      ? 'Vendor & Owner History'
-                      : 'Compliance & Eligibility'
-                    : tab === 'relations'
-                      ? `Related (${relatedDevices.length + relatedSensors.length})`
-                      : `Risks & FMEA (${entityRiskCount})`}
+                  ? 'Overview'
+                  : tab === 'sops'
+                    ? `SOPs (${linkedSops.length})`
+                    : tab === 'history'
+                      ? isAssetMode
+                        ? 'Activity & History'
+                        : 'Compliance & History'
+                      : tab === 'relations'
+                        ? `Related (${relatedDevices.length + relatedSensors.length})`
+                        : `Risks & FMEA (${entityRiskCount})`}
               </button>
             ))}
           </div>
@@ -1162,7 +1225,7 @@ export const EntityInfoModal: React.FC = () => {
                 const rmHvac = getEffectiveRoomHvac(room);
                 const m3h = computeRoomSupplyM3h(room);
                 const ahuTint = getAhuColor(rmHvac.ahuId);
-                const disabled = workspaceMode === 'view';
+                const disabled = isReadOnly;
                 return (
                   <section
                     className={`rounded-2xl border p-4 space-y-3 ${
@@ -1312,6 +1375,306 @@ export const EntityInfoModal: React.FC = () => {
                 );
               })()}
 
+              {/* Owner, Department & Cost Center Assignment */}
+              {(() => {
+                const departments = getSceneDepartments(scene);
+                const currentDept = departments.find((d) => d.id === room.departmentId) ?? departments[0];
+                const effectiveOwner = getDefaultRoomOwner(room, currentDept);
+                const effectiveCostCenter = room.costCenter || getDepartmentCostCenter(currentDept);
+                const costCenterOptions = departments.map((d) => ({
+                  deptId: d.id,
+                  deptName: d.name,
+                  costCenter: getDepartmentCostCenter(d),
+                }));
+                return (
+                  <section
+                    className={`rounded-2xl border p-4 space-y-3 ${
+                      isDark ? 'bg-[#17171F] border-zinc-800' : 'bg-slate-50 border-slate-200'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-amber-400">
+                        <UserCheck className="w-3.5 h-3.5" />
+                        Owner, Department &amp; Cost Center
+                      </div>
+                      <span className="text-[10.5px] font-mono text-zinc-400">
+                        {isReadOnly ? 'Read-Only' : 'Editable'}
+                      </span>
+                    </div>
+                    <fieldset
+                      disabled={isReadOnly}
+                      className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs disabled:opacity-80"
+                    >
+                      <label className="space-y-1">
+                        <span className="text-[10px] text-zinc-500 uppercase">Department</span>
+                        <select
+                          value={currentDept?.id ?? room.departmentId}
+                          onChange={(e) => {
+                            const nextDept = departments.find((d) => d.id === e.target.value);
+                            updateRoom(room.id, {
+                              departmentId: e.target.value,
+                              costCenter: getDepartmentCostCenter(nextDept),
+                            });
+                          }}
+                          className={`w-full px-2.5 py-1.5 rounded-lg border text-xs ${
+                            isDark ? 'bg-[#111116] border-zinc-700' : 'bg-white border-slate-200'
+                          }`}
+                        >
+                          {departments.map((dept) => (
+                            <option key={dept.id} value={dept.id}>
+                              {dept.code} · {dept.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-[10px] text-zinc-500 uppercase">Cost Center</span>
+                        <select
+                          value={effectiveCostCenter}
+                          onChange={(e) => {
+                            const matched = costCenterOptions.find((c) => c.costCenter === e.target.value);
+                            updateRoom(room.id, {
+                              costCenter: e.target.value,
+                              ...(matched ? { departmentId: matched.deptId } : {}),
+                            });
+                          }}
+                          className={`w-full px-2.5 py-1.5 rounded-lg border text-xs ${
+                            isDark ? 'bg-[#111116] border-zinc-700' : 'bg-white border-slate-200'
+                          }`}
+                        >
+                          {costCenterOptions.map((c) => (
+                            <option key={c.deptId} value={c.costCenter}>
+                              {c.costCenter}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-[10px] text-zinc-500 uppercase">Room Owner</span>
+                        <input
+                          type="text"
+                          value={effectiveOwner}
+                          onChange={(e) =>
+                            updateRoom(room.id, {
+                              owner: e.target.value,
+                              metadata: { ...room.metadata, owner: e.target.value },
+                            })
+                          }
+                          className={`w-full px-2.5 py-1.5 rounded-lg border text-xs ${
+                            isDark ? 'bg-[#111116] border-zinc-700' : 'bg-white border-slate-200'
+                          }`}
+                        />
+                      </label>
+                    </fieldset>
+                  </section>
+                );
+              })()}
+
+              {/* Related Cameras with Live Preview */}
+              {(() => {
+                const roomCx = room.x + room.width / 2;
+                const roomCz = room.z + room.depth / 2;
+                const floorCams = scene.cameras.filter((c) => c.floorId === room.floorId);
+                const directCams = floorCams.filter((c) => {
+                  const [px, , pz] = c.position;
+                  const [tx, , tz] = c.target;
+                  const insidePos =
+                    px >= room.x - 0.8 &&
+                    px <= room.x + room.width + 0.8 &&
+                    pz >= room.z - 0.8 &&
+                    pz <= room.z + room.depth + 0.8;
+                  const insideTgt =
+                    tx >= room.x &&
+                    tx <= room.x + room.width &&
+                    tz >= room.z &&
+                    tz <= room.z + room.depth;
+                  const withinRadius =
+                    Math.hypot(px - roomCx, pz - roomCz) <= Math.max(8, c.coverageRadius || 10);
+                  return insidePos || insideTgt || withinRadius;
+                });
+                const roomCams =
+                  directCams.length > 0
+                    ? directCams.slice(0, 2)
+                    : floorCams
+                        .slice()
+                        .sort(
+                          (a, b) =>
+                            Math.hypot(a.position[0] - roomCx, a.position[2] - roomCz) -
+                            Math.hypot(b.position[0] - roomCx, b.position[2] - roomCz)
+                        )
+                        .slice(0, 1);
+                const floorObj = scene.floors.find((f) => f.id === room.floorId);
+
+                return (
+                  <section
+                    className={`rounded-2xl border p-4 space-y-3 ${
+                      isDark ? 'bg-[#17171F] border-zinc-800' : 'bg-slate-50 border-slate-200'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-cyan-400">
+                        <Camera className="w-3.5 h-3.5" />
+                        Related Cameras &amp; Live Preview ({roomCams.length})
+                      </div>
+                      {roomCams[0] && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            closeEntityInfo();
+                            openLiveCamera(roomCams[0].id);
+                          }}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-xl bg-cyan-500/15 hover:bg-cyan-500 text-cyan-300 hover:text-zinc-950 text-[11px] font-semibold transition cursor-pointer"
+                        >
+                          <Eye className="w-3 h-3" />
+                          Open Camera Manager
+                        </button>
+                      )}
+                    </div>
+                    {roomCams.length > 0 ? (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        {roomCams.map((cam) => (
+                          <div
+                            key={cam.id}
+                            className={`rounded-xl border overflow-hidden ${
+                              isDark ? 'bg-[#111116] border-zinc-800' : 'bg-white border-slate-200'
+                            }`}
+                          >
+                            <div className="relative h-32 w-full bg-black overflow-hidden">
+                              <LiveCctvCanvas
+                                camera={cam}
+                                floorName={floorObj?.name ?? 'Floor'}
+                                room={room}
+                                roomAssets={relatedDevices}
+                                nightVision={false}
+                                ptzZoom={1}
+                                ptzPan={0}
+                              />
+                              <span className="absolute top-2 left-2 px-1.5 py-0.5 rounded bg-rose-600/90 text-white font-mono text-[9px] font-bold tracking-wider">
+                                LIVE
+                              </span>
+                            </div>
+                            <div className="px-3 py-2 flex items-center justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="text-xs font-semibold truncate">{cam.name}</div>
+                                <div className="text-[10px] font-mono text-zinc-400">
+                                  FOV {cam.fov}° · {cam.kind.toUpperCase()}
+                                </div>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  closeEntityInfo();
+                                  openLiveCamera(cam.id);
+                                }}
+                                className="px-2.5 py-1 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-[10px] font-semibold shrink-0 cursor-pointer"
+                              >
+                                Full Feed
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-zinc-500">No surveillance cameras assigned to this floor.</div>
+                    )}
+                  </section>
+                );
+              })()}
+
+              {/* Fire Safety: Related Fire Sensors & Fire Extinguisher List */}
+              {(() => {
+                const fireSafety = getEffectiveRoomFireSafety(room);
+                return (
+                  <section
+                    ref={fireSafetyRef}
+                    className={`rounded-2xl border p-4 space-y-3 transition-all ${
+                      highlightFireSection
+                        ? 'bg-rose-500/15 border-rose-400 ring-2 ring-rose-500/40'
+                        : isDark
+                          ? 'bg-[#17171F] border-zinc-800'
+                          : 'bg-slate-50 border-slate-200'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-rose-400">
+                        <Flame className="w-3.5 h-3.5" />
+                        Fire Sensors ({fireSafety.sensors.length}) &amp; Extinguishers ({fireSafety.extinguishers.length})
+                      </div>
+                      <span className="text-[10px] font-mono text-emerald-400">NFPA 72 / EN 54 Monitored</span>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div className="space-y-1.5">
+                        <div className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                          Fire Detection Sensors
+                        </div>
+                        {fireSafety.sensors.map((fs) => (
+                          <div
+                            key={fs.id}
+                            className={`rounded-xl border px-3 py-2 flex items-center justify-between gap-2 ${
+                              isDark ? 'bg-[#111116] border-zinc-800' : 'bg-white border-slate-200'
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-mono text-[10.5px] font-bold text-rose-400">{fs.tag}</span>
+                                <span className="text-[11px] font-semibold truncate">{fs.type}</span>
+                              </div>
+                              <div className="text-[10px] text-zinc-400 truncate">
+                                {fs.sensitivity} · Next test {fs.nextTestDue}
+                              </div>
+                            </div>
+                            <span
+                              className={`px-2 py-0.5 rounded-md font-mono text-[9.5px] font-bold uppercase shrink-0 ${
+                                fs.status === 'normal'
+                                  ? 'bg-emerald-500/15 text-emerald-400'
+                                  : 'bg-amber-500/15 text-amber-400'
+                              }`}
+                            >
+                              {fs.status === 'normal' ? 'ACTIVE' : 'TEST DUE'}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <div className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                          Portable &amp; Clean-Agent Extinguishers
+                        </div>
+                        {fireSafety.extinguishers.map((fe) => (
+                          <div
+                            key={fe.id}
+                            className={`rounded-xl border px-3 py-2 flex items-center justify-between gap-2 ${
+                              isDark ? 'bg-[#111116] border-zinc-800' : 'bg-white border-slate-200'
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="font-mono text-[10.5px] font-bold text-amber-400">{fe.tag}</span>
+                                <span className="text-[11px] font-semibold truncate">
+                                  {fe.agent} ({fe.capacityKg}kg)
+                                </span>
+                              </div>
+                              <div className="text-[10px] text-zinc-400 truncate">
+                                {fe.locationHint} · {fe.classRating} · Due {fe.nextInspection}
+                              </div>
+                            </div>
+                            <span
+                              className={`px-2 py-0.5 rounded-md font-mono text-[9.5px] font-bold uppercase shrink-0 ${
+                                fe.pressureStatus === 'green-nominal'
+                                  ? 'bg-emerald-500/15 text-emerald-400'
+                                  : 'bg-rose-500/15 text-rose-400'
+                              }`}
+                            >
+                              {fe.pressureStatus === 'green-nominal' ? 'OK' : 'RECHARGE'}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </section>
+                );
+              })()}
+
               {/* Room SOPs */}
               <section
                 className={`rounded-2xl border p-4 space-y-2.5 ${
@@ -1323,28 +1686,42 @@ export const EntityInfoModal: React.FC = () => {
                   Room &amp; Cleanroom SOPs ({linkedSops.length})
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  {linkedSops.slice(0, 4).map((doc) => (
-                    <button
+                  {linkedSops.slice(0, 6).map((doc) => (
+                    <div
                       key={doc.id}
-                      type="button"
-                      onClick={() => {
-                        closeEntityInfo();
-                        openGmpModal({ tab: 'sops', sopId: doc.id });
-                      }}
-                      className={`text-left rounded-xl border p-2.5 flex items-center justify-between gap-2 cursor-pointer ${
+                      className={`rounded-xl border p-2.5 flex items-center justify-between gap-2 ${
                         isDark
                           ? 'bg-[#111116] border-zinc-800 hover:border-violet-500'
                           : 'bg-white border-slate-200 hover:border-violet-500'
                       }`}
                     >
-                      <div className="min-w-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          closeEntityInfo();
+                          openGmpModal({ tab: 'sops', sopId: doc.id });
+                        }}
+                        className="text-left min-w-0 flex-1 cursor-pointer"
+                      >
                         <div className="font-mono text-[10px] font-bold text-amber-400">
                           {doc.docNumber} · v{doc.version}
                         </div>
                         <div className="text-xs font-semibold truncate">{doc.title}</div>
-                      </div>
-                      <ArrowUpRight className="w-3.5 h-3.5 text-violet-400 shrink-0" />
-                    </button>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          startReadingSop(doc.id, doc.title, null, doc.docNumber);
+                          closeEntityInfo();
+                          setScreen('maya-life');
+                        }}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-violet-600/20 hover:bg-violet-600 text-violet-300 hover:text-white text-[10px] font-semibold shrink-0 transition cursor-pointer"
+                        title="Open in MAYA Life Studio to read & analyze"
+                      >
+                        <Sparkles className="w-3 h-3" />
+                        MAYA
+                      </button>
+                    </div>
                   ))}
                 </div>
               </section>
@@ -1451,72 +1828,289 @@ export const EntityInfoModal: React.FC = () => {
             </div>
           )}
 
-          {/* TAB 2: VENDOR & OWNER HISTORY (ASSET) OR COMPLIANCE & ELIGIBILITY (ROOM) */}
-          {activeSubTab === 'history' && isAssetMode && asset && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <section
-                className={`rounded-2xl border p-4 space-y-3 ${
+          {/* DEDICATED SOP LIBRARY & FULL READER TAB */}
+          {activeSubTab === 'sops' && (
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+              <div
+                className={`lg:col-span-4 rounded-2xl border p-3 space-y-2 ${
                   isDark ? 'bg-[#17171F] border-zinc-800' : 'bg-slate-50 border-slate-200'
                 }`}
               >
-                <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-amber-400">
-                  <Wrench className="w-3.5 h-3.5" />
-                  Vendor &amp; OEM Service History ({asset.vendorHistory?.length ?? 0})
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-violet-400">
+                    <BookOpen className="w-3.5 h-3.5" />
+                    Linked SOPs ({linkedSops.length})
+                  </div>
                 </div>
-                <div className="space-y-2.5">
-                  {(asset.vendorHistory ?? []).map((vh) => (
-                    <div
-                      key={vh.id}
-                      className={`rounded-xl border p-3 space-y-1 ${
-                        isDark ? 'bg-[#111116] border-zinc-800' : 'bg-white border-slate-200'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-bold">{vh.vendor}</span>
-                        <span className="font-mono text-[10px] text-amber-400">{vh.date}</span>
-                      </div>
-                      <div className="text-[11px] font-semibold text-violet-400">{vh.action}</div>
-                      <div className="flex items-center justify-between text-[10.5px] text-zinc-400 font-mono">
-                        <span>Ref: {vh.reference ?? 'OEM-SVC'}</span>
-                        {vh.costUsd ? <span>${vh.costUsd.toLocaleString()}</span> : null}
-                      </div>
-                      {vh.note && <p className="text-[11px] text-zinc-400 pt-0.5">{vh.note}</p>}
-                    </div>
-                  ))}
-                </div>
-              </section>
+                {linkedSops.length === 0 ? (
+                  <div className="text-xs text-zinc-500 py-6 text-center">
+                    No SOP documents matched this entity yet.
+                  </div>
+                ) : (
+                  <div className="space-y-1.5 max-h-[460px] overflow-y-auto pr-0.5">
+                    {linkedSops.map((sop) => {
+                      const activeSopObj =
+                        linkedSops.find((s) => s.id === selectedSopId) ?? linkedSops[0];
+                      const isSel = activeSopObj?.id === sop.id;
+                      return (
+                        <button
+                          key={sop.id}
+                          type="button"
+                          onClick={() => setSelectedSopId(sop.id)}
+                          className={`w-full text-left p-2.5 rounded-xl border transition cursor-pointer ${
+                            isSel
+                              ? 'bg-violet-600/15 border-violet-500'
+                              : isDark
+                                ? 'bg-[#111116] border-zinc-800 hover:border-violet-500/40'
+                                : 'bg-white border-slate-200 hover:border-violet-400'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-1.5">
+                            <span className="font-mono text-[10px] font-bold text-violet-400">
+                              {sop.docNumber}
+                            </span>
+                            <span className="text-[9.5px] px-1.5 py-0.5 rounded bg-zinc-800/80 text-zinc-300">
+                              v{sop.version}
+                            </span>
+                          </div>
+                          <div className="text-xs font-semibold mt-0.5 line-clamp-2">{sop.title}</div>
+                          <div className="text-[10px] text-zinc-500 mt-0.5">{sop.actionType}</div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
 
-              <section
-                className={`rounded-2xl border p-4 space-y-3 ${
+              <div
+                className={`lg:col-span-8 rounded-2xl border p-4 space-y-3 ${
                   isDark ? 'bg-[#17171F] border-zinc-800' : 'bg-slate-50 border-slate-200'
                 }`}
               >
-                <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-violet-400">
-                  <UserCheck className="w-3.5 h-3.5" />
-                  Owner &amp; Cost Center Custody History ({asset.ownerHistory?.length ?? 0})
-                </div>
-                <div className="space-y-2.5">
-                  {(asset.ownerHistory ?? []).map((oh) => (
-                    <div
-                      key={oh.id}
-                      className={`rounded-xl border p-3 space-y-1 ${
-                        isDark ? 'bg-[#111116] border-zinc-800' : 'bg-white border-slate-200'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-bold">{oh.owner}</span>
-                        <span className="font-mono text-[10px] text-emerald-400">{oh.date}</span>
+                {(() => {
+                  const activeSopObj =
+                    linkedSops.find((s) => s.id === selectedSopId) ?? linkedSops[0] ?? null;
+                  if (!activeSopObj) {
+                    return (
+                      <div className="text-xs text-zinc-500 py-12 text-center">
+                        Select an SOP on the left to inspect its full GMP procedure.
                       </div>
-                      <div className="text-[11px] text-zinc-400">
-                        {oh.department} · <span className="font-mono text-amber-400">{oh.costCenter}</span>
+                    );
+                  }
+                  return (
+                    <>
+                      <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-zinc-200 dark:border-zinc-800">
+                        <div className="min-w-0">
+                          <div className="font-mono text-[10.5px] font-bold text-violet-400">
+                            {activeSopObj.docNumber} · v{activeSopObj.version} · {activeSopObj.status.toUpperCase()}
+                          </div>
+                          <div className="text-sm font-bold truncate">{activeSopObj.title}</div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            startReadingSop(
+                              activeSopObj.id,
+                              activeSopObj.title,
+                              asset?.id ?? null,
+                              asset?.assetId ?? room?.code
+                            );
+                            closeEntityInfo();
+                            setScreen('maya-life');
+                          }}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold cursor-pointer shrink-0"
+                        >
+                          <Sparkles className="w-3.5 h-3.5" />
+                          Read with MAYA
+                        </button>
                       </div>
-                      <p className="text-[11px] text-zinc-400">{oh.note}</p>
-                    </div>
-                  ))}
-                </div>
-              </section>
+                      <div className="max-h-[420px] overflow-y-auto pr-1">
+                        <RichMarkdownRenderer markdown={activeSopObj.markdown} isDark={isDark} compact />
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
             </div>
           )}
+
+          {/* TAB 2: UNIFIED ACTIVITY, AUDIT & VENDOR/OWNER HISTORY (ASSET) OR COMPLIANCE & ELIGIBILITY (ROOM) */}
+          {activeSubTab === 'history' && isAssetMode && asset && (() => {
+            const assetWorkOrders = workOrders.filter(
+              (w) => w.targetId === asset.id || w.targetName.includes(asset.assetId)
+            );
+            const assetAuditEntries = auditLog.filter(
+              (a) =>
+                a.entityId === asset.id ||
+                a.summary.toLowerCase().includes(asset.assetId.toLowerCase()) ||
+                a.summary.toLowerCase().includes(asset.name.toLowerCase())
+            );
+            const assetMayaEntries = mayaInteractions.filter(
+              (m) => m.targetId === asset.id || m.targetCode === asset.assetId
+            );
+
+            return (
+              <div className="space-y-4">
+                {/* Unified Activity & Audit Timeline */}
+                <section
+                  className={`rounded-2xl border p-4 space-y-3 ${
+                    isDark ? 'bg-[#17171F] border-zinc-800' : 'bg-slate-50 border-slate-200'
+                  }`}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-cyan-400">
+                      <History className="w-3.5 h-3.5" />
+                      Unified Activity, Work Orders &amp; Audit History (
+                      {assetWorkOrders.length + assetAuditEntries.length + assetMayaEntries.length})
+                    </div>
+                    <span className="font-mono text-[10px] text-zinc-400">
+                      21 CFR Part 11 · Real-Time Trail
+                    </span>
+                  </div>
+
+                  {assetWorkOrders.length + assetAuditEntries.length + assetMayaEntries.length === 0 ? (
+                    <div className="text-xs text-zinc-500 py-3">
+                      No live work orders or audit activity recorded yet for {asset.assetId}.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 max-h-[260px] overflow-y-auto pr-1">
+                      {assetWorkOrders.map((wo) => (
+                        <div
+                          key={wo.id}
+                          className={`rounded-xl border p-3 space-y-1 ${
+                            isDark ? 'bg-[#111116] border-zinc-800' : 'bg-white border-slate-200'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-mono text-[10px] font-bold text-amber-400">
+                              {wo.woNumber} · {wo.serviceType}
+                            </span>
+                            <span className="text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-400">
+                              {wo.status}
+                            </span>
+                          </div>
+                          <div className="text-xs font-semibold">{wo.title}</div>
+                          <div className="text-[10.5px] text-zinc-400 font-mono">
+                            Due {wo.dueDate} · {wo.assigneeName}
+                          </div>
+                        </div>
+                      ))}
+
+                      {assetMayaEntries.map((mi) => (
+                        <div
+                          key={mi.id}
+                          className={`rounded-xl border p-3 space-y-1 ${
+                            isDark ? 'bg-[#111116] border-zinc-800' : 'bg-white border-slate-200'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-mono text-[10px] font-bold text-violet-400">
+                              MAYA · {mi.kind.toUpperCase()}
+                            </span>
+                            <span className="font-mono text-[10px] text-zinc-400 tabular-nums">
+                              {new Date(mi.timestamp).toLocaleTimeString([], {
+                                hour: '2-digit',
+                                minute: '2-digit',
+                              })}
+                            </span>
+                          </div>
+                          <div className="text-xs font-semibold">{mi.summary}</div>
+                          <div className="text-[10px] text-zinc-500">State: {mi.mayaState}</div>
+                        </div>
+                      ))}
+
+                      {assetAuditEntries.map((ae) => (
+                        <div
+                          key={ae.id}
+                          className={`rounded-xl border p-3 space-y-1 ${
+                            isDark ? 'bg-[#111116] border-zinc-800' : 'bg-white border-slate-200'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-mono text-[10px] font-bold text-emerald-400">
+                              AUDIT · {ae.action}
+                            </span>
+                            <span className="font-mono text-[10px] text-zinc-400 tabular-nums">
+                              {new Date(ae.timestamp).toLocaleTimeString([], {
+                                hour: '2-digit',
+                                minute: '2-digit',
+                              })}
+                            </span>
+                          </div>
+                          <div className="text-xs font-medium">{ae.summary}</div>
+                          <div className="text-[10px] text-zinc-500">Actor: {ae.actor}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <section
+                    className={`rounded-2xl border p-4 space-y-3 ${
+                      isDark ? 'bg-[#17171F] border-zinc-800' : 'bg-slate-50 border-slate-200'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-amber-400">
+                      <Wrench className="w-3.5 h-3.5" />
+                      Vendor &amp; OEM Service History ({asset.vendorHistory?.length ?? 0})
+                    </div>
+                    <div className="space-y-2.5">
+                      {(asset.vendorHistory ?? []).map((vh) => (
+                        <div
+                          key={vh.id}
+                          className={`rounded-xl border p-3 space-y-1 ${
+                            isDark ? 'bg-[#111116] border-zinc-800' : 'bg-white border-slate-200'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-bold">{vh.vendor}</span>
+                            <span className="font-mono text-[10px] text-amber-400">{vh.date}</span>
+                          </div>
+                          <div className="text-[11px] font-semibold text-violet-400">{vh.action}</div>
+                          <div className="flex items-center justify-between text-[10.5px] text-zinc-400 font-mono">
+                            <span>Ref: {vh.reference ?? 'OEM-SVC'}</span>
+                            {vh.costUsd ? <span>${vh.costUsd.toLocaleString()}</span> : null}
+                          </div>
+                          {vh.note && <p className="text-[11px] text-zinc-400 pt-0.5">{vh.note}</p>}
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+
+                  <section
+                    className={`rounded-2xl border p-4 space-y-3 ${
+                      isDark ? 'bg-[#17171F] border-zinc-800' : 'bg-slate-50 border-slate-200'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-violet-400">
+                      <UserCheck className="w-3.5 h-3.5" />
+                      Owner &amp; Cost Center Custody History ({asset.ownerHistory?.length ?? 0})
+                    </div>
+                    <div className="space-y-2.5">
+                      {(asset.ownerHistory ?? []).map((oh) => (
+                        <div
+                          key={oh.id}
+                          className={`rounded-xl border p-3 space-y-1 ${
+                            isDark ? 'bg-[#111116] border-zinc-800' : 'bg-white border-slate-200'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-bold">{oh.owner}</span>
+                            <span className="font-mono text-[10px] text-emerald-400">{oh.date}</span>
+                          </div>
+                          <div className="text-[11px] text-zinc-400">
+                            {oh.department} · <span className="font-mono text-amber-400">{oh.costCenter}</span>
+                          </div>
+                          <p className="text-[11px] text-zinc-400">{oh.note}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                </div>
+              </div>
+            );
+          })()}
 
           {activeSubTab === 'history' && !isAssetMode && room && (
             <div className="space-y-4">

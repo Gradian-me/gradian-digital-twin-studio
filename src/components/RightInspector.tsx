@@ -18,6 +18,7 @@ import {
   Focus,
   History,
   Info,
+  Lightbulb,
   Link2,
   Lock,
   PaintBucket,
@@ -47,6 +48,7 @@ import { METRIC_PRESETS } from '../types/telemetry';
 import { MiniSparkline } from './TelemetryDashboard';
 import { SchemaVisualizerD3 } from './SchemaVisualizerD3';
 import { EntityRisksSection } from './RiskFmeaCenter';
+import { LightingDesignerPanel } from './LightingDesignerPanel';
 import {
   AHU_CATALOG,
   AIRFLOW_MODES,
@@ -201,7 +203,7 @@ export const RightInspector: React.FC = () => {
   };
 
   const [assetSubTab, setAssetSubTab] = useState<'general' | 'spatial' | 'ops' | 'iot' | 'docs'>('general');
-  const [openRoomSection, setOpenRoomSection] = useState<'specs' | 'hvac' | 'sensors' | 'fmea'>('specs');
+  const [openRoomSection, setOpenRoomSection] = useState<'specs' | 'hvac' | 'lighting' | 'sensors' | 'fmea'>('specs');
   const [openAssetSection, setOpenAssetSection] = useState<'specs' | 'gmp' | 'fmea'>('specs');
   const [aiInput, setAiInput] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
@@ -844,6 +846,31 @@ export const RightInspector: React.FC = () => {
                             />
                           </label>
                         </fieldset>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* SECTION 2B: Room Lighting & Wall Switch Designer */}
+                  <div className="rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#14141A] overflow-hidden">
+                    <button
+                      type="button"
+                      onClick={() => setOpenRoomSection('lighting')}
+                      className="w-full px-3 py-2 flex items-center justify-between gap-2 text-left hover:bg-zinc-100/70 dark:hover:bg-zinc-800/40 cursor-pointer"
+                    >
+                      <span className="flex items-center gap-1.5 font-semibold text-[11.5px] text-zinc-800 dark:text-zinc-100">
+                        {openRoomSection === 'lighting' ? (
+                          <ChevronDown className="w-3.5 h-3.5 text-amber-500" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5 text-zinc-400" />
+                        )}
+                        <Lightbulb className="w-3.5 h-3.5 text-amber-500" />
+                        Lighting &amp; Wall Switches
+                      </span>
+                      <span className="font-mono text-[10px] text-amber-500">Day / Night</span>
+                    </button>
+                    {openRoomSection === 'lighting' && (
+                      <div className="p-2.5 border-t border-zinc-200/70 dark:border-zinc-800">
+                        <LightingDesignerPanel fixedRoomId={selRoom.id} compact />
                       </div>
                     )}
                   </div>

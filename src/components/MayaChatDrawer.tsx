@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   BarChart3,
   BookOpen,
+  Bot,
   Box,
   Check,
   CheckSquare,
@@ -17,9 +18,11 @@ import {
   Grid2X2,
   Info,
   Layers,
+  List,
   Loader2,
   MapPin,
   MessageSquarePlus,
+  Mic,
   Play,
   RefreshCw,
   Send,
@@ -33,13 +36,21 @@ import {
   X,
 } from 'lucide-react';
 import { useTwinStore } from '../store/useTwinStore';
+import { useMayaStore, type MayaDrawerMessage } from '../store/useMayaStore';
 import { useTelemetryStore } from '../store/useTelemetryStore';
 import { evaluateProductionLine, useGmpStore } from '../store/useGmpStore';
 import { getTargetFmeaSummary, useRiskIncidentStore } from '../store/useRiskIncidentStore';
+import { useMayaTranscribe } from '../hooks/useMayaTranscribe';
 import { OBJECT_LIBRARY } from '../data/objectLibrary';
 import { DEFAULT_MATERIALS } from '../data/materialsLibrary';
 import { fetchApiJson } from '../utils/safeJson';
 import type { ProposedAIAction } from '../types/twin';
+import {
+  EmbeddedMarkdownChart,
+  RichMarkdownRenderer,
+  type EmbeddedChartType,
+  type MarkdownEntityTarget,
+} from './RichMarkdownRenderer';
 
 interface MayaChartDatum {
   label: string;
@@ -83,7 +94,7 @@ interface MayaMessage {
   retryPrompt?: string;
 }
 
-type TemplateCategoryId = 'gmp' | 'fmea' | 'assets' | 'rooms';
+type TemplateCategoryId = 'gmp' | 'fmea' | 'assets' | 'rooms' | 'charts';
 
 interface MayaPromptTemplate {
   title: string;
@@ -224,6 +235,36 @@ const MAYA_TEMPLATE_GROUPS: {
       },
     ],
   },
+  {
+    id: 'charts',
+    label: 'Charts',
+    templates: [
+      {
+        title: 'Energy & Asset Load (Pie + Bar)',
+        summary: 'Distribution pie chart & bar comparison with GFM summary table',
+        prompt:
+          'Analyze our facility power consumption (kW) across equipment and rooms. Render a Markdown GFM comparison table, a `chart:pie` distribution chart by category, and a `chart:bar` comparison of the top energy-consuming assets.',
+      },
+      {
+        title: 'Telemetry & HVAC Trends (Line + Area)',
+        summary: 'Multi-series trend lines & area envelopes with target limits',
+        prompt:
+          'Generate a telemetry & cleanroom HVAC trend analysis including a `chart:line` temperature/pressure trend with target limits, a `chart:area` 24h ACH airflow envelope, and a structured Markdown parameter table.',
+      },
+      {
+        title: 'Compliance Target vs Actual (Target)',
+        summary: 'KPI target attainment bars & threshold benchmark line',
+        prompt:
+          'Evaluate room GMP readiness, calibration compliance, and condition scores against 95% targets using a `chart:target` Target vs Actual chart and a clean Markdown table with 3D jump links.',
+      },
+      {
+        title: 'Full Executive Facility Report',
+        summary: 'Complete report with Table, Line, Bar, Pie & Target charts',
+        prompt:
+          'Produce an executive facility analytics report in Markdown combining a GFM comparison table, a `chart:line` performance trend, a `chart:target` KPI attainment chart, and a `chart:pie` asset/energy share breakdown.',
+      },
+    ],
+  },
 ];
 
 const QUICK_DESIGN_PROMPTS = [
@@ -233,199 +274,61 @@ const QUICK_DESIGN_PROMPTS = [
   MAYA_TEMPLATE_GROUPS[3].templates[1].prompt,
 ];
 
-/**
- * Safe, zero-HTML-injection Markdown renderer supporting headings, bold, inline code
- * (with automatic 1-click 3D navigation when an inline code matches a room/asset/floor code),
- * bullet/numbered lists, and Markdown tables.
- */
-function renderInlineTokens(
-  text: string,
-  resolveCodeTarget?: (token: string) => CreatedOrLinkedEntity | null,
-  onJumpEntity?: (ent: CreatedOrLinkedEntity) => void
-): React.ReactNode[] {
-  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
-  return parts.map((part, idx) => {
-    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
-      return (
-        <strong key={idx} className="font-semibold text-zinc-900 dark:text-white">
-          {part.slice(2, -2)}
-        </strong>
-      );
-    }
-    if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
-      const token = part.slice(1, -1).trim();
-      const matchedTarget = resolveCodeTarget ? resolveCodeTarget(token) : null;
-      if (matchedTarget && onJumpEntity) {
-        return (
-          <button
-            key={idx}
-            type="button"
-            onClick={() => onJumpEntity(matchedTarget)}
-            title={`Fly to ${matchedTarget.code} · ${matchedTarget.name} in 3D`}
-            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-violet-500/15 hover:bg-violet-600 text-violet-700 dark:text-violet-300 hover:text-white font-mono text-[11px] font-semibold transition-colors cursor-pointer align-baseline"
-          >
-            <span>{token}</span>
-            <Compass className="w-2.5 h-2.5 shrink-0 opacity-80" />
-          </button>
-        );
-      }
-      return (
-        <code
-          key={idx}
-          className="px-1.5 py-0.5 rounded-md bg-violet-500/15 text-violet-700 dark:text-violet-300 font-mono text-[11px]"
-        >
-          {token}
-        </code>
-      );
-    }
-    return <React.Fragment key={idx}>{part}</React.Fragment>;
-  });
-}
-
 const RichMarkdownBlock: React.FC<{
   markdown: string;
   resolveCodeTarget?: (token: string) => CreatedOrLinkedEntity | null;
   onJumpEntity?: (ent: CreatedOrLinkedEntity) => void;
 }> = ({ markdown, resolveCodeTarget, onJumpEntity }) => {
-  const lines = markdown.replace(/\r\n/g, '\n').split('\n');
-  const blocks: React.ReactNode[] = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i].trim();
-    if (!line) {
-      i++;
-      continue;
-    }
-
-    // Markdown Table block
-    if (line.startsWith('|') && line.endsWith('|')) {
-      const tableLines: string[] = [];
-      while (i < lines.length && lines[i].trim().startsWith('|')) {
-        tableLines.push(lines[i].trim());
-        i++;
+  const isDark =
+    typeof document !== 'undefined' ? document.documentElement.classList.contains('dark') : true;
+  return (
+    <RichMarkdownRenderer
+      markdown={markdown}
+      isDark={isDark}
+      compact
+      resolveCodeTarget={
+        resolveCodeTarget
+          ? (token) => {
+              const found = resolveCodeTarget(token);
+              if (!found) return null;
+              return {
+                type:
+                  found.type === 'room' ||
+                  found.type === 'asset' ||
+                  found.type === 'floor' ||
+                  found.type === 'building'
+                    ? found.type
+                    : 'asset',
+                id: found.id,
+                code: found.code,
+                name: found.name,
+                reason: found.reason,
+              } as MarkdownEntityTarget;
+            }
+          : undefined
       }
-      const rows = tableLines
-        .filter((l) => !/^\|[\s:-]+\|$/.test(l.replace(/\|/g, '|').replace(/\s/g, '')))
-        .map((l) =>
-          l
-            .slice(1, -1)
-            .split('|')
-            .map((cell) => cell.trim())
-        );
-
-      if (rows.length > 0) {
-        const [header, ...body] = rows;
-        blocks.push(
-          <div
-            key={`tbl-${i}`}
-            className="my-2.5 overflow-x-auto rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#0D0D11]"
-          >
-            <table className="w-full text-left border-collapse text-[11.5px]">
-              <thead>
-                <tr className="border-b border-zinc-200 dark:border-zinc-800 bg-zinc-100/80 dark:bg-[#15151C]">
-                  {header.map((cell, ci) => (
-                    <th key={ci} className="px-3 py-2 font-semibold text-zinc-700 dark:text-zinc-200 whitespace-nowrap">
-                      {renderInlineTokens(cell, resolveCodeTarget, onJumpEntity)}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-zinc-200/70 dark:divide-zinc-800/70">
-                {body.map((row, ri) => (
-                  <tr key={ri} className="hover:bg-violet-500/5">
-                    {row.map((cell, ci) => (
-                      <td key={ci} className="px-3 py-1.5 text-zinc-600 dark:text-zinc-300 font-mono tabular-nums">
-                        {renderInlineTokens(cell, resolveCodeTarget, onJumpEntity)}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        );
+      onJumpEntity={
+        onJumpEntity && resolveCodeTarget
+          ? (ent) => {
+              const full = resolveCodeTarget(ent.code);
+              if (full) onJumpEntity(full);
+            }
+          : undefined
       }
-      continue;
-    }
-
-    // Headings
-    if (line.startsWith('### ')) {
-      blocks.push(
-        <h4 key={`h3-${i}`} className="text-xs font-bold text-violet-600 dark:text-violet-300 mt-3 mb-1">
-          {renderInlineTokens(line.slice(4), resolveCodeTarget, onJumpEntity)}
-        </h4>
-      );
-      i++;
-      continue;
-    }
-    if (line.startsWith('## ') || line.startsWith('# ')) {
-      const content = line.replace(/^#+\s+/, '');
-      blocks.push(
-        <h3 key={`h2-${i}`} className="text-sm font-bold text-zinc-900 dark:text-white mt-3 mb-1.5">
-          {renderInlineTokens(content, resolveCodeTarget, onJumpEntity)}
-        </h3>
-      );
-      i++;
-      continue;
-    }
-
-    // Bullet list
-    if (/^[-*•]\s+/.test(line)) {
-      const items: string[] = [];
-      while (i < lines.length && /^[-*•]\s+/.test(lines[i].trim())) {
-        items.push(lines[i].trim().replace(/^[-*•]\s+/, ''));
-        i++;
-      }
-      blocks.push(
-        <ul key={`ul-${i}`} className="my-1.5 space-y-1 pl-4 list-disc marker:text-violet-500">
-          {items.map((it, idx) => (
-            <li key={idx} className="text-xs leading-relaxed text-zinc-700 dark:text-zinc-300">
-              {renderInlineTokens(it, resolveCodeTarget, onJumpEntity)}
-            </li>
-          ))}
-        </ul>
-      );
-      continue;
-    }
-
-    // Numbered list
-    if (/^\d+\.\s+/.test(line)) {
-      const items: string[] = [];
-      while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
-        items.push(lines[i].trim().replace(/^\d+\.\s+/, ''));
-        i++;
-      }
-      blocks.push(
-        <ol key={`ol-${i}`} className="my-1.5 space-y-1 pl-4 list-decimal marker:text-amber-500 marker:font-mono">
-          {items.map((it, idx) => (
-            <li key={idx} className="text-xs leading-relaxed text-zinc-700 dark:text-zinc-300">
-              {renderInlineTokens(it, resolveCodeTarget, onJumpEntity)}
-            </li>
-          ))}
-        </ol>
-      );
-      continue;
-    }
-
-    // Paragraph
-    blocks.push(
-      <p key={`p-${i}`} className="text-xs leading-relaxed text-zinc-700 dark:text-zinc-300 my-1.5">
-        {renderInlineTokens(line, resolveCodeTarget, onJumpEntity)}
-      </p>
-    );
-    i++;
-  }
-
-  return <div className="space-y-0.5">{blocks}</div>;
+    />
+  );
 };
 
 /**
- * Embedded Interactive SVG Visual Chart inside Maya's chat messages
+ * Embedded Interactive Recharts Visual Chart inside Maya's chat messages
+ * Supports: pie, bar, line, area, target, composed, and kpi summary grids.
  */
 const InlineMayaChart: React.FC<{ chart: MayaChartSpec }> = ({ chart }) => {
-  const data = Array.isArray(chart.data) ? chart.data.slice(0, 8) : [];
+  const data = Array.isArray(chart.data) ? chart.data.slice(0, 12) : [];
   if (data.length === 0) return null;
+
+  const isDark =
+    typeof document !== 'undefined' ? document.documentElement.classList.contains('dark') : true;
 
   if (chart.kind === 'kpi') {
     return (
@@ -457,90 +360,36 @@ const InlineMayaChart: React.FC<{ chart: MayaChartSpec }> = ({ chart }) => {
     );
   }
 
-  if (chart.kind === 'line' && data.length >= 2) {
-    const W = 400;
-    const H = 128;
-    const padX = 24;
-    const padY = 16;
-    const vals = data.map((d) => Number(d.value) || 0);
-    const minV = Math.min(...vals);
-    const maxV = Math.max(...vals);
-    const span = Math.max(0.01, maxV - minV);
+  const normalizedKind: EmbeddedChartType =
+    chart.kind === 'pie' ||
+    chart.kind === 'line' ||
+    chart.kind === 'area' ||
+    chart.kind === 'target' ||
+    chart.kind === 'composed' ||
+    chart.kind === 'bar'
+      ? chart.kind
+      : data.some((d) => typeof d.target === 'number')
+      ? 'target'
+      : 'bar';
 
-    const pts = data.map((d, idx) => {
-      const x = padX + (idx / Math.max(1, data.length - 1)) * (W - padX * 2);
-      const y = H - padY - ((Number(d.value) - minV) / span) * (H - padY * 2);
-      return { ...d, x, y };
-    });
-    const pathD = pts.map((p, idx) => `${idx === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
-    const areaD = `${pathD} L${pts[pts.length - 1].x.toFixed(1)},${(H - padY).toFixed(1)} L${pts[0].x.toFixed(1)},${(H - padY).toFixed(1)} Z`;
-
-    return (
-      <div className="my-2.5 p-3.5 rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#0D0D11] space-y-2">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-1.5 text-xs font-semibold text-zinc-900 dark:text-white">
-            <BarChart3 className="w-3.5 h-3.5 text-violet-500" />
-            <span>{chart.title}</span>
-          </div>
-          {chart.unit && <span className="text-[10px] font-mono text-amber-500">{chart.unit}</span>}
-        </div>
-        <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-32">
-          <defs>
-            <linearGradient id={`maya-line-${chart.title.replace(/\W/g, '')}`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#8B5CF6" stopOpacity="0.32" />
-              <stop offset="100%" stopColor="#F59E0B" stopOpacity="0.02" />
-            </linearGradient>
-          </defs>
-          <path d={areaD} fill={`url(#maya-line-${chart.title.replace(/\W/g, '')})`} />
-          <path d={pathD} fill="none" stroke="#8B5CF6" strokeWidth={2.2} strokeLinejoin="round" />
-          {pts.map((p, idx) => (
-            <g key={idx}>
-              <circle cx={p.x} cy={p.y} r={3.5} fill="#F59E0B" stroke="#0D0D11" strokeWidth={1.5} />
-              <text x={p.x} y={H - 2} textAnchor="middle" className="fill-zinc-500 font-mono text-[8.5px]">
-                {p.label.slice(0, 8)}
-              </text>
-            </g>
-          ))}
-        </svg>
-      </div>
-    );
-  }
-
-  // Default: Modern Rounded Horizontal Bar Chart
-  const maxVal = Math.max(1, ...data.map((d) => Math.abs(Number(d.value) || 0)));
   return (
-    <div className="my-2.5 p-3.5 rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#0D0D11] space-y-2.5">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-1.5 text-xs font-semibold text-zinc-900 dark:text-white">
-          <BarChart3 className="w-3.5 h-3.5 text-violet-500" />
-          <span>{chart.title}</span>
-        </div>
-        {chart.subtitle && <span className="text-[10.5px] text-zinc-500">{chart.subtitle}</span>}
-      </div>
-      <div className="space-y-2">
-        {data.map((d, idx) => {
-          const pct = Math.max(6, Math.min(100, (Math.abs(Number(d.value) || 0) / maxVal) * 100));
-          const fill = CHART_COLORS[d.color || ''] ?? (idx % 2 === 0 ? '#8B5CF6' : '#F59E0B');
-          return (
-            <div key={idx} className="space-y-1">
-              <div className="flex items-center justify-between text-[11px]">
-                <span className="text-zinc-700 dark:text-zinc-300 truncate pr-2">{d.label}</span>
-                <span className="font-mono tabular-nums font-semibold text-zinc-900 dark:text-white shrink-0">
-                  {Number(d.value).toLocaleString(undefined, { maximumFractionDigits: 1 })}
-                  {chart.unit ? ` ${chart.unit}` : ''}
-                </span>
-              </div>
-              <div className="h-2 w-full rounded-full bg-zinc-200 dark:bg-zinc-800 overflow-hidden">
-                <div
-                  className="h-full rounded-full transition-all duration-500"
-                  style={{ width: `${pct}%`, backgroundColor: fill }}
-                />
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
+    <EmbeddedMarkdownChart
+      isDark={isDark}
+      spec={{
+        type: normalizedKind,
+        title: chart.title,
+        subtitle: chart.subtitle,
+        unit: chart.unit,
+        xKey: 'label',
+        series: [{ key: 'value', label: chart.unit ? `Value (${chart.unit})` : 'Value' }],
+        data: data.map((d) => ({
+          label: d.label,
+          value: Number(d.value) || 0,
+          ...(typeof d.target === 'number' ? { target: d.target } : {}),
+          ...(d.color ? { color: d.color } : {}),
+        })),
+      }}
+    />
   );
 };
 
@@ -571,22 +420,37 @@ export const MayaChatDrawer: React.FC = () => {
   const riskIncidents = useRiskIncidentStore((s) => s.incidents);
   const openRiskModal = useRiskIncidentStore((s) => s.openRiskModal);
 
+  const drawerThreads = useMayaStore((s) => s.drawerThreads);
+  const activeDrawerThreadId = useMayaStore((s) => s.activeDrawerThreadId);
+  const createDrawerThread = useMayaStore((s) => s.createDrawerThread);
+  const selectDrawerThread = useMayaStore((s) => s.selectDrawerThread);
+  const deleteDrawerThread = useMayaStore((s) => s.deleteDrawerThread);
+  const renameDrawerThread = useMayaStore((s) => s.renameDrawerThread);
+  const appendDrawerMessage = useMayaStore((s) => s.appendDrawerMessage);
+  const updateDrawerMessage = useMayaStore((s) => s.updateDrawerMessage);
+  const clearActiveDrawerThread = useMayaStore((s) => s.clearActiveDrawerThread);
+
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [showTemplatesTray, setShowTemplatesTray] = useState(true);
+  const [showThreadsPanel, setShowThreadsPanel] = useState(false);
   const [activeTemplateCategory, setActiveTemplateCategory] = useState<TemplateCategoryId>('gmp');
   const [selectedActionIndicesByMsg, setSelectedActionIndicesByMsg] = useState<Record<string, number[]>>({});
   const [commentByMsg, setCommentByMsg] = useState<Record<string, string>>({});
-  const [messages, setMessages] = useState<MayaMessage[]>([
-    {
-      id: 'maya-welcome',
-      role: 'assistant',
-      highlightTitle: 'Maya · GMP, FMEA & 3D Digital Twin Copilot',
-      content:
-        'Hi! I am **Maya**, your AI Spatial Architect & GMP Quality Copilot.\n\nChoose a **GMP, FMEA, Asset, or Room** template below — or ask anything in natural language. Every room code, asset tag, and risk target I cite is directly clickable to **fly straight to its exact 3D location** on the digital twin.',
-      followUpSuggestions: QUICK_DESIGN_PROMPTS.slice(0, 3),
+
+  const transcribe = useMayaTranscribe({
+    onTranscript: (text) => {
+      setInput((prev) => (prev.trim() ? `${prev.trim()} ${text}` : text));
+      showToast('Voice transcribed with Gemini 3.5 Transcribe', 'success');
     },
-  ]);
+    onError: (msg) => showToast(msg, 'error'),
+  });
+
+  const activeThread = useMemo(
+    () => drawerThreads.find((t) => t.id === activeDrawerThreadId) ?? drawerThreads[0],
+    [drawerThreads, activeDrawerThreadId]
+  );
+  const messages = (activeThread?.messages ?? []) as MayaMessage[];
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -858,6 +722,30 @@ export const MayaChatDrawer: React.FC = () => {
     return { facilitySummary, telemetrySummary };
   };
 
+  const generateAsyncDrawerTitle = async (
+    threadId: string,
+    firstUserMessage: string,
+    firstAssistantReply?: string
+  ) => {
+    try {
+      const res = await fetch('/api/maya/generate-title', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          firstUserMessage,
+          firstAssistantReply: firstAssistantReply?.slice(0, 320),
+        }),
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data?.title && typeof data.title === 'string') {
+        renameDrawerThread(threadId, data.title, true);
+      }
+    } catch {
+      // Non-blocking fallback
+    }
+  };
+
   const sendMessage = async (textOverride?: string) => {
     const prompt = (textOverride ?? input).trim();
     if (!prompt || loading) return;
@@ -865,13 +753,19 @@ export const MayaChatDrawer: React.FC = () => {
     if (!textOverride) setInput('');
     setShowTemplatesTray(false);
 
-    const userMsg: MayaMessage = {
+    const targetThreadId = useMayaStore.getState().activeDrawerThreadId;
+    const targetThreadObj = useMayaStore
+      .getState()
+      .drawerThreads.find((t) => t.id === targetThreadId);
+    const shouldGenerateTitle = Boolean(targetThreadObj && !targetThreadObj.titleGenerated);
+
+    const userMsg: MayaDrawerMessage = {
       id: `u-${Date.now()}`,
       role: 'user',
       content: prompt,
     };
     const nextHistory = [...messages, userMsg];
-    setMessages(nextHistory);
+    appendDrawerMessage(userMsg, targetThreadId);
     setLoading(true);
 
     try {
@@ -906,21 +800,25 @@ export const MayaChatDrawer: React.FC = () => {
             }))
         : [];
 
-      const assistantMsg: MayaMessage = {
+      const assistantContent = data.markdown || data.explanation || 'Analysis ready.';
+      const assistantMsg: MayaDrawerMessage = {
         id: `a-${Date.now()}`,
         role: 'assistant',
         highlightTitle: data.highlightTitle,
-        content: data.markdown || data.explanation || 'Analysis ready.',
+        content: assistantContent,
         charts: Array.isArray(data.charts) ? data.charts : [],
         proposedActions: Array.isArray(data.proposedActions) ? data.proposedActions : [],
         navigationTargets: rawNavTargets,
         followUpSuggestions: Array.isArray(data.followUpSuggestions) ? data.followUpSuggestions : [],
         modelUsed: data.modelUsed,
       };
-      setMessages((prev) => [...prev, assistantMsg]);
+      appendDrawerMessage(assistantMsg, targetThreadId);
+
+      if (shouldGenerateTitle) {
+        void generateAsyncDrawerTitle(targetThreadId, prompt, assistantContent);
+      }
     } catch (err: any) {
-      setMessages((prev) => [
-        ...prev,
+      appendDrawerMessage(
         {
           id: `err-${Date.now()}`,
           role: 'assistant',
@@ -928,7 +826,8 @@ export const MayaChatDrawer: React.FC = () => {
           error: true,
           retryPrompt: prompt,
         },
-      ]);
+        targetThreadId
+      );
     } finally {
       setLoading(false);
     }
@@ -1259,19 +1158,13 @@ export const MayaChatDrawer: React.FC = () => {
     }
 
     const totalApplied = spatialActions.length + gmpAppliedCount;
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === msgId
-          ? {
-              ...m,
-              applied: true,
-              appliedCount: totalApplied,
-              appliedComment: customComment || m.appliedComment,
-              createdEntities: createdOrTouched.length > 0 ? createdOrTouched : m.createdEntities,
-            }
-          : m
-      )
-    );
+    updateDrawerMessage(msgId, (m) => ({
+      ...m,
+      applied: true,
+      appliedCount: totalApplied,
+      appliedComment: customComment || m.appliedComment,
+      createdEntities: createdOrTouched.length > 0 ? createdOrTouched : m.createdEntities,
+    }));
     if (spatialActions.length > 0) {
       showToast(
         `Maya applied ${totalApplied} selected change${totalApplied > 1 ? 's' : ''} to your digital twin`,
@@ -1313,58 +1206,137 @@ export const MayaChatDrawer: React.FC = () => {
             </div>
 
             <div className="min-w-0">
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5">
                 <h2 className="text-sm font-bold text-zinc-900 dark:text-white truncate">
-                  Maya AI Map Studio
+                  {activeThread?.title || 'Maya AI Map Studio'}
                 </h2>
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-violet-500/15 text-violet-600 dark:text-violet-300 shrink-0">
-                  Live Designer
-                </span>
               </div>
               <p className="text-[11px] text-zinc-500 dark:text-zinc-400 truncate">
+                {drawerThreads.length} chat{drawerThreads.length === 1 ? '' : 's'} ·{' '}
                 {activeFloor ? `${activeFloor.code} · ${activeFloor.name}` : scene.name}
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-1.5 shrink-0">
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={() => setShowThreadsPanel((v) => !v)}
+              className={`flex items-center gap-1 px-2 py-1.5 rounded-xl border text-[11px] font-semibold transition-colors cursor-pointer ${
+                showThreadsPanel
+                  ? 'bg-violet-600 border-violet-500 text-white'
+                  : 'border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#1C1C25] text-zinc-700 dark:text-zinc-200 hover:border-violet-500'
+              }`}
+              title={`Toggle Dedicated Chat List (${drawerThreads.length})`}
+            >
+              <List className="w-3.5 h-3.5" />
+              <span className="font-mono text-[10px]">{drawerThreads.length}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                createDrawerThread();
+                setShowThreadsPanel(false);
+                setShowTemplatesTray(true);
+              }}
+              className="p-1.5 rounded-xl bg-violet-600 hover:bg-violet-500 text-white transition-colors cursor-pointer"
+              title="New Dedicated Chat Thread"
+            >
+              <MessageSquarePlus className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={() => {
+                setShowMayaChat(false);
+                setScreen('maya-life');
+              }}
+              className="flex items-center gap-1 px-2 py-1.5 rounded-xl border border-violet-500/40 bg-violet-500/12 hover:bg-violet-500/20 text-[11px] font-semibold text-violet-700 dark:text-violet-300 transition-colors cursor-pointer"
+              title="Open dedicated MAYA Life 3D Companion & SOP Studio"
+            >
+              <Bot className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Life</span>
+            </button>
             {screen === 'workspace' && viewMode !== 'split' && (
               <button
                 onClick={() => setViewMode('split')}
-                className="hidden sm:flex items-center gap-1 px-2.5 py-1.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#1C1C25] hover:border-violet-500 text-[11px] font-medium text-zinc-700 dark:text-zinc-200 transition-colors"
+                className="hidden sm:flex items-center gap-1 p-1.5 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#1C1C25] hover:border-violet-500 text-zinc-700 dark:text-zinc-200 transition-colors cursor-pointer"
                 title="Show 2D & 3D Split Map beside Maya"
               >
                 <Columns2 className="w-3.5 h-3.5 text-amber-500" />
-                <span>Split Map</span>
               </button>
             )}
             <button
-              onClick={() =>
-                setMessages([
-                  {
-                    id: `reset-${Date.now()}`,
-                    role: 'assistant',
-                    highlightTitle: 'New Design Session Started',
-                    content:
-                      'Canvas context refreshed. Ask me to **add rooms**, **arrange equipment**, **optimize cleanroom pressure**, or **visualize telemetry trends**.',
-                    followUpSuggestions: QUICK_DESIGN_PROMPTS.slice(0, 3),
-                  },
-                ])
-              }
-              className="p-2 rounded-xl text-zinc-400 hover:text-zinc-900 dark:hover:text-white hover:bg-zinc-200/70 dark:hover:bg-zinc-800 transition-colors"
-              title="Clear Chat History"
+              onClick={clearActiveDrawerThread}
+              className="p-1.5 rounded-xl text-zinc-400 hover:text-zinc-900 dark:hover:text-white hover:bg-zinc-200/70 dark:hover:bg-zinc-800 transition-colors cursor-pointer"
+              title="Reset Current Thread"
             >
               <Trash2 className="w-3.5 h-3.5" />
             </button>
             <button
               onClick={() => setShowMayaChat(false)}
-              className="p-2 rounded-xl text-zinc-400 hover:text-zinc-900 dark:hover:text-white hover:bg-zinc-200/70 dark:hover:bg-zinc-800 transition-colors"
+              className="p-1.5 rounded-xl text-zinc-400 hover:text-zinc-900 dark:hover:text-white hover:bg-zinc-200/70 dark:hover:bg-zinc-800 transition-colors cursor-pointer"
               title="Close Maya Chat"
             >
               <X className="w-4 h-4" />
             </button>
           </div>
         </header>
+
+        {/* Dedicated Chat Threads List Drawer */}
+        {showThreadsPanel && (
+          <div className="px-3 py-2.5 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#14141C] space-y-1.5 max-h-52 overflow-y-auto shrink-0">
+            <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider text-zinc-500 px-1">
+              <span>Dedicated Conversations (Auto AI Titles)</span>
+              <button
+                type="button"
+                onClick={() => {
+                  createDrawerThread();
+                  setShowThreadsPanel(false);
+                }}
+                className="text-violet-500 hover:underline font-bold cursor-pointer"
+              >
+                + New Chat
+              </button>
+            </div>
+            {drawerThreads.map((th) => {
+              const isAct = th.id === activeDrawerThreadId;
+              return (
+                <div
+                  key={th.id}
+                  onClick={() => {
+                    selectDrawerThread(th.id);
+                    setShowThreadsPanel(false);
+                  }}
+                  className={`flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl border transition cursor-pointer ${
+                    isAct
+                      ? 'bg-violet-600/15 border-violet-500/60 text-zinc-900 dark:text-white'
+                      : 'bg-white dark:bg-[#1A1A24] border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300 hover:border-violet-500/40'
+                  }`}
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-semibold truncate">{th.title}</div>
+                    <div className="text-[10px] text-zinc-400 font-mono tabular-nums">
+                      {th.messages.length} msgs ·{' '}
+                      {new Date(th.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </div>
+                  </div>
+                  {drawerThreads.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteDrawerThread(th.id);
+                      }}
+                      className="p-1 rounded-lg text-zinc-400 hover:text-rose-500 hover:bg-rose-500/10 cursor-pointer shrink-0"
+                      title="Delete Chat Thread"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
 
         {/* Scrollable Conversation Thread */}
         <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 space-y-4">
@@ -1864,9 +1836,100 @@ export const MayaChatDrawer: React.FC = () => {
           )}
         </div>
 
-        {/* Modern Rounded Chat Composer */}
-        <footer className="p-3.5 border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#15151C] shrink-0">
+        {/* Modern Rounded Chat Composer with Voice Transcription */}
+        <footer className="p-3.5 border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#15151C] shrink-0 space-y-2">
+          {(transcribe.isRecording || transcribe.isTranscribing) && (
+            <div className="px-3 py-1.5 rounded-xl border border-violet-500/35 bg-violet-500/10 flex items-center justify-between gap-2 text-xs">
+              <div className="flex items-center gap-2 min-w-0">
+                {transcribe.isTranscribing ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500 shrink-0" />
+                    <span className="text-[11px] font-medium text-violet-700 dark:text-violet-300 truncate">
+                      Transcribing audio (gemini-3.5-transcribe)...
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <span className="w-2 h-2 rounded-full bg-rose-500 shrink-0" />
+                    <span className="font-mono text-[11px] font-semibold text-rose-600 dark:text-rose-400 tabular-nums">
+                      {String(Math.floor(transcribe.durationSec / 60)).padStart(2, '0')}:
+                      {String(transcribe.durationSec % 60).padStart(2, '0')}
+                    </span>
+                    <div className="flex items-end gap-0.5 h-3.5">
+                      {[0.35, 0.75, 1, 0.6, 0.35].map((w, idx) => (
+                        <span
+                          key={idx}
+                          className="w-1 rounded-full bg-violet-500 transition-all duration-75"
+                          style={{
+                            height: `${Math.max(25, Math.min(100, Math.round((0.2 + transcribe.audioLevel * w) * 100)))}%`,
+                          }}
+                        />
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {transcribe.isRecording && (
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    type="button"
+                    onClick={transcribe.cancelRecording}
+                    className="p-1 rounded-lg text-zinc-500 hover:text-zinc-900 dark:hover:text-white cursor-pointer"
+                    title="Cancel recording"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => transcribe.stopAndTranscribe()}
+                    className="px-2 py-1 rounded-lg bg-zinc-200 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200 text-[10.5px] font-semibold cursor-pointer"
+                  >
+                    Insert
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      transcribe.stopAndTranscribe((text) => {
+                        const merged = input.trim() ? `${input.trim()} ${text}` : text;
+                        sendMessage(merged);
+                      })
+                    }
+                    className="px-2.5 py-1 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-[10.5px] font-semibold cursor-pointer"
+                  >
+                    Send
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           <div className="rounded-2xl bg-white dark:bg-[#0D0D12] border border-zinc-200 dark:border-zinc-800 focus-within:border-violet-500 transition-colors p-2 flex items-end gap-2">
+            <button
+              type="button"
+              disabled={loading || transcribe.isTranscribing}
+              onClick={() =>
+                transcribe.isRecording ? transcribe.stopAndTranscribe() : transcribe.startRecording()
+              }
+              className={`p-2.5 rounded-xl border transition-colors shrink-0 cursor-pointer disabled:opacity-40 ${
+                transcribe.isRecording
+                  ? 'bg-rose-600 border-rose-500 text-white'
+                  : 'bg-zinc-50 dark:bg-[#171720] border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:border-violet-500 hover:text-violet-500'
+              }`}
+              title={
+                transcribe.isRecording
+                  ? 'Stop & Transcribe Voice'
+                  : 'Voice Input (Gemini 3.5 Transcribe)'
+              }
+            >
+              {transcribe.isTranscribing ? (
+                <Loader2 className="w-4 h-4 animate-spin text-violet-500" />
+              ) : transcribe.isRecording ? (
+                <Square className="w-4 h-4 fill-current" />
+              ) : (
+                <Mic className="w-4 h-4" />
+              )}
+            </button>
             <textarea
               ref={inputRef}
               rows={2}
@@ -1878,20 +1941,24 @@ export const MayaChatDrawer: React.FC = () => {
                   sendMessage();
                 }
               }}
-              placeholder="Ask Maya about GMP eligibility, FMEA risks, HVAC, rooms, or equipment..."
+              placeholder={
+                transcribe.isRecording
+                  ? 'Listening to your voice... click Insert or Send'
+                  : 'Ask Maya or tap Mic to dictate GMP, FMEA, HVAC, or room queries...'
+              }
               className="flex-1 bg-transparent px-2 py-1 text-xs text-zinc-900 dark:text-zinc-100 placeholder:text-zinc-400 resize-none focus:outline-none max-h-28"
             />
             <button
               onClick={() => sendMessage()}
               disabled={loading || !input.trim()}
-              className="p-2.5 rounded-xl bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-white transition-colors shrink-0"
+              className="p-2.5 rounded-xl bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-white transition-colors shrink-0 cursor-pointer"
               title="Send to Maya (Enter)"
             >
               <Send className="w-4 h-4" />
             </button>
           </div>
-          <div className="mt-2 flex items-center justify-between text-[10.5px] text-zinc-500 px-1">
-            <span>Enter to send · Click any cited code to fly in 3D</span>
+          <div className="flex items-center justify-between text-[10.5px] text-zinc-500 px-1">
+            <span>Enter to send · Tap Mic for Gemini 3.5 Transcribe</span>
             <span>All map edits support 1-click Undo</span>
           </div>
         </footer>

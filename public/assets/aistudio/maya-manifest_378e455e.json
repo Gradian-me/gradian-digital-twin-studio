@@ -1,0 +1,227 @@
+{
+  "version": "3.0.0",
+  "states": {
+    "idle": {
+      "duration": 8,
+      "playback": "loop",
+      "expression": "neutral"
+    },
+    "working": {
+      "duration": 3,
+      "playback": "loop",
+      "expression": "neutral"
+    },
+    "thinking": {
+      "duration": 4,
+      "playback": "loop",
+      "expression": "thinking"
+    },
+    "searching": {
+      "duration": 3.2,
+      "playback": "loop",
+      "expression": "curious"
+    },
+    "approval": {
+      "duration": 2.6,
+      "playback": "loop",
+      "expression": "approval"
+    },
+    "question": {
+      "duration": 3.6,
+      "playback": "loop",
+      "expression": "curious"
+    },
+    "error": {
+      "duration": 2.5,
+      "playback": "loop",
+      "expression": "error"
+    },
+    "finished": {
+      "duration": 2.2,
+      "playback": "once",
+      "expression": "finished"
+    },
+    "ratelimit": {
+      "duration": 4,
+      "playback": "loop",
+      "expression": "concerned"
+    },
+    "sleeping": {
+      "duration": 7,
+      "playback": "loop",
+      "expression": "sleeping"
+    },
+    "dizzy": {
+      "duration": 3,
+      "playback": "loop",
+      "expression": "dizzy"
+    },
+    "chat": {
+      "duration": 3,
+      "playback": "loop",
+      "expression": "happy"
+    },
+    "wave": {
+      "duration": 2.8,
+      "playback": "once",
+      "expression": "happy"
+    },
+    "analyze": {
+      "duration": 4,
+      "playback": "loop",
+      "expression": "thinking"
+    },
+    "present": {
+      "duration": 3.6,
+      "playback": "loop",
+      "expression": "confident"
+    },
+    "create": {
+      "duration": 3.4,
+      "playback": "loop",
+      "expression": "joyful"
+    },
+    "organize": {
+      "duration": 4,
+      "playback": "loop",
+      "expression": "neutral"
+    },
+    "teach": {
+      "duration": 3.4,
+      "playback": "loop",
+      "expression": "confident"
+    },
+    "support": {
+      "duration": 3.2,
+      "playback": "loop",
+      "expression": "happy"
+    },
+    "celebrate": {
+      "duration": 2.6,
+      "playback": "once",
+      "expression": "joyful"
+    },
+    "laptop": {
+      "duration": 3.5,
+      "playback": "loop",
+      "expression": "neutral"
+    }
+  },
+  "expressions": [
+    "neutral",
+    "happy",
+    "joyful",
+    "wink",
+    "surprised",
+    "thinking",
+    "curious",
+    "confident",
+    "love",
+    "proud",
+    "concerned",
+    "confused",
+    "annoyed",
+    "tired",
+    "sleeping",
+    "dizzy",
+    "error",
+    "finished",
+    "approval",
+    "searching",
+    "yawn"
+  ],
+  "atlas": {
+    "columns": 5,
+    "rows": 5,
+    "tileOrder": [
+      "neutral",
+      "happy",
+      "joyful",
+      "wink",
+      "surprised",
+      "thinking",
+      "curious",
+      "confident",
+      "love",
+      "proud",
+      "concerned",
+      "confused",
+      "annoyed",
+      "tired",
+      "sleeping",
+      "dizzy",
+      "error",
+      "finished",
+      "approval",
+      "searching",
+      "yawn",
+      "blink"
+    ],
+    "node": "FaceAtlas"
+  },
+  "iconAtlas": {
+    "columns": 4,
+    "rows": 4,
+    "tileOrder": [
+      "dots",
+      "question",
+      "alert",
+      "check",
+      "heart",
+      "stars",
+      "sleep",
+      "search",
+      "clock",
+      "spiral",
+      "thumb",
+      "idea",
+      "anger",
+      "confetti",
+      "exclaim"
+    ],
+    "node": "StatusIconAtlas",
+    "pivot": "StatusIcon"
+  },
+  "stateIcons": {
+    "working": "dots",
+    "chat": "dots",
+    "question": "question",
+    "searching": "search",
+    "approval": "thumb",
+    "error": "alert",
+    "finished": "check",
+    "ratelimit": "clock",
+    "sleeping": "sleep",
+    "dizzy": "spiral",
+    "create": "idea",
+    "celebrate": "confetti"
+  },
+  "expressionIcons": {
+    "love": "heart",
+    "proud": "stars",
+    "surprised": "exclaim",
+    "confused": "spiral",
+    "annoyed": "anger",
+    "sleeping": "sleep",
+    "dizzy": "spiral",
+    "error": "alert",
+    "finished": "check",
+    "approval": "thumb",
+    "searching": "search",
+    "curious": "question",
+    "yawn": "sleep",
+    "joyful": "stars"
+  },
+  "logo": "Original provided artwork resized, not redrawn",
+  "defaultState": "idle",
+  "defaultExpression": "neutral",
+  "fileBytes": 315276,
+  "triangleInstances": 12346,
+  "headAtlasPixels": [
+    3200,
+    1920
+  ],
+  "defaultPreviewHeightFraction": 0.53,
+  "recommendedBodyCrossfadeSeconds": 0.52,
+  "recommendedExpressionCrossfadeSeconds": 0.18
+}

@@ -166,10 +166,76 @@ export interface EnvironmentalSpecs {
   hvac?: RoomHvacConfig;
 }
 
+export interface RoomFireSensor {
+  id: string;
+  tag: string;
+  type: 'Optical Smoke' | 'Thermal Rate-of-Rise' | 'VESDA Aspirating' | 'UV/IR Flame';
+  zone: string;
+  status: 'normal' | 'test-due' | 'fault';
+  lastTested: string;
+  nextTestDue: string;
+  sensitivity: string;
+}
+
+export interface RoomFireExtinguisher {
+  id: string;
+  tag: string;
+  agent: 'CO2 (Carbon Dioxide)' | 'FM-200 Clean Agent' | 'ABC Dry Powder' | 'Water Mist';
+  capacityKg: number;
+  classRating: string;
+  pressureStatus: 'green-nominal' | 'recharge-due';
+  locationHint: string;
+  lastInspection: string;
+  nextInspection: string;
+}
+
+export interface RoomFireSafetyConfig {
+  sensors: RoomFireSensor[];
+  extinguishers: RoomFireExtinguisher[];
+}
+
+export type LightFixtureType =
+  | 'led-troffer'
+  | 'linear-vapor'
+  | 'recessed-downlight'
+  | 'high-bay'
+  | 'emergency-bulkhead'
+  | 'uv-c-sterilizer';
+
+export interface RoomLightSwitch {
+  id: string;
+  label: string;
+  wallSide: 'north' | 'south' | 'east' | 'west';
+  offsetRatio: number; // 0.08..0.92 along chosen wall
+  heightM: number; // default ~1.25m
+  isOn: boolean;
+  dimmerPct?: number; // 10..100
+}
+
+export interface RoomLightFixture {
+  id: string;
+  label: string;
+  type: LightFixtureType;
+  switchId: string;
+  relX: number; // 0.1..0.9 across room width
+  relZ: number; // 0.1..0.9 across room depth
+  kelvin: number; // e.g., 3000..6500
+  intensity: number; // 0.3..2.5
+}
+
+export interface RoomLightingConfig {
+  switches: RoomLightSwitch[];
+  fixtures: RoomLightFixture[];
+}
+
 export interface Room {
   id: string;
   floorId: string;
   departmentId: string;
+  owner?: string;
+  costCenter?: string;
+  fireSafety?: RoomFireSafetyConfig;
+  lighting?: RoomLightingConfig;
   name: string;
   code: string;
   spaceTypeId: string;

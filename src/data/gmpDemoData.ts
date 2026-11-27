@@ -638,14 +638,38 @@ Standardizes **Clean-in-Place (CIP)**, **Steam-in-Place (SIP)**, and **pH / Diss
 | pH 2-Point Cal | pH 4.01 & pH 7.00 | Slope 95–103% | \`AT-PH-01\` |
 | DO Probe Slope | 0% N2 / 100% Air | Drift < ±1.5% / 24h | \`AT-DO-01\` |
 
-## 3. Pre-Operation Verification Checklist
-- Confirm valid calibration sticker & digital QR record on vessel skid.
-- Verify rupture disc integrity and sterile vent filter **WIT (Water Intrusion Test)** pass certificate.
-- Inspect mechanical seal condensate trap and bottom diaphragm harvest valve torque.
-- Record batch-ready sign-off in Electronic Batch Record (EBR) per **21 CFR Part 11**.
+## 3. SIP Sterilization Thermal Profile
+\`\`\`chart:line
+{
+  "title": "Bioreactor SIP Thermal Hold Curve",
+  "subtitle": "Vessel Core vs Jacket Setpoint (45-min Validation Cycle)",
+  "unit": "°C",
+  "xKey": "minute",
+  "target": 121.5,
+  "targetLabel": "SIP Min 121.5 °C",
+  "series": [
+    { "key": "coreTemp", "label": "Core Temp", "color": "#8B5CF6" },
+    { "key": "jacketTemp", "label": "Jacket Temp", "color": "#06B6D4" }
+  ],
+  "data": [
+    { "minute": "0m", "coreTemp": 65.0, "jacketTemp": 71.5 },
+    { "minute": "10m", "coreTemp": 103.4, "jacketTemp": 112.0 },
+    { "minute": "20m", "coreTemp": 121.8, "jacketTemp": 124.2 },
+    { "minute": "30m", "coreTemp": 122.4, "jacketTemp": 124.5 },
+    { "minute": "40m", "coreTemp": 122.1, "jacketTemp": 123.9 },
+    { "minute": "45m", "coreTemp": 96.8, "jacketTemp": 90.2 }
+  ]
+}
+\`\`\`
 
-## 4. Safety & Gowning
-> Wear Class C sterile garments, face shield, and thermal gloves during live steam header isolation. Never open sample ports when vessel gauge pressure exceeds **0.05 bar(g)**.`,
+## 4. Pre-Operation Verification Checklist
+- [x] Confirm valid calibration sticker & digital QR record on vessel skid.
+- [x] Verify rupture disc integrity and sterile vent filter **WIT (Water Intrusion Test)** pass certificate.
+- [ ] Inspect mechanical seal condensate trap and bottom diaphragm harvest valve torque.
+- [ ] Record batch-ready sign-off in Electronic Batch Record (EBR) per **21 CFR Part 11**.
+
+## 5. Safety & Gowning
+> [!WARNING] Wear Class C sterile garments, face shield, and thermal gloves during live steam header isolation. Never open sample ports when vessel gauge pressure exceeds **0.05 bar(g)**.`,
   },
   {
     id: 'sop-chrom-oq',
@@ -756,7 +780,47 @@ Ensures Grade A aseptic vial filling accuracy and freeze-dryer shelf thermal uni
 | Grade C / ISO 7 | 352,000 / m³ | +15 to +20 Pa | ≥ 20 ACH |
 | Grade D / ISO 8 | 3,520,000 / m³ | +5 to +10 Pa | ≥ 12 ACH |
 
-## 2. HEPA DOP / PAO Leak Test
+## 2. Cleanroom Airflow Target vs Actual & 24h Trend
+\`\`\`chart:target
+{
+  "title": "Cleanroom Air Changes per Hour (ACH) vs Annex 1 Target",
+  "subtitle": "Measured Supply Airflow across Qualified Suites",
+  "unit": "ACH",
+  "xKey": "suite",
+  "series": [{ "key": "actual", "label": "Measured ACH" }],
+  "data": [
+    { "suite": "A0-103 Grade B", "actual": 46, "target": 40 },
+    { "suite": "A0-101 Grade C", "actual": 26, "target": 20 },
+    { "suite": "B0-102 Grade C", "actual": 22, "target": 20 },
+    { "suite": "A1-201 Grade D", "actual": 15, "target": 12 }
+  ]
+}
+\`\`\`
+
+\`\`\`chart:area
+{
+  "title": "24-Hour Differential Pressure Cascade Stability",
+  "subtitle": "Continuous EMS Trend (Pa)",
+  "unit": "Pa",
+  "xKey": "hour",
+  "target": 30,
+  "targetLabel": "Grade B Min +30 Pa",
+  "series": [
+    { "key": "gradeA", "label": "Grade A Core", "color": "#06B6D4" },
+    { "key": "gradeB", "label": "Grade B Fill", "color": "#10B981" },
+    { "key": "gradeC", "label": "Grade C Upstream", "color": "#8B5CF6" }
+  ],
+  "data": [
+    { "hour": "00:00", "gradeA": 44, "gradeB": 33, "gradeC": 18 },
+    { "hour": "06:00", "gradeA": 45, "gradeB": 34, "gradeC": 19 },
+    { "hour": "12:00", "gradeA": 43, "gradeB": 32, "gradeC": 17 },
+    { "hour": "18:00", "gradeA": 45, "gradeB": 34, "gradeC": 19 },
+    { "hour": "24:00", "gradeA": 44, "gradeB": 33, "gradeC": 18 }
+  ]
+}
+\`\`\`
+
+## 3. HEPA DOP / PAO Leak Test
 - Aerosol challenge upstream concentration **20–80 µg/L**; downstream scan penetration must not exceed **0.01%** at any point.`,
   },
   {
@@ -781,7 +845,43 @@ Governs physical rack layout, VLAN segmentation (OT SCADA VLAN 110 vs Corporate)
 - Maintain rack inlet cold-aisle temperature between **18.0 °C and 24.0 °C** (RH 40–55%).
 - Never exceed **70% rated kW capacity** on any single PDU bus (A or B) to preserve N+1 failover headroom.
 - Label every fiber/copper patch cord at both ends using **Micro-QR / DataMatrix** tags matching the 42U Rack Designer port matrix.
-- Verify nightly encrypted PostgreSQL & Historian snapshot replication with SHA-256 checksum verification.`,
+- Verify nightly encrypted PostgreSQL & Historian snapshot replication with SHA-256 checksum verification.
+
+## 3. Rack Power Load & Network Capacity Mix
+\`\`\`chart:bar
+{
+  "title": "42U Rack Redundant Bus A vs Bus B Load",
+  "unit": "kW",
+  "xKey": "rack",
+  "target": 12,
+  "targetLabel": "70% N+1 Limit",
+  "series": [
+    { "key": "busA", "label": "PDU Bus A", "color": "#06B6D4" },
+    { "key": "busB", "label": "PDU Bus B", "color": "#8B5CF6" }
+  ],
+  "data": [
+    { "rack": "DC-R01", "busA": 9.4, "busB": 9.1 },
+    { "rack": "DC-R02", "busA": 8.2, "busB": 8.0 },
+    { "rack": "NET-R01", "busA": 5.1, "busB": 4.9 },
+    { "rack": "IDF-A0", "busA": 3.4, "busB": 3.3 }
+  ]
+}
+\`\`\`
+
+\`\`\`chart:pie
+{
+  "title": "Data Center Port Allocation by VLAN Segment",
+  "unit": "%",
+  "xKey": "vlan",
+  "series": [{ "key": "pct", "label": "Port Share" }],
+  "data": [
+    { "vlan": "OT SCADA (VLAN 10)", "pct": 38, "color": "#06B6D4" },
+    { "vlan": "GMP BMS/EMS (VLAN 20)", "pct": 29, "color": "#10B981" },
+    { "vlan": "Storage & Backup (VLAN 40)", "pct": 21, "color": "#8B5CF6" },
+    { "vlan": "DMZ & Mgmt (VLAN 99)", "pct": 12, "color": "#F59E0B" }
+  ]
+}
+\`\`\``,
   },
   {
     id: 'sop-wh-cold',
@@ -830,6 +930,288 @@ Governs physical rack layout, VLAN segmentation (OT SCADA VLAN 110 vs Corporate)
 - Document 5-Why / Fishbone root cause and verify corrective action effectiveness prior to QA release.`,
   },
 ];
+
+const ARCHETYPE_SOP_SPECS: Record<
+  string,
+  {
+    prefix: string;
+    actionType: SopDocument['actionType'];
+    ppe: string;
+    cpps: [string, string, string][];
+    steps: string[];
+    alarms: string[];
+    pmInterval: string;
+  }
+> = {
+  'bioreactor-ss': {
+    prefix: 'USP',
+    actionType: 'Operation',
+    ppe: 'Grade C cleanroom suit, sterile nitrile gloves, safety visor, thermal sleeves during SIP',
+    cpps: [
+      ['Culture Temperature', '37.0 ± 0.2 °C', 'Jacket PID loop'],
+      ['Dissolved Oxygen (DO)', '40.0 ± 3.0 %', 'O2 sparger cascade'],
+      ['pH Setpoint', '7.05 ± 0.05', 'CO2 / 1M NaOH'],
+      ['Agitation Speed', '95–140 RPM', 'Magnetic drive'],
+    ],
+    steps: [
+      'Verify SIP sterilization cycle F0 ≥ 15.0 min and sterile vent filter WIT pass certificate.',
+      'Perform 2-point pH buffer calibration (4.01 / 7.00) and 100% air-saturated DO probe span.',
+      'Charge sterile basal media through pre-steamed transfer manifold under +0.2 bar(g) overlay.',
+      'Inoculate seed train via aseptic Weld-Connect transfer and initiate SCADA batch recipe.',
+      'Record hourly IPC samples (VCD, viability, glucose, lactate) in Electronic Batch Record.',
+    ],
+    alarms: [
+      'High Pressure (> 0.6 bar(g)): Verify exhaust heater & vent filter condensate drain immediately.',
+      'DO Drop (< 15%): Check mass flow controller O2 supply pressure and sparger backpressure.',
+    ],
+    pmInterval: 'Quarterly mechanical seal inspection & annual hydrostatic / rupture disc certification.',
+  },
+  'bioreactor-su': {
+    prefix: 'USP',
+    actionType: 'Operation',
+    ppe: 'Grade C gowning, double sterile gloves, safety glasses',
+    cpps: [
+      ['Bag Pressure Integrity', '0.15 bar hold (< 0.005 bar/5m)', 'Pre-fill leak test'],
+      ['Temperature Control', '37.0 ± 0.3 °C', 'Electric heating blanket'],
+      ['DO / pH Optical Sensor', 'Pre-gamma calibrated patch', 'Optical reader'],
+    ],
+    steps: [
+      'Inspect single-use bioprocess film bag lot CoA, gamma irradiation dot, and sterile connectors.',
+      'Install bag smoothly into stainless jacket shell ensuring bottom impeller hub locks cleanly.',
+      'Execute automated pre-use pressure decay integrity test prior to media fill.',
+      'Connect sterile optical pH/DO fibers, load-cell zero tare, and exhaust filter heater sleeve.',
+      'Start perfusion/fed-batch profile and confirm active SCADA alarm routing.',
+    ],
+    alarms: [
+      'Leak Test Fail: Quarantine bag lot, do not charge media, open QA Deviation SOP-QA-099.',
+      'Load Cell Drift: Verify tubing strain relief and re-zero only prior to inoculation.',
+    ],
+    pmInterval: 'Semi-annual load cell linearity calibration & annual heating jacket thermal mapping.',
+  },
+  'chrom-skid': {
+    prefix: 'DSP',
+    actionType: 'Operation',
+    ppe: 'Grade C cleanroom apparel, chemical splash goggles, nitrile gloves',
+    cpps: [
+      ['Linear Flow Velocity', '150–300 cm/h (±2%)', 'Coriolis mass flowmeter'],
+      ['Pre-Column Pressure', '≤ 2.8 bar(g)', 'PT-01 high-pressure interlock'],
+      ['UV-280 nm Peak Cut', '0.15–2.50 AU', 'Dual-wavelength UV cell'],
+      ['Elution Buffer pH', '3.50 ± 0.05', 'Inline pH/conductivity'],
+    ],
+    steps: [
+      'Verify column packing HETP/Asymmetry qualification certificate and resin sanitization status.',
+      'Prime A/B buffer pumps, purge air trap, and zero UV-280 nm & conductivity baselines.',
+      'Equilibrate column with 5 CV Equilibration Buffer until outlet pH and conductivity stabilize.',
+      'Load clarified harvest at validated residence time while monitoring ΔP across column.',
+      'Execute wash, low-pH elution peak collection, CIP (0.1M NaOH), and 20% ethanol storage.',
+    ],
+    alarms: [
+      'High ΔP Alarm (> 2.5 bar): Ramp down pump automatically; inspect inline 0.2µm guard filter.',
+      'Air Sensor Triggered: Pause load step, vent bubble trap, verify feed vessel level.',
+    ],
+    pmInterval: 'Quarterly pump head seal check, semi-annual UV filter check, annual OQ/PQ.',
+  },
+  'tff-skid': {
+    prefix: 'DSP',
+    actionType: 'Operation',
+    ppe: 'Grade C cleanroom apparel, splash goggles, chemical-resistant gloves',
+    cpps: [
+      ['Transmembrane Pressure (TMP)', '0.8–1.4 bar', 'Retentate control valve'],
+      ['Crossflow Flux', '4–6 L/min·m²', 'Recirculation lobe pump'],
+      ['Normalized Water Perm (NWP)', '≥ 80% of initial', 'Post-CIP membrane check'],
+    ],
+    steps: [
+      'Torque cassette holder evenly to manufacturer spec and flush storage preservative with WFI.',
+      'Measure pre-use Normalized Water Permeability (NWP) and confirm membrane integrity test.',
+      'Equilibrate cassettes with formulation buffer and transfer bulk intermediate to retentate tank.',
+      'Execute concentration (UF) and 7-diavolume constant-volume diafiltration (DF).',
+      'Recover product pool with minimal hold-up flush and perform validated caustic CIP.',
+    ],
+    alarms: [
+      'Feed Pressure > 3.5 bar: Check retentate proportional valve position and membrane fouling.',
+    ],
+    pmInterval: 'Semi-annual pressure transmitter calibration and peristaltic/lobe pump rebuild.',
+  },
+  'lyophilizer': {
+    prefix: 'ASEP',
+    actionType: 'Operation',
+    ppe: 'Grade B/C aseptic garmenting, cryogenic thermal gloves for unloading',
+    cpps: [
+      ['Shelf Freezing Ramp', '-45.0 ± 1.5 °C', 'Silicone oil heat exchanger'],
+      ['Condenser Temperature', '≤ -65.0 °C', 'Cascade refrigeration'],
+      ['Chamber Vacuum', '80–120 µbar', 'Capacitance manometer'],
+      ['Chamber Leak Rate', '≤ 0.02 mbar·L/s', 'Pre-batch integrity test'],
+    ],
+    steps: [
+      'Confirm completed SIP cycle, chamber leak-rate pass, and sterile vent filter integrity.',
+      'Load partially stoppered vials via Grade A LAF transfer cart onto pre-cooled shelves (+5 °C).',
+      'Initiate validated freeze-drying recipe (Freezing → Primary Drying → Secondary Drying).',
+      'Confirm Pirani-to-Capacitance Manometer convergence indicating primary drying endpoint.',
+      'Backfill with sterile dry N2 to 750 mbar, hydraulically stopper vials, and unload to crimper.',
+    ],
+    alarms: [
+      'Vacuum Excursion (> 200 µbar): Switch to backup vacuum pump; alert QA for batch impact.',
+      'Condenser Temp Rise (> -55 °C): Inspect refrigeration compressor oil & suction pressure.',
+    ],
+    pmInterval: 'Monthly vacuum pump oil change, semi-annual shelf temperature mapping & vacuum cal.',
+  },
+  'filling-line': {
+    prefix: 'ASEP',
+    actionType: 'Operation',
+    ppe: 'Grade A/B sterile barrier gowning, sterile double gloves, isolator gauntlets',
+    cpps: [
+      ['LAF Air Velocity', '0.45 m/s ± 20%', 'Unidirectional Grade A'],
+      ['Fill Weight Accuracy', 'Target ± 1.5%', '100% IPC checkweigher'],
+      ['Isolator ΔP vs Grade C', '+35 to +45 Pa', 'Continuous EMS'],
+      ['VHP Decontamination', '6-log Geobacillus kill', 'Pre-campaign BI cycle'],
+    ],
+    steps: [
+      'Complete VHP bio-decontamination cycle and confirm H2O2 aeration < 1.0 ppm.',
+      'Perform isolator glove leak tests and install pre-sterilized peristaltic fill path & needles.',
+      'Execute 10-vial start-up fill weight verification and stopper placement check.',
+      'Run aseptic filling campaign with continuous ≥ 0.5µm / 5.0µm viable & non-viable monitoring.',
+      'Perform post-use sterilizing filter bubble-point integrity test prior to batch disposition.',
+    ],
+    alarms: [
+      'Isolator Door / Glove Interlock Open: Line stops immediately; initiate sterile intervention SOP.',
+      'Particle Count Alert (≥ 0.5µm): Pause fill, investigate air disturbance, notify QA.',
+    ],
+    pmInterval: 'Monthly servo/peristaltic dosing calibration, semi-annual smoke study & HEPA DOP scan.',
+  },
+  'ahu-unit': {
+    prefix: 'FAC',
+    actionType: 'Maintenance',
+    ppe: 'Safety glasses, cut-resistant gloves, dust respirator during pre-filter swap',
+    cpps: [
+      ['Supply Airflow', 'Design ACH ± 10%', 'VFD supply fan'],
+      ['Supply Temp / RH', '19.5 °C / 45% RH', 'Chilled water & steam coil'],
+      ['HEPA Final ΔP', '120–350 Pa', 'Differential pressure switch'],
+    ],
+    steps: [
+      'Verify BMS telemetry for supply/return VFD frequencies, coil valves, and damper feedback.',
+      'Inspect G4 pre-filter, F9 bag filter, and H14 terminal HEPA differential pressure gauges.',
+      'Verify condensate drain pan cleanliness, belt tension, and fan bearing vibration levels.',
+      'Confirm room pressure cascade remains strictly positive from Grade A → B → C → D → CNC.',
+    ],
+    alarms: [
+      'High HEPA ΔP (> 380 Pa): Schedule H14 filter replacement and post-install PAO leak scan.',
+      'Supply Fan Fault: Verify redundant standby fan auto-cutover and maintain cleanroom pressure.',
+    ],
+    pmInterval: 'Quarterly pre-filter change, semi-annual coil sanitization & annual HEPA integrity scan.',
+  },
+  'server-rack': {
+    prefix: 'IT',
+    actionType: 'Operation',
+    ppe: 'ESD wrist strap, insulated footwear, ear protection in hot aisles',
+    cpps: [
+      ['Cold Aisle Inlet Temp', '18.0–24.0 °C', 'ASHRAE TC 9.9 Class A1'],
+      ['Relative Humidity', '40–55% RH', 'Non-condensing'],
+      ['Dual PDU Bus Load', '≤ 70% per A/B bus', 'N+1 failover margin'],
+    ],
+    steps: [
+      'Authenticate badge & biometric access; verify rack change ticket in CMDB / ITIL log.',
+      'Confirm dual PDU feeds (Bus A & Bus B) and UPS battery health before hardware service.',
+      'Trace physical fiber/copper patch cords against 42U Rack Designer port matrix and Micro-QR tags.',
+      'Verify VLAN isolation (OT SCADA VLAN-10 vs Corporate VLAN-30) and redundant trunk link up.',
+      'Update asset inventory and close rack doors to preserve cold/hot aisle containment.',
+    ],
+    alarms: [
+      'Rack Inlet > 27 °C: Check CRAC/In-Row chiller setpoint and blanking panel integrity.',
+      'Link Down / Redundancy Loss: Inspect SFP+ optical power levels and failover path.',
+    ],
+    pmInterval: 'Monthly UPS self-test, quarterly thermal camera scan & semi-annual fiber cleaning.',
+  },
+};
+
+export function buildComprehensiveSopsForScene(scene: DigitalTwinScene): SopDocument[] {
+  const docs: SopDocument[] = [...INITIAL_SOP_DOCUMENTS];
+  const existingIds = new Set(docs.map((d) => d.id));
+  const roomById = new Map(scene.rooms.map((r) => [r.id, r]));
+
+  scene.assets.forEach((asset, idx) => {
+    const sopId = `sop-asset-${asset.id}`;
+    if (existingIds.has(sopId)) return;
+    existingIds.add(sopId);
+
+    const spec =
+      ARCHETYPE_SOP_SPECS[asset.archetype] ??
+      (asset.category === 'IT & Data Center'
+        ? ARCHETYPE_SOP_SPECS['server-rack']
+        : asset.category === 'HVAC & Utilities'
+          ? ARCHETYPE_SOP_SPECS['ahu-unit']
+          : {
+              prefix: 'OPS',
+              actionType: 'Operation' as const,
+              ppe: 'Cleanroom/lab gowning, safety glasses, nitrile gloves',
+              cpps: [
+                ['Operating Power Load', `${asset.energyKw} kW nominal (±10%)`, 'Facility power meter'],
+                ['Utilization Target', `${asset.utilizationPct}% nominal`, 'MES / BMS monitor'],
+                ['Condition Threshold', '≥ 80% reliability index', 'Predictive telemetry'],
+              ] as [string, string, string][],
+              steps: [
+                `Verify calibration sticker, QR tag (${asset.assetId}), and active qualification status before start.`,
+                `Inspect utility connections, electrical interlocks, and surrounding clearance (${asset.width}m × ${asset.depth}m footprint).`,
+                `Confirm environmental conditions inside assigned room meet GMP/operational specification.`,
+                `Start ${asset.name} following validated recipe/checklist and monitor live telemetry sensors.`,
+                `Log run completion, sanitization status, and any anomalies in the Digital Twin audit trail.`,
+              ],
+              alarms: [
+                `Telemetry Excursion: Place ${asset.assetId} into safe hold and notify supervisor / QA immediately.`,
+                `Emergency Stop Active: Isolate utility supply before troubleshooting; log CAPA if batch impacted.`,
+              ],
+              pmInterval: 'Quarterly preventive inspection & annual calibration/qualification verification.',
+            });
+
+    const room = asset.roomId ? roomById.get(asset.roomId) : undefined;
+    const roomLabel = room ? `${room.code} — ${room.name} (${room.environmental.cleanroomGrade})` : 'Facility Floor';
+    const docNum = `SOP-${spec.prefix}-${String(101 + idx).padStart(3, '0')}`;
+    const cppRows = spec.cpps
+      .map(([p, lim, ctrl]) => `| ${p} | ${lim} | ${ctrl} |`)
+      .join('\n');
+    const stepsMd = spec.steps.map((s, i) => `${i + 1}. ${s}`).join('\n');
+    const alarmsMd = spec.alarms.map((a) => `- **${a.split(':')[0]}**: ${a.split(':').slice(1).join(':').trim()}`).join('\n');
+
+    docs.push({
+      id: sopId,
+      docNumber: docNum,
+      title: `${asset.assetId} · ${asset.name} Standard Operating & Safety SOP`,
+      docType: 'SOP',
+      equipmentCategory: asset.category,
+      archetypes: [asset.archetype],
+      actionType: spec.actionType,
+      version: '2.0',
+      effectiveDate: '2026-01-10',
+      reviewDueDate: '2028-01-10',
+      author: asset.owner || 'GMP Engineering & QA',
+      status: 'effective',
+      markdown: `# ${docNum} · ${asset.name} (\`${asset.assetId}\`)
+
+## 1. Purpose, Location & Scope
+Governs safe startup, GMP operation, alarm response, and preventive maintenance for **${asset.name}** (Tag \`${asset.assetId}\`, Model: ${asset.manufacturer} ${asset.model}) located in **${roomLabel}**.
+
+- **Equipment Category**: ${asset.category} · Criticality: **${asset.criticality.toUpperCase()}**
+- **Rated Power**: ${asset.energyKw} kW · Dimensions: ${asset.width}m × ${asset.depth}m × ${asset.height}m
+- **Required PPE & Gowning**: ${spec.ppe}
+
+## 2. Critical Process Parameters & Limits
+| Parameter | Operating Target / Limit | Control / Verification |
+| --- | --- | --- |
+${cppRows}
+
+## 3. Step-by-Step Operating Procedure
+${stepsMd}
+
+## 4. Alarm, Deviation & Emergency Response
+${alarmsMd}
+
+## 5. Preventive Maintenance & References
+- **PM & Calibration Cadence**: ${spec.pmInterval}
+- **Cross-References**: \`SOP-QA-099\` (Out-of-Calibration Deviation), 21 CFR Part 11 Electronic Records, EU GMP Annex 1.`,
+    });
+  });
+
+  return docs;
+}
 
 export const INITIAL_WIKI_ARTICLES: WikiArticle[] = [
   {

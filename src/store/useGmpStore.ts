@@ -23,6 +23,7 @@ import type {
 import type { DigitalTwinScene, EquipmentCategory } from '../types/twin';
 import {
   addDaysToIso,
+  buildComprehensiveSopsForScene,
   buildDefaultComplianceForAsset,
   buildSeedCronJobs,
   buildSeedProductionLines,
@@ -684,8 +685,18 @@ export const useGmpStore = create<GmpState>((set, get) => {
     workOrders,
     cronJobs,
     personnel: personnelList,
-    sops:
-      persisted?.sops && persisted.sops.length > 0 ? persisted.sops : INITIAL_SOP_DOCUMENTS,
+    sops: (() => {
+      const generated = buildComprehensiveSopsForScene(initialScene);
+      const base = persisted?.sops && persisted.sops.length > 0 ? [...persisted.sops] : [];
+      const seen = new Set(base.map((d) => d.id));
+      generated.forEach((doc) => {
+        if (!seen.has(doc.id)) {
+          base.push(doc);
+          seen.add(doc.id);
+        }
+      });
+      return base;
+    })(),
     wikiArticles:
       persisted?.wikiArticles && persisted.wikiArticles.length > 0
         ? persisted.wikiArticles
@@ -723,9 +734,19 @@ export const useGmpStore = create<GmpState>((set, get) => {
           changed = true;
         }
       });
+      const generatedSops = buildComprehensiveSopsForScene(scene);
+      const seenSopIds = new Set(state.sops.map((d) => d.id));
+      const missingSops = generatedSops.filter((d) => !seenSopIds.has(d.id));
+      const nextSops = missingSops.length > 0 ? [...state.sops, ...missingSops] : state.sops;
+      if (missingSops.length > 0) changed = true;
+
       if (changed || state.initializedForProjectId !== scene.id) {
-        set({ complianceByAssetId: nextComp, initializedForProjectId: scene.id });
-        persist({ ...get(), complianceByAssetId: nextComp });
+        set({
+          complianceByAssetId: nextComp,
+          sops: nextSops,
+          initializedForProjectId: scene.id,
+        });
+        persist({ ...get(), complianceByAssetId: nextComp, sops: nextSops });
       }
     },
 

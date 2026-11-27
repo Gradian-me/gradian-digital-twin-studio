@@ -29,8 +29,9 @@ import { useTelemetryStore } from '../store/useTelemetryStore';
 import { useTwinStore } from '../store/useTwinStore';
 import { useGmpStore } from '../store/useGmpStore';
 import { AssetMini3DViewer } from './AssetMini3DViewer';
+import { PredictiveFailureCharts } from './PredictiveFailureCharts';
+import { VirtualGrid, VirtualList } from './VirtualList';
 import {
-  buildSensorForecastSeries,
   computeAssetFailurePredictions,
   type MaintenanceMilestone,
   type MaintenanceSeverity,
@@ -136,282 +137,6 @@ function severityMeta(sev: MaintenanceSeverity): { label: string; glyph: string;
   }
   return { label: 'Healthy', glyph: '●', textCls: 'text-emerald-600 dark:text-emerald-400', accentHex: '#10B981' };
 }
-
-/**
- * Predictive Degradation & Failure Horizon Chart (SVG):
- * Plots historical sensor readings (solid) and OLS projected drift trajectory (dashed)
- * intersecting the equipment alarm limit at the predicted failure date.
- */
-const PredictiveHorizonChart: React.FC<{
-  sensor: SensorDefinition;
-  snapshot?: LiveSensorSnapshot;
-  milestone: MaintenanceMilestone;
-}> = ({ sensor, snapshot, milestone }) => {
-  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
-  const series = useMemo(
-    () => buildSensorForecastSeries(sensor, snapshot, milestone),
-    [sensor, snapshot, milestone]
-  );
-
-  const W = 720;
-  const H = 224;
-  const padL = 54;
-  const padR = 24;
-  const padT = 20;
-  const padB = 30;
-  const innerW = W - padL - padR;
-  const innerH = H - padT - padB;
-
-  const { minX, maxX, yMin, yMax, mapped, histD, projD, nowX, failX } = useMemo(() => {
-    const xs = series.map((p) => p.dayOffset);
-    const ys = series.map((p) => p.value);
-    const xLo = Math.min(-14, ...xs);
-    const xHi = Math.max(7, ...xs);
-    const xSpan = Math.max(1, xHi - xLo);
-
-    const loVal = Math.min(...ys, milestone.alarmThreshold, sensor.nominal);
-    const hiVal = Math.max(...ys, milestone.alarmThreshold, sensor.nominal);
-    const padVal = Math.max(0.15, (hiVal - loVal) * 0.18);
-    const yLo = loVal - padVal;
-    const yHi = hiVal + padVal;
-    const ySpan = Math.max(0.001, yHi - yLo);
-
-    const mPts = series.map((p) => ({
-      ...p,
-      x: padL + ((p.dayOffset - xLo) / xSpan) * innerW,
-      y: padT + innerH - ((p.value - yLo) / ySpan) * innerH,
-    }));
-
-    const histPts = mPts.filter((p) => p.kind === 'history');
-    const forecastPts = mPts.filter((p) => p.kind === 'forecast');
-    const bridgeStart = histPts[histPts.length - 1];
-    const projChain = bridgeStart ? [bridgeStart, ...forecastPts] : forecastPts;
-
-    const hD = histPts.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
-    const pD = projChain.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
-
-    return {
-      minX: xLo,
-      maxX: xHi,
-      yMin: yLo,
-      yMax: yHi,
-      mapped: mPts,
-      histD: hD,
-      projD: pD,
-      nowX: padL + ((0 - xLo) / xSpan) * innerW,
-      failX: padL + ((milestone.daysUntilFailure - xLo) / xSpan) * innerW,
-    };
-  }, [series, milestone, sensor.nominal, innerW, innerH]);
-
-  const mapY = (v: number) => padT + innerH - ((v - yMin) / Math.max(0.001, yMax - yMin)) * innerH;
-  const activePt = hoverIdx !== null && mapped[hoverIdx] ? mapped[hoverIdx] : mapped[mapped.length - 1];
-  const sev = severityMeta(milestone.severity);
-  const yTicks = [0, 0.33, 0.66, 1].map((t) => yMin + (yMax - yMin) * t);
-
-  return (
-    <div className="space-y-2">
-      <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-        <div className="flex items-center gap-2 font-mono text-[11px] text-zinc-600 dark:text-zinc-300">
-          <span className="font-semibold text-violet-600 dark:text-violet-400">{sensor.tag}</span>
-          <span className="text-zinc-400">·</span>
-          <span>Solid: Sensor History</span>
-          <span className="text-zinc-400">·</span>
-          <span style={{ color: sev.accentHex }}>Dashed: OLS Failure Projection</span>
-        </div>
-        {activePt && (
-          <div className="font-mono tabular-nums text-[11px] text-zinc-600 dark:text-zinc-300">
-            <span>{activePt.dateLabel}</span>
-            <span className="mx-1.5 text-zinc-400">·</span>
-            <span className="font-semibold text-zinc-900 dark:text-white">
-              {activePt.value.toFixed(sensor.precision)} {sensor.unit}
-            </span>
-            <span className="ml-1.5 text-zinc-500">
-              ({activePt.kind === 'history' ? 'Observed' : `+${activePt.dayOffset}d Forecast`})
-            </span>
-          </div>
-        )}
-      </div>
-
-      <div className="relative w-full overflow-hidden rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#0B0B0E]">
-        <svg
-          viewBox={`0 0 ${W} ${H}`}
-          className="w-full h-[224px] block cursor-crosshair select-none"
-          onMouseLeave={() => setHoverIdx(null)}
-          onMouseMove={(e) => {
-            if (!mapped.length) return;
-            const rect = e.currentTarget.getBoundingClientRect();
-            const relX = ((e.clientX - rect.left) / rect.width) * W;
-            let best = 0;
-            let bestDist = Infinity;
-            mapped.forEach((p, idx) => {
-              const d = Math.abs(p.x - relX);
-              if (d < bestDist) {
-                bestDist = d;
-                best = idx;
-              }
-            });
-            setHoverIdx(best);
-          }}
-        >
-          {/* Horizontal Grid & Y Labels */}
-          {yTicks.map((val, i) => {
-            const y = mapY(val);
-            return (
-              <g key={i}>
-                <line
-                  x1={padL}
-                  x2={W - padR}
-                  y1={y}
-                  y2={y}
-                  stroke="currentColor"
-                  className="text-zinc-200 dark:text-zinc-800/80"
-                  strokeWidth={1}
-                />
-                <text
-                  x={padL - 8}
-                  y={y + 3.5}
-                  textAnchor="end"
-                  className="fill-zinc-500 font-mono text-[10px]"
-                >
-                  {val.toFixed(sensor.precision)}
-                </text>
-              </g>
-            );
-          })}
-
-          {/* Forecast region subtle tint */}
-          <rect
-            x={nowX}
-            y={padT}
-            width={Math.max(0, W - padR - nowX)}
-            height={innerH}
-            fill={sev.accentHex}
-            opacity={0.05}
-          />
-
-          {/* "Today" vertical divider */}
-          <line
-            x1={nowX}
-            x2={nowX}
-            y1={padT}
-            y2={padT + innerH}
-            stroke="#71717A"
-            strokeDasharray="3 3"
-            strokeWidth={1}
-          />
-          <text x={nowX + 4} y={padT + 11} className="fill-zinc-500 font-mono text-[9.5px]">
-            Today
-          </text>
-
-          {/* Horizontal Alarm Threshold */}
-          <line
-            x1={padL}
-            x2={W - padR}
-            y1={mapY(milestone.alarmThreshold)}
-            y2={mapY(milestone.alarmThreshold)}
-            stroke="#F43F5E"
-            strokeDasharray="5 4"
-            strokeWidth={1.3}
-          />
-          <text
-            x={W - padR - 4}
-            y={Math.max(padT + 11, mapY(milestone.alarmThreshold) - 4)}
-            textAnchor="end"
-            className="fill-rose-500 font-mono text-[9.5px] font-semibold"
-          >
-            Alarm Limit ({milestone.alarmThreshold} {sensor.unit})
-          </text>
-
-          {/* Predicted Failure Vertical Marker */}
-          <line
-            x1={failX}
-            x2={failX}
-            y1={padT}
-            y2={padT + innerH}
-            stroke={sev.accentHex}
-            strokeDasharray="3 3"
-            strokeWidth={1.4}
-          />
-
-          {/* Solid Historical Curve */}
-          {histD && (
-            <path
-              d={histD}
-              fill="none"
-              stroke="#8B5CF6"
-              strokeWidth={2.2}
-              strokeLinejoin="round"
-              strokeLinecap="round"
-            />
-          )}
-
-          {/* Dashed Projected Trajectory */}
-          {projD && (
-            <path
-              d={projD}
-              fill="none"
-              stroke={sev.accentHex}
-              strokeWidth={2.2}
-              strokeDasharray="6 4"
-              strokeLinejoin="round"
-              strokeLinecap="round"
-            />
-          )}
-
-          {/* Failure Intersection Diamond */}
-          <g transform={`translate(${failX}, ${mapY(milestone.alarmThreshold)})`}>
-            <polygon
-              points="0,-6 6,0 0,6 -6,0"
-              fill={sev.accentHex}
-              stroke="#FFFFFF"
-              strokeWidth={1.4}
-            />
-          </g>
-
-          {/* Hover Crosshair */}
-          {activePt && (
-            <g>
-              <line
-                x1={activePt.x}
-                x2={activePt.x}
-                y1={padT}
-                y2={padT + innerH}
-                stroke="#A1A1AA"
-                strokeWidth={1}
-                strokeDasharray="2 2"
-              />
-              <circle
-                cx={activePt.x}
-                cy={activePt.y}
-                r={4.2}
-                fill={activePt.kind === 'history' ? '#8B5CF6' : sev.accentHex}
-                stroke="#FFFFFF"
-                strokeWidth={1.5}
-              />
-            </g>
-          )}
-
-          {/* Bottom X Axis labels */}
-          <text x={padL} y={H - 8} className="fill-zinc-500 font-mono text-[9.5px]">
-            {minX}d History
-          </text>
-          <text x={nowX} y={H - 8} textAnchor="middle" className="fill-zinc-500 font-mono text-[9.5px]">
-            Now
-          </text>
-          <text
-            x={Math.min(W - padR, failX)}
-            y={H - 8}
-            textAnchor="end"
-            className="font-mono text-[9.5px] font-semibold"
-            fill={sev.accentHex}
-          >
-            Fail {milestone.predictedFailureDate} (+{maxX}d)
-          </text>
-        </svg>
-      </div>
-    </div>
-  );
-};
 
 /**
  * High-precision interactive SVG time-series trend chart with hover crosshair,
@@ -635,6 +360,7 @@ const LiveTrendChart: React.FC<{
 
 export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
   const scene = useTwinStore((s) => s.scene);
+  const theme = useTwinStore((s) => s.theme);
   const drillInto = useTwinStore((s) => s.drillInto);
   const showToast = useTwinStore((s) => s.showToast);
   const complianceByAssetId = useGmpStore((s) => s.complianceByAssetId);
@@ -1400,7 +1126,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
       <div className="flex-1 min-h-0 flex overflow-hidden">
         {/* TAB 1: FOCUSED 3D OBJECT INSPECTOR + LIVE TRENDS (NO CLUTTERED 200-ITEM SIDEBAR) */}
         {dashboardTab === 'trends' && (
-          <main className="flex-1 min-w-0 overflow-y-auto p-4 lg:p-6">
+          <main className="flex-1 min-w-0 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-4 lg:p-6">
             {activeGroup && activeSensor ? (
               <div className="max-w-[1440px] mx-auto grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
                 {/* Left 4 Columns: Focused 3D Model Viewer for THIS Single Equipment / Room */}
@@ -1790,25 +1516,25 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
           </main>
         )}
 
-        {/* TAB 2: EQUIPMENT & MAIN SENSORS MATRIX */}
+        {/* TAB 2: EQUIPMENT & MAIN SENSORS MATRIX (VIRTUALIZED WINDOWED GRID) */}
         {dashboardTab === 'equipment' && (
-          <main className="flex-1 overflow-y-auto p-4 lg:p-6 space-y-5">
-            <div className="max-w-[1440px] mx-auto space-y-5">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
+          <main className="flex-1 min-h-0 flex flex-col overflow-hidden">
+            <div className="shrink-0 px-4 lg:px-6 pt-4 pb-3 border-b border-zinc-200 dark:border-zinc-800/80 bg-zinc-50/70 dark:bg-[#0D0D12]">
+              <div className="max-w-[1440px] mx-auto flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-3 min-w-0">
                   <button
                     onClick={handleBack}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#17171F] hover:border-violet-500 text-xs font-medium"
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#17171F] hover:border-violet-500 text-xs font-medium shrink-0"
                   >
                     <ArrowLeft className="w-3.5 h-3.5 text-violet-500" />
                     Back
                   </button>
-                  <div>
-                    <h2 className="text-base font-semibold text-zinc-900 dark:text-white">
+                  <div className="min-w-0">
+                    <h2 className="text-sm sm:text-base font-semibold text-zinc-900 dark:text-white truncate">
                       Monitored Bioreactors, HPLCs, Process Skids &amp; Cleanrooms
                     </h2>
-                    <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                      Click any card to open its isolated 3D inspector &amp; multi-channel live trends
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate">
+                      {filteredGroups.length} units · Windowed virtual grid for smooth live telemetry scrolling
                     </p>
                   </div>
                 </div>
@@ -1817,9 +1543,9 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                     placeholder="Search equipment or tag..."
-                    className="h-9 px-3 rounded-xl bg-white dark:bg-[#17171F] border border-zinc-200 dark:border-zinc-800 text-xs w-56 focus:outline-none focus:border-violet-500"
+                    className="h-9 px-3 rounded-xl bg-white dark:bg-[#17171F] border border-zinc-200 dark:border-zinc-800 text-xs w-48 sm:w-56 focus:outline-none focus:border-violet-500"
                   />
-                  <div className="flex items-center gap-1 p-1 rounded-xl bg-zinc-200/70 dark:bg-[#14141A]">
+                  <div className="flex items-center gap-1 p-1 rounded-xl bg-zinc-200/70 dark:bg-[#14141A] overflow-x-auto max-w-full">
                     {(
                       [
                         { id: 'all', label: 'All' },
@@ -1832,7 +1558,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                       <button
                         key={f.id}
                         onClick={() => setCategoryFilter(f.id)}
-                        className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-colors ${
+                        className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
                           categoryFilter === f.id
                             ? 'bg-violet-600 text-white'
                             : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
@@ -1844,114 +1570,126 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                   </div>
                 </div>
               </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                {filteredGroups.map((g) => {
-                  const mainSnap = readings[g.mainSensor.id];
-                  const st = statusText(g.worstStatus);
-                  const mainColor = METRIC_PRESETS[g.mainSensor.metric]?.color ?? '#8B5CF6';
-                  const cardTabUrl = buildTelemetryTabUrl({
-                    tab: 'trends',
-                    assetId: g.targetKind === 'asset' ? g.targetId : undefined,
-                    roomId: g.targetKind === 'room' ? g.targetId : undefined,
-                    sensorId: g.mainSensor.id,
-                  });
-
-                  return (
-                    <div
-                      key={g.key}
-                      className="p-4 rounded-2xl border border-zinc-200 dark:border-zinc-800/80 bg-white dark:bg-[#121216] hover:border-violet-500/50 transition-colors flex flex-col justify-between gap-3"
-                    >
-                      <div>
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="min-w-0">
-                            <div className="text-[11px] font-mono text-violet-500">
-                              {g.code} · <span className="text-zinc-500">{g.category}</span>
-                            </div>
-                            <h3 className="text-sm font-semibold text-zinc-900 dark:text-white truncate mt-0.5">
-                              {g.name}
-                            </h3>
-                          </div>
-                          <span className={`px-2 py-0.5 rounded-lg border text-[11px] font-mono font-medium shrink-0 ${st.badgeCls}`}>
-                            {st.glyph} {st.label}
-                          </span>
-                        </div>
-
-                        <div className="mt-3 pt-3 border-t border-zinc-100 dark:border-zinc-800/80 flex items-center justify-between gap-3">
-                          <div>
-                            <div className="text-[11px] text-zinc-500 dark:text-zinc-400">
-                              Main · <span className="font-mono">{g.mainSensor.tag}</span>
-                            </div>
-                            <div className="mt-0.5 flex items-baseline gap-1.5 font-mono tabular-nums">
-                              <span className="text-2xl font-bold text-zinc-900 dark:text-white">
-                                {(mainSnap?.value ?? g.mainSensor.nominal).toFixed(g.mainSensor.precision)}
-                              </span>
-                              <span className="text-xs text-zinc-400">{g.mainSensor.unit}</span>
-                            </div>
-                          </div>
-                          <MiniSparkline points={mainSnap?.history ?? []} color={mainColor} width={96} height={30} />
-                        </div>
-
-                        {g.sensors.length > 1 && (
-                          <div className="mt-3 pt-2.5 border-t border-zinc-100 dark:border-zinc-800/80 space-y-1.5">
-                            {g.sensors
-                              .filter((s) => s.id !== g.mainSensor.id)
-                              .slice(0, 3)
-                              .map((s) => {
-                                const snap = readings[s.id];
-                                const sSt = statusText(snap?.status ?? 'nominal');
-                                return (
-                                  <div key={s.id} className="flex items-center justify-between text-xs">
-                                    <span className="text-zinc-500 dark:text-zinc-400 truncate pr-2">
-                                      {s.name.split('·').pop()?.trim() || s.name}
-                                    </span>
-                                    <span className="font-mono tabular-nums text-zinc-800 dark:text-zinc-200 shrink-0">
-                                      {(snap?.value ?? s.nominal).toFixed(s.precision)} {s.unit}{' '}
-                                      <span className={sSt.cls}>{sSt.glyph}</span>
-                                    </span>
-                                  </div>
-                                );
-                              })}
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="pt-2.5 border-t border-zinc-100 dark:border-zinc-800/80 flex items-center justify-between gap-2">
-                        <button
-                          onClick={() => {
-                            setDashboardFocus({
-                              assetId: g.targetKind === 'asset' ? g.targetId : null,
-                              roomId: g.targetKind === 'room' ? g.targetId : null,
-                              sensorId: g.mainSensor.id,
-                            });
-                            navigateToTab('trends');
-                          }}
-                          className="text-xs font-semibold text-violet-600 dark:text-violet-400 hover:underline flex items-center gap-1"
-                        >
-                          Inspect 3D &amp; Trends
-                          <ChevronRight className="w-3.5 h-3.5" />
-                        </button>
-                        <a
-                          href={cardTabUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-white"
-                        >
-                          <ExternalLink className="w-3 h-3" />
-                          New Tab
-                        </a>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
             </div>
+
+            <VirtualGrid
+              items={filteredGroups}
+              rowHeight={276}
+              minColumnWidth={310}
+              maxColumns={3}
+              gap={16}
+              overscanRows={2}
+              resetScrollKey={`${categoryFilter}-${searchQuery}`}
+              className="flex-1 min-h-0"
+              paddingClassName="max-w-[1440px] mx-auto p-4 lg:p-6"
+              getKey={(g) => g.key}
+              emptyState={
+                <div className="p-12 text-center text-xs text-zinc-500">
+                  No monitored equipment or rooms match this filter.
+                </div>
+              }
+              renderItem={(g) => {
+                const mainSnap = readings[g.mainSensor.id];
+                const st = statusText(g.worstStatus);
+                const mainColor = METRIC_PRESETS[g.mainSensor.metric]?.color ?? '#8B5CF6';
+                const cardTabUrl = buildTelemetryTabUrl({
+                  tab: 'trends',
+                  assetId: g.targetKind === 'asset' ? g.targetId : undefined,
+                  roomId: g.targetKind === 'room' ? g.targetId : undefined,
+                  sensorId: g.mainSensor.id,
+                });
+
+                return (
+                  <div className="h-full p-4 rounded-2xl border border-zinc-200 dark:border-zinc-800/80 bg-white dark:bg-[#121216] hover:border-violet-500/50 transition-colors flex flex-col justify-between gap-2.5 overflow-hidden">
+                    <div className="min-h-0">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="text-[11px] font-mono text-violet-500 truncate">
+                            {g.code} · <span className="text-zinc-500">{g.category}</span>
+                          </div>
+                          <h3 className="text-sm font-semibold text-zinc-900 dark:text-white truncate mt-0.5">
+                            {g.name}
+                          </h3>
+                        </div>
+                        <span className={`px-2 py-0.5 rounded-lg border text-[11px] font-mono font-medium shrink-0 ${st.badgeCls}`}>
+                          {st.glyph} {st.label}
+                        </span>
+                      </div>
+
+                      <div className="mt-2.5 pt-2.5 border-t border-zinc-100 dark:border-zinc-800/80 flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="text-[11px] text-zinc-500 dark:text-zinc-400 truncate">
+                            Main · <span className="font-mono">{g.mainSensor.tag}</span>
+                          </div>
+                          <div className="mt-0.5 flex items-baseline gap-1.5 font-mono tabular-nums">
+                            <span className="text-2xl font-bold text-zinc-900 dark:text-white">
+                              {(mainSnap?.value ?? g.mainSensor.nominal).toFixed(g.mainSensor.precision)}
+                            </span>
+                            <span className="text-xs text-zinc-400">{g.mainSensor.unit}</span>
+                          </div>
+                        </div>
+                        <MiniSparkline points={mainSnap?.history ?? []} color={mainColor} width={92} height={28} />
+                      </div>
+
+                      {g.sensors.length > 1 && (
+                        <div className="mt-2.5 pt-2 border-t border-zinc-100 dark:border-zinc-800/80 space-y-1">
+                          {g.sensors
+                            .filter((s) => s.id !== g.mainSensor.id)
+                            .slice(0, 3)
+                            .map((s) => {
+                              const snap = readings[s.id];
+                              const sSt = statusText(snap?.status ?? 'nominal');
+                              return (
+                                <div key={s.id} className="flex items-center justify-between text-xs">
+                                  <span className="text-zinc-500 dark:text-zinc-400 truncate pr-2">
+                                    {s.name.split('·').pop()?.trim() || s.name}
+                                  </span>
+                                  <span className="font-mono tabular-nums text-zinc-800 dark:text-zinc-200 shrink-0">
+                                    {(snap?.value ?? s.nominal).toFixed(s.precision)} {s.unit}{' '}
+                                    <span className={sSt.cls}>{sSt.glyph}</span>
+                                  </span>
+                                </div>
+                              );
+                            })}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="pt-2 border-t border-zinc-100 dark:border-zinc-800/80 flex items-center justify-between gap-2 shrink-0">
+                      <button
+                        onClick={() => {
+                          setDashboardFocus({
+                            assetId: g.targetKind === 'asset' ? g.targetId : null,
+                            roomId: g.targetKind === 'room' ? g.targetId : null,
+                            sensorId: g.mainSensor.id,
+                          });
+                          navigateToTab('trends');
+                        }}
+                        className="text-xs font-semibold text-violet-600 dark:text-violet-400 hover:underline flex items-center gap-1"
+                      >
+                        Inspect 3D &amp; Trends
+                        <ChevronRight className="w-3.5 h-3.5" />
+                      </button>
+                      <a
+                        href={cardTabUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-white"
+                      >
+                        <ExternalLink className="w-3 h-3" />
+                        New Tab
+                      </a>
+                    </div>
+                  </div>
+                );
+              }}
+            />
           </main>
         )}
 
         {/* TAB 3: SENSOR TAG STUDIO (WITH EXPLICIT BACK BUTTON) */}
         {dashboardTab === 'define' && (
-          <main className="flex-1 overflow-y-auto p-4 lg:p-6">
+          <main className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-4 lg:p-6">
             <div className="max-w-6xl mx-auto space-y-4">
               <div className="flex items-center justify-between gap-3">
                 <button
@@ -2208,9 +1946,9 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                   </div>
                 </form>
 
-                {/* Registered Tag Directory */}
-                <div className="lg:col-span-5 p-5 rounded-3xl border border-zinc-200 dark:border-zinc-800/80 bg-white dark:bg-[#121216] flex flex-col max-h-[680px]">
-                  <div className="flex items-center justify-between pb-3 border-b border-zinc-200 dark:border-zinc-800/80">
+                {/* Registered Tag Directory (Virtualized) */}
+                <div className="lg:col-span-5 p-5 rounded-3xl border border-zinc-200 dark:border-zinc-800/80 bg-white dark:bg-[#121216] flex flex-col h-[520px] lg:h-[660px] overflow-hidden">
+                  <div className="shrink-0 flex items-center justify-between pb-3 border-b border-zinc-200 dark:border-zinc-800/80">
                     <div>
                       <h3 className="text-sm font-semibold text-zinc-900 dark:text-white">
                         Registered Sensor Tags ({sensors.length})
@@ -2218,11 +1956,21 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                       <p className="text-[11px] text-zinc-500">Click star to promote Main Sensor; delete custom tags</p>
                     </div>
                   </div>
-                  <div className="flex-1 overflow-y-auto divide-y divide-zinc-100 dark:divide-zinc-800/70 mt-2">
-                    {sensors.map((s) => {
+                  <VirtualList
+                    items={sensors}
+                    itemHeight={54}
+                    overscan={8}
+                    className="flex-1 min-h-0 mt-1"
+                    getKey={(s) => s.id}
+                    emptyState={
+                      <div className="p-6 text-center text-xs text-zinc-500">
+                        No sensor tags registered yet.
+                      </div>
+                    }
+                    renderItem={(s) => {
                       const snap = readings[s.id];
                       return (
-                        <div key={s.id} className="py-2 flex items-center justify-between gap-2 text-xs">
+                        <div className="h-full border-b border-zinc-100 dark:border-zinc-800/70 flex items-center justify-between gap-2 text-xs">
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
                               <span className="font-mono font-semibold text-zinc-900 dark:text-zinc-100">{s.tag}</span>
@@ -2251,8 +1999,8 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                           </div>
                         </div>
                       );
-                    })}
-                  </div>
+                    }}
+                  />
                 </div>
               </div>
             </div>
@@ -2261,7 +2009,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
 
         {/* TAB 4: SENSOR RELATIONSHIPS & CONTROL LOOPS (WITH EXPLICIT BACK BUTTON) */}
         {dashboardTab === 'relationships' && (
-          <main className="flex-1 overflow-y-auto p-4 lg:p-6">
+          <main className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-4 lg:p-6">
             <div className="max-w-6xl mx-auto space-y-4">
               <div className="flex items-center justify-between gap-3">
                 <button
@@ -2458,7 +2206,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
 
         {/* TAB 5: PREDICTIVE FAILURE FORECAST & MAINTENANCE MILESTONES */}
         {dashboardTab === 'predictive' && (
-          <main className="flex-1 overflow-y-auto p-4 lg:p-6">
+          <main className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-4 lg:p-6">
             <div className="max-w-[1440px] mx-auto space-y-5">
               {/* Top Section Header + Timeline Sync Toggle */}
               <div className="flex flex-wrap items-center justify-between gap-3">
@@ -2475,7 +2223,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                       Predictive Asset Failure &amp; Maintenance Milestones
                     </h2>
                     <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                      Extrapolated from live sensor drift regression and alarm margins · Synced directly to the 5D Timeline bar
+                      Recharts OLS drift forecasting &amp; fleet horizon analysis · Synced directly to the 5D Timeline bar
                     </p>
                   </div>
                 </div>
@@ -2535,135 +2283,33 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                 </div>
               </div>
 
-              {/* Selected Asset Degradation & Failure Horizon Chart */}
-              {selectedMilestone && selectedMilestoneSensor && (() => {
-                const sev = severityMeta(selectedMilestone.severity);
-                return (
-                  <div className="p-5 rounded-3xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#121216] space-y-4">
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div className="space-y-1 min-w-0">
-                        <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
-                          <span className="font-bold text-violet-600 dark:text-violet-400">
-                            {selectedMilestone.assetCode}
-                          </span>
-                          <span className="text-zinc-400">·</span>
-                          <span className={`font-semibold ${sev.textCls}`}>
-                            {sev.glyph} {sev.label} ({selectedMilestone.daysUntilFailure}d)
-                          </span>
-                          <span className="text-zinc-400">·</span>
-                          <span className="text-zinc-500 dark:text-zinc-400">
-                            {selectedMilestone.category}
-                          </span>
-                        </div>
-                        <h3 className="text-base font-bold text-zinc-900 dark:text-white">
-                          {selectedMilestone.assetName} — Failure Horizon {selectedMilestone.predictedFailureDate}
-                        </h3>
-                        <p className="text-xs text-zinc-600 dark:text-zinc-400">
-                          {selectedMilestone.recommendedAction}
-                        </p>
-                      </div>
+              {/* Recharts Predictive Failure Visualization Suite */}
+              <PredictiveFailureCharts
+                milestones={maintenanceMilestones}
+                selectedMilestone={selectedMilestone}
+                selectedSensor={selectedMilestoneSensor}
+                selectedSnapshot={
+                  selectedMilestoneSensor ? readings[selectedMilestoneSensor.id] : undefined
+                }
+                isDark={theme === 'dark'}
+                onSelectAsset={(assetId) => setSelectedPredictiveAssetId(assetId)}
+                onJumpToTimeline={!standalone ? handleJumpToTimelineMilestone : undefined}
+                onSchedulePm={handleSchedulePredictivePm}
+              />
 
-                      <div className="flex flex-wrap items-center gap-2 shrink-0">
-                        {!standalone && (
-                          <button
-                            type="button"
-                            onClick={() => handleJumpToTimelineMilestone(selectedMilestone)}
-                            className="h-9 px-3.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
-                          >
-                            <CalendarClock className="w-3.5 h-3.5" />
-                            Show on Timeline
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => handleSchedulePredictivePm(selectedMilestone)}
-                          className="h-9 px-3.5 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
-                        >
-                          <Wrench className="w-3.5 h-3.5" />
-                          Schedule PM ({selectedMilestone.recommendedServiceDate})
-                        </button>
-                        {!standalone && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const twin = useTwinStore.getState();
-                              twin.setScreen('workspace');
-                              closeDashboard();
-                              window.setTimeout(() => {
-                                useTwinStore.getState().drillInto('asset', selectedMilestone.assetId);
-                              }, 60);
-                            }}
-                            className="h-9 px-3 rounded-xl border border-zinc-200 dark:border-zinc-700 hover:border-violet-500 text-xs font-medium text-zinc-700 dark:text-zinc-200 flex items-center gap-1.5 cursor-pointer"
-                          >
-                            <Box className="w-3.5 h-3.5 text-violet-500" />
-                            3D
-                          </button>
-                        )}
-                      </div>
-                    </div>
-
-                    <PredictiveHorizonChart
-                      sensor={selectedMilestoneSensor}
-                      snapshot={readings[selectedMilestoneSensor.id]}
-                      milestone={selectedMilestone}
-                    />
-
-                    <div className="pt-3 border-t border-zinc-200 dark:border-zinc-800 grid grid-cols-2 sm:grid-cols-6 gap-3 text-xs font-mono tabular-nums">
-                      <div>
-                        <div className="text-[10.5px] font-sans text-zinc-500">Current Reading</div>
-                        <div className="mt-0.5 font-semibold text-zinc-900 dark:text-white">
-                          {selectedMilestone.currentValue.toFixed(selectedMilestone.precision)} {selectedMilestone.unit}
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-[10.5px] font-sans text-zinc-500">Alarm Limit</div>
-                        <div className="mt-0.5 font-semibold text-rose-500">
-                          {selectedMilestone.alarmThreshold} {selectedMilestone.unit}
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-[10.5px] font-sans text-zinc-500">Est. Drift / Day</div>
-                        <div className="mt-0.5 font-semibold text-amber-500">
-                          {selectedMilestone.driftPerDay >= 0 ? '+' : ''}
-                          {selectedMilestone.driftPerDay} {selectedMilestone.unit}
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-[10.5px] font-sans text-zinc-500">Predicted Failure</div>
-                        <div className="mt-0.5 font-semibold" style={{ color: sev.accentHex }}>
-                          {selectedMilestone.predictedFailureDate}
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-[10.5px] font-sans text-zinc-500">Model Confidence</div>
-                        <div className="mt-0.5 font-semibold text-zinc-900 dark:text-white">
-                          {selectedMilestone.confidencePct}% (n={selectedMilestone.sampleCount})
-                        </div>
-                      </div>
-                      <div>
-                        <div className="text-[10.5px] font-sans text-zinc-500">Asset Health</div>
-                        <div className="mt-0.5 font-semibold text-zinc-900 dark:text-white">
-                          {selectedMilestone.healthScore} / 100
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })()}
-
-              {/* Ranked Maintenance Milestones Table */}
-              <div className="rounded-3xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#121216] overflow-hidden">
+              {/* Ranked Maintenance Milestones Directory (Virtualized Rows) */}
+              <div className="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#121216] overflow-hidden">
                 <div className="px-5 py-3.5 border-b border-zinc-200 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h3 className="text-sm font-semibold text-zinc-900 dark:text-white">
                       Maintenance Milestones Forecast ({filteredMilestones.length})
                     </h3>
                     <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
-                      Click any row to inspect its degradation trajectory or scrub directly to its Maintenance Milestone on the 5D Timeline
+                      Click any row to update the Recharts horizon curve or scrub directly to its 5D Timeline milestone
                     </p>
                   </div>
 
-                  <div className="flex items-center gap-1 p-1 rounded-xl bg-zinc-100 dark:bg-[#191922] border border-zinc-200 dark:border-zinc-800">
+                  <div className="flex items-center gap-1 p-1 rounded-xl bg-zinc-100 dark:bg-[#191922] border border-zinc-200 dark:border-zinc-800 overflow-x-auto max-w-full">
                     {(
                       [
                         { id: 'all', label: 'All' },
@@ -2677,7 +2323,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                         key={f.id}
                         type="button"
                         onClick={() => setPredictiveSeverityFilter(f.id)}
-                        className={`px-2.5 py-1 rounded-lg text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                           predictiveSeverityFilter === f.id
                             ? 'bg-violet-600 text-white'
                             : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100'
@@ -2690,72 +2336,86 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                 </div>
 
                 <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse text-xs">
-                    <thead>
-                      <tr className="border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#16161E] text-[11px] text-zinc-500 dark:text-zinc-400 font-medium">
-                        <th className="py-2.5 px-4">Equipment</th>
-                        <th className="py-2.5 px-3">Driver Sensor</th>
-                        <th className="py-2.5 px-3 text-right">Live / Alarm</th>
-                        <th className="py-2.5 px-3 text-right">Predicted Failure</th>
-                        <th className="py-2.5 px-3 text-right">Confidence</th>
-                        <th className="py-2.5 px-3 text-right">Health</th>
-                        <th className="py-2.5 px-4 text-right">Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800/70">
-                      {filteredMilestones.map((m) => {
+                  <div className="min-w-[780px]">
+                    <div className="grid grid-cols-12 items-center border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#16161E] text-[11px] text-zinc-500 dark:text-zinc-400 font-medium py-2.5 px-4">
+                      <div className="col-span-3">Equipment</div>
+                      <div className="col-span-2">Driver Sensor</div>
+                      <div className="col-span-2 text-right">Live / Alarm</div>
+                      <div className="col-span-2 text-right">Predicted Failure</div>
+                      <div className="col-span-1 text-right">Health</div>
+                      <div className="col-span-2 text-right">Actions</div>
+                    </div>
+                    <VirtualList
+                      items={filteredMilestones}
+                      itemHeight={60}
+                      overscan={6}
+                      maxHeight={420}
+                      resetScrollKey={predictiveSeverityFilter}
+                      getKey={(m) => m.id}
+                      emptyState={
+                        <div className="py-8 text-center text-xs text-zinc-500">
+                          No equipment matches this predictive severity filter.
+                        </div>
+                      }
+                      renderItem={(m) => {
                         const sev = severityMeta(m.severity);
                         const isSel = selectedMilestone?.assetId === m.assetId;
                         return (
-                          <tr
-                            key={m.id}
+                          <div
                             onClick={() => setSelectedPredictiveAssetId(m.assetId)}
-                            className={`cursor-pointer transition-colors ${
+                            className={`h-full grid grid-cols-12 items-center px-4 border-b border-zinc-100 dark:border-zinc-800/70 text-xs cursor-pointer transition-colors ${
                               isSel
                                 ? 'bg-violet-500/10'
                                 : 'hover:bg-zinc-50 dark:hover:bg-[#181822]'
                             }`}
                           >
-                            <td className="py-3 px-4">
-                              <div className="font-mono font-semibold text-zinc-900 dark:text-white">
+                            <div className="col-span-3 min-w-0 pr-2">
+                              <div className="font-mono font-semibold text-zinc-900 dark:text-white truncate">
                                 {m.assetCode}
                               </div>
-                              <div className="text-[11px] text-zinc-500 dark:text-zinc-400 truncate max-w-[200px]">
+                              <div className="text-[11px] text-zinc-500 dark:text-zinc-400 truncate">
                                 {m.assetName}
                               </div>
-                            </td>
-                            <td className="py-3 px-3">
-                              <div className="font-mono text-violet-600 dark:text-violet-400">
+                            </div>
+                            <div className="col-span-2 min-w-0 pr-2">
+                              <div className="font-mono text-violet-600 dark:text-violet-400 truncate">
                                 {m.driverSensorTag}
                               </div>
-                              <div className="text-[11px] text-zinc-500">{m.driverMetricLabel}</div>
-                            </td>
-                            <td className="py-3 px-3 text-right font-mono tabular-nums whitespace-nowrap">
+                              <div className="text-[11px] text-zinc-500 truncate">
+                                {m.driverMetricLabel} · {m.confidencePct}%
+                              </div>
+                            </div>
+                            <div className="col-span-2 text-right font-mono tabular-nums whitespace-nowrap pr-2">
                               <div className="font-semibold text-zinc-900 dark:text-white">
                                 {m.currentValue.toFixed(m.precision)} {m.unit}
                               </div>
                               <div className="text-[10.5px] text-rose-500">
                                 Limit {m.alarmThreshold} {m.unit}
                               </div>
-                            </td>
-                            <td className="py-3 px-3 text-right font-mono tabular-nums whitespace-nowrap">
+                            </div>
+                            <div className="col-span-2 text-right font-mono tabular-nums whitespace-nowrap pr-2">
                               <div className={`font-semibold ${sev.textCls}`}>
                                 {sev.glyph} {m.predictedFailureDate}
                               </div>
                               <div className="text-[10.5px] text-zinc-500">
                                 in {m.daysUntilFailure}d · PM {m.recommendedServiceDate}
                               </div>
-                            </td>
-                            <td className="py-3 px-3 text-right font-mono tabular-nums">
-                              {m.confidencePct}%
-                            </td>
-                            <td className="py-3 px-3 text-right font-mono tabular-nums">
-                              <span className={m.healthScore < 55 ? 'text-rose-500 font-semibold' : m.healthScore < 75 ? 'text-amber-500 font-semibold' : 'text-emerald-500 font-semibold'}>
+                            </div>
+                            <div className="col-span-1 text-right font-mono tabular-nums pr-2">
+                              <span
+                                className={
+                                  m.healthScore < 55
+                                    ? 'text-rose-500 font-semibold'
+                                    : m.healthScore < 75
+                                      ? 'text-amber-500 font-semibold'
+                                      : 'text-emerald-500 font-semibold'
+                                }
+                              >
                                 {m.healthScore}%
                               </span>
-                            </td>
-                            <td
-                              className="py-3 px-4 text-right whitespace-nowrap"
+                            </div>
+                            <div
+                              className="col-span-2 text-right whitespace-nowrap"
                               onClick={(e) => e.stopPropagation()}
                             >
                               <div className="inline-flex items-center gap-1.5">
@@ -2776,19 +2436,12 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                                   PM Order
                                 </button>
                               </div>
-                            </td>
-                          </tr>
+                            </div>
+                          </div>
                         );
-                      })}
-                      {filteredMilestones.length === 0 && (
-                        <tr>
-                          <td colSpan={7} className="py-8 text-center text-xs text-zinc-500">
-                            No equipment matches this predictive severity filter.
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
+                      }}
+                    />
+                  </div>
                 </div>
               </div>
             </div>
@@ -2796,17 +2449,17 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
         )}
       </div>
 
-      {/* On-Demand Equipment / Room Switcher Dialog (Replaces Cluttered Permanent Sidebar) */}
+      {/* On-Demand Equipment / Room Switcher Dialog (Virtualized) */}
       {showSwitcherModal && (
         <div
-          className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4"
+          className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-0 sm:p-4"
           onClick={() => setShowSwitcherModal(false)}
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-2xl max-h-[80vh] rounded-3xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#121216] shadow-2xl flex flex-col overflow-hidden"
+            className="w-full max-w-2xl h-[100dvh] sm:h-[80vh] sm:rounded-3xl border-0 sm:border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#121216] shadow-2xl flex flex-col overflow-hidden"
           >
-            <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-3">
+            <div className="shrink-0 px-5 py-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-3">
               <div className="flex items-center gap-2.5">
                 <button
                   onClick={() => setShowSwitcherModal(false)}
@@ -2832,7 +2485,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
               </button>
             </div>
 
-            <div className="p-4 border-b border-zinc-200 dark:border-zinc-800 space-y-2.5">
+            <div className="shrink-0 p-4 border-b border-zinc-200 dark:border-zinc-800 space-y-2.5">
               <div className="relative">
                 <Search className="w-4 h-4 text-zinc-400 absolute left-3 top-2.5" />
                 <input
@@ -2843,7 +2496,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                   className="w-full h-9 pl-9 pr-3 rounded-xl bg-zinc-50 dark:bg-[#1A1A22] border border-zinc-200 dark:border-zinc-800 text-xs focus:outline-none focus:border-violet-500"
                 />
               </div>
-              <div className="flex items-center gap-1.5 flex-wrap">
+              <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
                 {(
                   [
                     { id: 'all', label: 'All' },
@@ -2856,7 +2509,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                   <button
                     key={f.id}
                     onClick={() => setCategoryFilter(f.id)}
-                    className={`px-3 py-1 rounded-xl text-xs font-medium transition-colors ${
+                    className={`px-3 py-1 rounded-xl text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
                       categoryFilter === f.id
                         ? 'bg-violet-600 text-white'
                         : 'bg-zinc-100 dark:bg-[#1A1A22] text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
@@ -2868,14 +2521,24 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
               </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto divide-y divide-zinc-100 dark:divide-zinc-800/70">
-              {filteredGroups.map((g) => {
+            <VirtualList
+              items={filteredGroups}
+              itemHeight={62}
+              overscan={8}
+              resetScrollKey={`${categoryFilter}-${searchQuery}`}
+              className="flex-1 min-h-0"
+              getKey={(g) => g.key}
+              emptyState={
+                <div className="p-8 text-center text-xs text-zinc-500">
+                  No monitored equipment or rooms match this filter.
+                </div>
+              }
+              renderItem={(g) => {
                 const mainSnap = readings[g.mainSensor.id];
                 const isSel = activeGroup?.key === g.key;
                 const stInfo = statusText(g.worstStatus);
                 return (
                   <button
-                    key={g.key}
                     onClick={() => {
                       setDashboardFocus({
                         assetId: g.targetKind === 'asset' ? g.targetId : null,
@@ -2884,7 +2547,7 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                       });
                       setShowSwitcherModal(false);
                     }}
-                    className={`w-full text-left px-5 py-3 flex items-center justify-between gap-3 transition-colors ${
+                    className={`w-full h-full text-left px-5 border-b border-zinc-100 dark:border-zinc-800/70 flex items-center justify-between gap-3 transition-colors ${
                       isSel
                         ? 'bg-violet-500/10'
                         : 'hover:bg-zinc-50 dark:hover:bg-[#1A1A22]'
@@ -2892,10 +2555,10 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                   >
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
-                        <span className="font-mono text-xs text-violet-500 font-semibold">{g.code}</span>
+                        <span className="font-mono text-xs text-violet-500 font-semibold shrink-0">{g.code}</span>
                         <span className="text-xs font-semibold text-zinc-900 dark:text-white truncate">{g.name}</span>
                       </div>
-                      <div className="text-[11px] font-mono text-zinc-500 mt-0.5">
+                      <div className="text-[11px] font-mono text-zinc-500 mt-0.5 truncate">
                         {g.mainSensor.tag} · {g.sensors.length} channels · {g.category}
                       </div>
                     </div>
@@ -2909,13 +2572,8 @@ export const TelemetryDashboard: React.FC<Props> = ({ standalone = false }) => {
                     </div>
                   </button>
                 );
-              })}
-              {filteredGroups.length === 0 && (
-                <div className="p-8 text-center text-xs text-zinc-500">
-                  No monitored equipment or rooms match this filter.
-                </div>
-              )}
-            </div>
+              }}
+            />
           </div>
         </div>
       )}

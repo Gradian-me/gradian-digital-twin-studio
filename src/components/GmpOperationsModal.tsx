@@ -50,162 +50,14 @@ import type {
 } from '../types/gmp';
 import type { EquipmentCategory } from '../types/twin';
 import { addDaysToIso, todayIso } from '../data/gmpDemoData';
+import {
+  MarkdownTemplateToolbar,
+  RichMarkdownRenderer,
+} from './RichMarkdownRenderer';
 
-/**
- * Safe React JSX Markdown renderer (no raw HTML injection).
- * Supports headings, markdown tables, blockquotes, bullet/numbered lists, bold, and inline code.
- */
-const SafeMarkdownView: React.FC<{ markdown: string; isDark: boolean }> = ({ markdown, isDark }) => {
-  const renderInline = (text: string) => {
-    const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
-    return parts.map((part, idx) => {
-      if (part.startsWith('**') && part.endsWith('**')) {
-        return (
-          <strong key={idx} className={isDark ? 'text-white font-bold' : 'text-slate-950 font-bold'}>
-            {part.slice(2, -2)}
-          </strong>
-        );
-      }
-      if (part.startsWith('`') && part.endsWith('`')) {
-        return (
-          <code
-            key={idx}
-            className={`px-1.5 py-0.5 rounded font-mono text-[11px] ${
-              isDark ? 'bg-violet-500/20 text-amber-300' : 'bg-violet-100 text-violet-800'
-            }`}
-          >
-            {part.slice(1, -1)}
-          </code>
-        );
-      }
-      return <React.Fragment key={idx}>{part}</React.Fragment>;
-    });
-  };
-
-  const lines = markdown.split('\n');
-  const blocks: React.ReactNode[] = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i].trimEnd();
-
-    // Markdown table
-    if (line.trim().startsWith('|') && i + 1 < lines.length && lines[i + 1].includes('---')) {
-      const headers = line
-        .split('|')
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const rows: string[][] = [];
-      i += 2;
-      while (i < lines.length && lines[i].trim().startsWith('|')) {
-        rows.push(
-          lines[i]
-            .split('|')
-            .map((s) => s.trim())
-            .filter(Boolean)
-        );
-        i++;
-      }
-      blocks.push(
-        <div
-          key={`tbl-${i}`}
-          className={`my-3 overflow-x-auto rounded-xl border ${
-            isDark ? 'border-zinc-800 bg-[#0E0E13]' : 'border-slate-200 bg-white'
-          }`}
-        >
-          <table className="w-full text-left text-xs">
-            <thead className={isDark ? 'bg-zinc-900/90 text-violet-300' : 'bg-slate-100 text-slate-700'}>
-              <tr>
-                {headers.map((h, hi) => (
-                  <th key={hi} className="px-3 py-2 font-bold border-b border-zinc-800/60">
-                    {renderInline(h)}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r, ri) => (
-                <tr
-                  key={ri}
-                  className={isDark ? 'border-b border-zinc-800/50 last:border-0' : 'border-b border-slate-100'}
-                >
-                  {r.map((cell, ci) => (
-                    <td key={ci} className="px-3 py-2">
-                      {renderInline(cell)}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      );
-      continue;
-    }
-
-    if (line.startsWith('# ')) {
-      blocks.push(
-        <h1 key={i} className="text-lg font-extrabold tracking-tight mt-1 mb-2 text-violet-400">
-          {renderInline(line.slice(2))}
-        </h1>
-      );
-    } else if (line.startsWith('## ')) {
-      blocks.push(
-        <h2
-          key={i}
-          className={`text-sm font-bold mt-4 mb-1.5 pb-1 border-b ${
-            isDark ? 'border-zinc-800 text-amber-300' : 'border-slate-200 text-violet-700'
-          }`}
-        >
-          {renderInline(line.slice(3))}
-        </h2>
-      );
-    } else if (line.startsWith('### ')) {
-      blocks.push(
-        <h3 key={i} className="text-xs font-bold uppercase tracking-wider mt-3 mb-1 text-violet-300">
-          {renderInline(line.slice(4))}
-        </h3>
-      );
-    } else if (line.startsWith('> ')) {
-      blocks.push(
-        <blockquote
-          key={i}
-          className={`my-2 rounded-xl border-l-4 border-amber-500 px-3 py-2 text-xs ${
-            isDark ? 'bg-amber-500/10 text-amber-200' : 'bg-amber-50 text-amber-900'
-          }`}
-        >
-          {renderInline(line.slice(2))}
-        </blockquote>
-      );
-    } else if (/^[-*]\s+/.test(line.trim())) {
-      blocks.push(
-        <div key={i} className="flex items-start gap-2 text-xs my-1 pl-1">
-          <span className="w-1.5 h-1.5 rounded-full bg-violet-400 mt-1.5 shrink-0" />
-          <span className="leading-relaxed">{renderInline(line.trim().replace(/^[-*]\s+/, ''))}</span>
-        </div>
-      );
-    } else if (/^\d+\.\s+/.test(line.trim())) {
-      const match = line.trim().match(/^(\d+)\.\s+(.*)$/);
-      blocks.push(
-        <div key={i} className="flex items-start gap-2 text-xs my-1 pl-1">
-          <span className="font-mono text-[10px] font-bold text-amber-400 mt-0.5 shrink-0">
-            {match?.[1]}.
-          </span>
-          <span className="leading-relaxed">{renderInline(match?.[2] ?? line)}</span>
-        </div>
-      );
-    } else if (line.trim() !== '') {
-      blocks.push(
-        <p key={i} className={`text-xs leading-relaxed my-1.5 ${isDark ? 'text-zinc-300' : 'text-slate-700'}`}>
-          {renderInline(line)}
-        </p>
-      );
-    }
-    i++;
-  }
-
-  return <div className="space-y-0.5">{blocks}</div>;
-};
+const SafeMarkdownView: React.FC<{ markdown: string; isDark: boolean }> = ({ markdown, isDark }) => (
+  <RichMarkdownRenderer markdown={markdown} isDark={isDark} />
+);
 
 const EQUIPMENT_CATEGORIES: EquipmentCategory[] = [
   'Biopharmaceutical',
@@ -2949,6 +2801,15 @@ export const GmpOperationsModal: React.FC = () => {
                       }`}
                     />
                   </div>
+                  <MarkdownTemplateToolbar
+                    isDark={isDark}
+                    onInsert={(snippet) =>
+                      setSopDraft((d) => ({
+                        ...d,
+                        markdown: `${d.markdown.trimEnd()}\n\n${snippet.trim()}\n`,
+                      }))
+                    }
+                  />
                   <textarea
                     rows={14}
                     value={sopDraft.markdown}
@@ -3031,14 +2892,24 @@ export const GmpOperationsModal: React.FC = () => {
                   </div>
 
                   {editingSop ? (
-                    <textarea
-                      rows={18}
-                      value={activeSop.markdown}
-                      onChange={(e) => updateSopDocument(activeSop.id, { markdown: e.target.value })}
-                      className={`w-full rounded-2xl border p-4 font-mono text-xs leading-relaxed ${
-                        isDark ? 'bg-[#0E0E13] border-zinc-700 text-zinc-100' : 'bg-white border-slate-300'
-                      }`}
-                    />
+                    <div className="space-y-2.5">
+                      <MarkdownTemplateToolbar
+                        isDark={isDark}
+                        onInsert={(snippet) =>
+                          updateSopDocument(activeSop.id, {
+                            markdown: `${activeSop.markdown.trimEnd()}\n\n${snippet.trim()}\n`,
+                          })
+                        }
+                      />
+                      <textarea
+                        rows={18}
+                        value={activeSop.markdown}
+                        onChange={(e) => updateSopDocument(activeSop.id, { markdown: e.target.value })}
+                        className={`w-full rounded-2xl border p-4 font-mono text-xs leading-relaxed ${
+                          isDark ? 'bg-[#0E0E13] border-zinc-700 text-zinc-100' : 'bg-white border-slate-300'
+                        }`}
+                      />
+                    </div>
                   ) : (
                     <SafeMarkdownView markdown={activeSop.markdown} isDark={isDark} />
                   )}
@@ -3197,6 +3068,15 @@ export const GmpOperationsModal: React.FC = () => {
                       }`}
                     />
                   </div>
+                  <MarkdownTemplateToolbar
+                    isDark={isDark}
+                    onInsert={(snippet) =>
+                      setWikiDraft((w) => ({
+                        ...w,
+                        markdown: `${w.markdown.trimEnd()}\n\n${snippet.trim()}\n`,
+                      }))
+                    }
+                  />
                   <textarea
                     rows={14}
                     value={wikiDraft.markdown}

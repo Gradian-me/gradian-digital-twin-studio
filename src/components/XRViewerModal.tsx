@@ -473,8 +473,8 @@ export const XRViewerModal: React.FC = () => {
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-3 sm:p-5">
-      <div className="w-full max-w-4xl bg-white dark:bg-[#111116] border border-zinc-200 dark:border-zinc-800 rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
+    <div className="fixed inset-0 z-50 bg-black/80 flex items-end sm:items-center justify-center p-0 sm:p-4">
+      <div className="w-full max-w-4xl h-[100dvh] sm:h-auto sm:max-h-[92vh] bg-white dark:bg-[#111116] border-0 sm:border border-zinc-200 dark:border-zinc-800 rounded-none sm:rounded-3xl shadow-2xl overflow-hidden flex flex-col">
         {/* Header with Back Button */}
         <div className="px-5 py-3.5 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#16161E] flex items-center justify-between gap-3 shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
@@ -506,8 +506,8 @@ export const XRViewerModal: React.FC = () => {
         </div>
 
         {/* Mode Tabs */}
-        <div className="px-5 py-2.5 border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#101016] flex items-center justify-between gap-2 flex-wrap shrink-0">
-          <div className="flex items-center gap-1.5">
+        <div className="px-4 sm:px-5 py-2.5 border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#101016] flex items-center justify-between gap-2 shrink-0 overflow-x-auto">
+          <div className="flex items-center gap-1.5 shrink-0">
             {(
               [
                 { id: 'ar-surface', label: 'AR Surface Detection', icon: <ScanLine className="w-3.5 h-3.5" /> },
@@ -518,7 +518,7 @@ export const XRViewerModal: React.FC = () => {
               <button
                 key={t.id}
                 onClick={() => setTab(t.id)}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors ${
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
                   tab === t.id
                     ? 'bg-violet-600 text-white shadow-xs'
                     : 'bg-zinc-100 dark:bg-[#191922] text-zinc-600 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-white'
@@ -530,7 +530,7 @@ export const XRViewerModal: React.FC = () => {
             ))}
           </div>
 
-          <div className="flex items-center gap-2 text-[10.5px] font-mono">
+          <div className="hidden md:flex items-center gap-2 text-[10.5px] font-mono shrink-0">
             <span className={xrStatus.arSupported ? 'text-emerald-400' : 'text-zinc-400'}>
               WebXR AR: {xrStatus.checked ? (xrStatus.arSupported ? 'Ready' : 'Camera Fallback') : '...'}
             </span>
@@ -542,7 +542,7 @@ export const XRViewerModal: React.FC = () => {
         </div>
 
         {/* BODY */}
-        <div className="flex-1 overflow-y-auto p-5 space-y-4">
+        <div key={tab} className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-4 sm:p-5 space-y-4">
           {/* TAB 1: AR SURFACE DETECTION ON CAMERA */}
           {tab === 'ar-surface' && (
             <div className="space-y-3">

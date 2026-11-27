@@ -2,6 +2,26 @@ import * as THREE from 'three';
 import type { Floor, Opening, SpatialAsset, Wall } from '../types/twin';
 import { getAssetBounds } from '../utils/spatial';
 
+export type PathRoutingAlgorithm = 'shortest' | 'least-congested';
+
+export interface NoGoZone {
+  id: string;
+  floorId: string;
+  label: string;
+  kind: 'room' | 'circle';
+  roomId?: string;
+  x: number;
+  z: number;
+  width?: number;
+  depth?: number;
+  radius?: number;
+}
+
+export interface PathFindOptions {
+  algorithm?: PathRoutingAlgorithm;
+  noGoZones?: NoGoZone[];
+}
+
 export interface FloorNavMesh {
   floorId: string;
   cellSize: number;
@@ -11,12 +31,26 @@ export interface FloorNavMesh {
   depth: number;
   /** 1 = walkable, 0 = blocked by wall or equipment */
   grid: Uint8Array;
+  /** 0.0 (wide open corridor) to 1.0 (tight / high-equipment-density congestion zone) */
+  congestionCost: Float32Array;
   walkableCount: number;
   totalCount: number;
   walkablePercent: number;
   isWalkable: (x: number, z: number) => boolean;
-  resolveMove: (fromX: number, fromZ: number, toX: number, toZ: number) => { x: number; z: number; collided: boolean };
-  findNearestWalkable: (x: number, z: number) => { x: number; z: number };
+  resolveMove: (
+    fromX: number,
+    fromZ: number,
+    toX: number,
+    toZ: number
+  ) => { x: number; z: number; collided: boolean };
+  findNearestWalkable: (x: number, z: number, noGoZones?: NoGoZone[]) => { x: number; z: number };
+  findPath: (
+    fromX: number,
+    fromZ: number,
+    toX: number,
+    toZ: number,
+    options?: PathFindOptions
+  ) => { x: number; z: number }[];
 }
 
 interface DoorPortal {
@@ -30,12 +64,43 @@ interface DoorPortal {
   halfDepth: number; // clearance on both sides of the door so overlapping room walls also open
 }
 
+export function isPointInsideNoGoZones(
+  wx: number,
+  wz: number,
+  zones?: NoGoZone[],
+  padding = 0.2
+): boolean {
+  if (!zones || zones.length === 0) return false;
+  for (let i = 0; i < zones.length; i++) {
+    const z = zones[i];
+    if (z.kind === 'room' && z.width && z.depth) {
+      if (
+        wx >= z.x - padding &&
+        wx <= z.x + z.width + padding &&
+        wz >= z.z - padding &&
+        wz <= z.z + z.depth + padding
+      ) {
+        return true;
+      }
+    } else {
+      const r = (z.radius ?? 2.0) + padding;
+      const dx = wx - z.x;
+      const dz = wz - z.z;
+      if (dx * dx + dz * dz <= r * r) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /**
  * Automatically computes a high-resolution walkable NavMesh for a floor by rasterizing:
  * 1. All architectural walls (with character shoulder clearance radius)
  * 2. World-space doorway portals that cleanly cut through BOTH the host wall AND any overlapping
  *    adjacent room wall (preventing rooms with shared double-walls from trapping walk mode)
  * 3. Blocking placed equipment footprints while preserving clear doorway egress corridors
+ * 4. A multi-source congestion / clearance cost field for 'Least Congested' routing
  */
 export function buildFloorNavMesh(
   floor: Floor,
@@ -49,7 +114,8 @@ export function buildFloorNavMesh(
   const depth = Math.max(4, floor.depth);
   const cols = Math.ceil(width / cellSize);
   const rows = Math.ceil(depth / cellSize);
-  const grid = new Uint8Array(cols * rows);
+  const total = cols * rows;
+  const grid = new Uint8Array(total);
   grid.fill(1);
 
   const floorWalls = walls.filter((w) => w.floorId === floor.id);
@@ -81,9 +147,7 @@ export function buildFloorNavMesh(
       uz,
       nx,
       nz,
-      // Generous walkable opening width so shoulder clearance never snags on door jambs
       halfWidth: Math.max(0.42, d.width * 0.5 - 0.04),
-      // Extend across host + adjacent shared wall + immediate threshold on both sides
       halfDepth: Math.max(0.75, host.thickness + agentRadius + 0.38),
     });
   });
@@ -102,7 +166,6 @@ export function buildFloorNavMesh(
     return false;
   };
 
-  // Helper: distance from point (px,pz) to segment (x1,z1)-(x2,z2)
   const distToSeg = (px: number, pz: number, x1: number, z1: number, x2: number, z2: number) => {
     const dx = x2 - x1;
     const dz = z2 - z1;
@@ -112,11 +175,13 @@ export function buildFloorNavMesh(
     return Math.hypot(px - (x1 + t * dx), pz - (z1 + t * dz));
   };
 
-  // Precompute asset AABBs with conservative agent clearance
   const assetBoxes = floorAssets.map((a) => {
     const b = getAssetBounds(a);
     const pad = Math.min(agentRadius, 0.18);
     return {
+      cx: a.x,
+      cz: a.z,
+      weight: a.operationalStatus === 'running' ? 1.0 : 0.55,
       minX: b.minX - pad,
       maxX: b.maxX + pad,
       minZ: b.minZ - pad,
@@ -132,20 +197,17 @@ export function buildFloorNavMesh(
       const wx = (c + 0.5) * cellSize;
       const idx = r * cols + c;
 
-      // Stay inside slab perimeter
       if (wx < 0.2 || wx > width - 0.2 || wz < 0.2 || wz > depth - 0.2) {
         grid[idx] = 0;
         continue;
       }
 
-      // World-space door portals ALWAYS stay open and walkable across overlapping room walls
       if (isInsideAnyDoorPortal(wx, wz)) {
         grid[idx] = 1;
         walkableCount++;
         continue;
       }
 
-      // Check architectural walls
       let blocked = false;
       for (let wi = 0; wi < floorWalls.length; wi++) {
         const w = floorWalls[wi];
@@ -158,7 +220,6 @@ export function buildFloorNavMesh(
       }
 
       if (!blocked) {
-        // Check equipment footprints
         for (let ai = 0; ai < assetBoxes.length; ai++) {
           const box = assetBoxes[ai];
           if (wx >= box.minX && wx <= box.maxX && wz >= box.minZ && wz <= box.maxZ) {
@@ -177,6 +238,86 @@ export function buildFloorNavMesh(
     }
   }
 
+  // Build congestion cost field (0.0 = wide open uncongested path, 1.0 = tight bottleneck / dense equipment)
+  const congestionCost = new Float32Array(total);
+  const obsDist = new Int16Array(total);
+  obsDist.fill(999);
+  const bfsQueue = new Int32Array(total);
+  let qHead = 0;
+  let qTail = 0;
+
+  for (let i = 0; i < total; i++) {
+    if (grid[i] === 0) {
+      obsDist[i] = 0;
+      bfsQueue[qTail++] = i;
+    }
+  }
+
+  const maxClearCells = 6; // ~2.1m clearance radius
+  while (qHead < qTail) {
+    const cur = bfsQueue[qHead++];
+    const curD = obsDist[cur];
+    if (curD >= maxClearCells) continue;
+    const cr = Math.floor(cur / cols);
+    const cc = cur - cr * cols;
+    const nextD = curD + 1;
+    if (cc + 1 < cols) {
+      const ni = cur + 1;
+      if (obsDist[ni] > nextD) {
+        obsDist[ni] = nextD;
+        bfsQueue[qTail++] = ni;
+      }
+    }
+    if (cc - 1 >= 0) {
+      const ni = cur - 1;
+      if (obsDist[ni] > nextD) {
+        obsDist[ni] = nextD;
+        bfsQueue[qTail++] = ni;
+      }
+    }
+    if (cr + 1 < rows) {
+      const ni = cur + cols;
+      if (obsDist[ni] > nextD) {
+        obsDist[ni] = nextD;
+        bfsQueue[qTail++] = ni;
+      }
+    }
+    if (cr - 1 >= 0) {
+      const ni = cur - cols;
+      if (obsDist[ni] > nextD) {
+        obsDist[ni] = nextD;
+        bfsQueue[qTail++] = ni;
+      }
+    }
+  }
+
+  for (let r = 0; r < rows; r++) {
+    const wz = (r + 0.5) * cellSize;
+    for (let c = 0; c < cols; c++) {
+      const idx = r * cols + c;
+      if (grid[idx] !== 1) {
+        congestionCost[idx] = 1;
+        continue;
+      }
+      // 1. Wall/obstacle proximity bottleneck penalty
+      const dCells = Math.min(maxClearCells, obsDist[idx]);
+      const wallProximity = 1 - dCells / maxClearCells; // 1 near wall, 0 in wide corridor
+
+      // 2. Active equipment cluster density penalty
+      const wx = (c + 0.5) * cellSize;
+      let eqCrowd = 0;
+      for (let ai = 0; ai < assetBoxes.length; ai++) {
+        const a = assetBoxes[ai];
+        const dist = Math.hypot(wx - a.cx, wz - a.cz);
+        if (dist < 2.8) {
+          eqCrowd += ((2.8 - dist) / 2.8) * 0.42 * a.weight;
+        }
+      }
+
+      congestionCost[idx] = Math.min(1, wallProximity * 0.62 + Math.min(0.65, eqCrowd));
+    }
+  }
+
   const isWalkable = (x: number, z: number) => {
     const c = Math.floor(x / cellSize);
     const r = Math.floor(z / cellSize);
@@ -188,14 +329,12 @@ export function buildFloorNavMesh(
     if (isWalkable(toX, toZ)) {
       return { x: toX, z: toZ, collided: false };
     }
-    // Smooth wall-sliding: try moving along X only, then Z only
     if (isWalkable(toX, fromZ)) {
       return { x: toX, z: fromZ, collided: true };
     }
     if (isWalkable(fromX, toZ)) {
       return { x: fromX, z: toZ, collided: true };
     }
-    // Gentle doorway funnel assist: if sliding near a doorway portal center, nudge along portal axis
     for (let i = 0; i < doorPortals.length; i++) {
       const p = doorPortals[i];
       const distToCenter = Math.hypot(fromX - p.cx, fromZ - p.cz);
@@ -207,7 +346,6 @@ export function buildFloorNavMesh(
         }
       }
     }
-    // If somehow spawned inside a non-walkable cell, nudge strictly toward nearest walkable cell (never tunnel forward)
     if (!isWalkable(fromX, fromZ)) {
       const safe = findNearestWalkable(fromX, fromZ);
       const dx = safe.x - fromX;
@@ -228,7 +366,6 @@ export function buildFloorNavMesh(
     if (totalDist < 1e-5) {
       return { x: fromX, z: fromZ, collided: false };
     }
-    // Sub-step every <= 0.08m so Fast/Sprint mode can NEVER tunnel through walls or non-NavMesh cells
     const steps = Math.max(1, Math.ceil(totalDist / 0.08));
     let cx = fromX;
     let cz = fromZ;
@@ -244,8 +381,11 @@ export function buildFloorNavMesh(
     return { x: cx, z: cz, collided };
   };
 
-  const findNearestWalkable = (x: number, z: number) => {
-    if (isWalkable(x, z)) return { x, z };
+  const findNearestWalkable = (x: number, z: number, noGoZones?: NoGoZone[]) => {
+    const floorNoGo = noGoZones?.filter((zn) => zn.floorId === floor.id);
+    if (isWalkable(x, z) && !isPointInsideNoGoZones(x, z, floorNoGo)) {
+      return { x, z };
+    }
     const startC = Math.max(0, Math.min(cols - 1, Math.floor(x / cellSize)));
     const startR = Math.max(0, Math.min(rows - 1, Math.floor(z / cellSize)));
     for (let rad = 1; rad <= Math.max(cols, rows); rad++) {
@@ -255,12 +395,283 @@ export function buildFloorNavMesh(
           const nc = startC + dc;
           const nr = startR + dr;
           if (nc >= 0 && nc < cols && nr >= 0 && nr < rows && grid[nr * cols + nc] === 1) {
-            return { x: (nc + 0.5) * cellSize, z: (nr + 0.5) * cellSize };
+            const wx = (nc + 0.5) * cellSize;
+            const wz = (nr + 0.5) * cellSize;
+            if (!isPointInsideNoGoZones(wx, wz, floorNoGo)) {
+              return { x: wx, z: wz };
+            }
           }
         }
       }
     }
     return { x: width / 2, z: depth / 2 };
+  };
+
+  /**
+   * 8-directional A* pathfinder supporting:
+   * - 'shortest': minimum Euclidean walking distance with line-of-sight string-pull smoothing
+   * - 'least-congested': penalizes narrow bottlenecks & high-equipment-density zones
+   * - User-defined 'No-Go' zones completely excluded from traversal
+   */
+  const findPath = (
+    fromX: number,
+    fromZ: number,
+    toX: number,
+    toZ: number,
+    options?: PathFindOptions
+  ): { x: number; z: number }[] => {
+    const algorithm: PathRoutingAlgorithm = options?.algorithm ?? 'shortest';
+    const floorNoGo = (options?.noGoZones ?? []).filter((z) => z.floorId === floor.id);
+
+    // Pre-rasterize No-Go cells for fast O(1) lookup during A*
+    let noGoMask: Uint8Array | null = null;
+    if (floorNoGo.length > 0) {
+      noGoMask = new Uint8Array(total);
+      for (let r = 0; r < rows; r++) {
+        const wz = (r + 0.5) * cellSize;
+        for (let c = 0; c < cols; c++) {
+          const wx = (c + 0.5) * cellSize;
+          if (isPointInsideNoGoZones(wx, wz, floorNoGo, 0.22)) {
+            noGoMask[r * cols + c] = 1;
+          }
+        }
+      }
+    }
+
+    const startPt = isWalkable(fromX, fromZ)
+      ? { x: fromX, z: fromZ }
+      : findNearestWalkable(fromX, fromZ, floorNoGo);
+    const goalPt =
+      isWalkable(toX, toZ) && !isPointInsideNoGoZones(toX, toZ, floorNoGo, 0.22)
+        ? { x: toX, z: toZ }
+        : findNearestWalkable(toX, toZ, floorNoGo);
+
+    if (Math.hypot(goalPt.x - startPt.x, goalPt.z - startPt.z) < cellSize * 0.6) {
+      return [startPt, goalPt];
+    }
+
+    const hasCleanLineOfSight = (
+      ax: number,
+      az: number,
+      bx: number,
+      bz: number,
+      checkCongestion: boolean
+    ) => {
+      const dist = Math.hypot(bx - ax, bz - az);
+      const steps = Math.max(2, Math.ceil(dist / (cellSize * 0.42)));
+      let maxAllowedCongestion = 1;
+      if (checkCongestion) {
+        const cA =
+          congestionCost[
+            Math.max(0, Math.min(rows - 1, Math.floor(az / cellSize))) * cols +
+              Math.max(0, Math.min(cols - 1, Math.floor(ax / cellSize)))
+          ];
+        const cB =
+          congestionCost[
+            Math.max(0, Math.min(rows - 1, Math.floor(bz / cellSize))) * cols +
+              Math.max(0, Math.min(cols - 1, Math.floor(bx / cellSize)))
+          ];
+        maxAllowedCongestion = Math.max(cA, cB) + 0.22;
+      }
+
+      for (let i = 1; i < steps; i++) {
+        const t = i / steps;
+        const px = ax + (bx - ax) * t;
+        const pz = az + (bz - az) * t;
+        const c = Math.floor(px / cellSize);
+        const r = Math.floor(pz / cellSize);
+        if (c < 0 || c >= cols || r < 0 || r >= rows) return false;
+        const idx = r * cols + c;
+        if (grid[idx] !== 1) return false;
+        if (noGoMask && noGoMask[idx] === 1) return false;
+        if (checkCongestion && congestionCost[idx] > maxAllowedCongestion) return false;
+      }
+      return true;
+    };
+
+    // Fast path for shortest mode when completely unobstructed and outside No-Go zones
+    if (
+      algorithm === 'shortest' &&
+      hasCleanLineOfSight(startPt.x, startPt.z, goalPt.x, goalPt.z, false)
+    ) {
+      return [startPt, goalPt];
+    }
+
+    const sc = Math.max(0, Math.min(cols - 1, Math.floor(startPt.x / cellSize)));
+    const sr = Math.max(0, Math.min(rows - 1, Math.floor(startPt.z / cellSize)));
+    const gc = Math.max(0, Math.min(cols - 1, Math.floor(goalPt.x / cellSize)));
+    const gr = Math.max(0, Math.min(rows - 1, Math.floor(goalPt.z / cellSize)));
+
+    const startIdx = sr * cols + sc;
+    const goalIdx = gr * cols + gc;
+    const startedInNoGo = Boolean(noGoMask && noGoMask[startIdx] === 1);
+
+    const gScore = new Float32Array(total);
+    gScore.fill(Infinity);
+    const cameFrom = new Int32Array(total);
+    cameFrom.fill(-1);
+    const closed = new Uint8Array(total);
+
+    const heapIdx: number[] = [];
+    const heapF: number[] = [];
+    const pushHeap = (idx: number, f: number) => {
+      let i = heapIdx.length;
+      heapIdx.push(idx);
+      heapF.push(f);
+      while (i > 0) {
+        const p = (i - 1) >> 1;
+        if (heapF[p] <= heapF[i]) break;
+        [heapIdx[p], heapIdx[i]] = [heapIdx[i], heapIdx[p]];
+        [heapF[p], heapF[i]] = [heapF[i], heapF[p]];
+        i = p;
+      }
+    };
+    const popHeap = (): number => {
+      const top = heapIdx[0];
+      const lastIdx = heapIdx.pop()!;
+      const lastF = heapF.pop()!;
+      if (heapIdx.length > 0) {
+        heapIdx[0] = lastIdx;
+        heapF[0] = lastF;
+        let i = 0;
+        const n = heapIdx.length;
+        while (true) {
+          let smallest = i;
+          const l = (i << 1) + 1;
+          const r = l + 1;
+          if (l < n && heapF[l] < heapF[smallest]) smallest = l;
+          if (r < n && heapF[r] < heapF[smallest]) smallest = r;
+          if (smallest === i) break;
+          [heapIdx[i], heapIdx[smallest]] = [heapIdx[smallest], heapIdx[i]];
+          [heapF[i], heapF[smallest]] = [heapF[smallest], heapF[i]];
+          i = smallest;
+        }
+      }
+      return top;
+    };
+
+    const octile = (c1: number, r1: number, c2: number, r2: number) => {
+      const dx = Math.abs(c1 - c2);
+      const dz = Math.abs(r1 - r2);
+      return Math.max(dx, dz) + 0.41421356 * Math.min(dx, dz);
+    };
+
+    gScore[startIdx] = 0;
+    pushHeap(startIdx, octile(sc, sr, gc, gr));
+
+    const dirs: [number, number, number][] = [
+      [1, 0, 1],
+      [-1, 0, 1],
+      [0, 1, 1],
+      [0, -1, 1],
+      [1, 1, 1.41421356],
+      [1, -1, 1.41421356],
+      [-1, 1, 1.41421356],
+      [-1, -1, 1.41421356],
+    ];
+
+    let found = false;
+    let bestClosestIdx = startIdx;
+    let bestClosestH = octile(sc, sr, gc, gr);
+    let expanded = 0;
+    const maxExpansions = Math.min(total, 18000);
+    const congestionWeight = algorithm === 'least-congested' ? 3.2 : 0.0;
+
+    while (heapIdx.length > 0 && expanded < maxExpansions) {
+      const cur = popHeap();
+      if (closed[cur]) continue;
+      closed[cur] = 1;
+      expanded++;
+
+      if (cur === goalIdx) {
+        found = true;
+        break;
+      }
+
+      const cr = Math.floor(cur / cols);
+      const cc = cur - cr * cols;
+      const hCur = octile(cc, cr, gc, gr);
+      if (hCur < bestClosestH) {
+        bestClosestH = hCur;
+        bestClosestIdx = cur;
+      }
+
+      const curInNoGo = Boolean(noGoMask && noGoMask[cur] === 1);
+
+      for (let d = 0; d < dirs.length; d++) {
+        const [dc, dr, baseCost] = dirs[d];
+        const nc = cc + dc;
+        const nr = cr + dr;
+        if (nc < 0 || nc >= cols || nr < 0 || nr >= rows) continue;
+        const nIdx = nr * cols + nc;
+        if (closed[nIdx] || grid[nIdx] !== 1) continue;
+
+        const nextInNoGo = Boolean(noGoMask && noGoMask[nIdx] === 1);
+        // Never enter a No-Go zone unless escaping outward from starting inside one
+        if (nextInNoGo && !(startedInNoGo && curInNoGo)) continue;
+
+        // Prevent clipping diagonal corners through walls/equipment/No-Go zones
+        if (dc !== 0 && dr !== 0) {
+          const idx1 = cr * cols + nc;
+          const idx2 = nr * cols + cc;
+          if (grid[idx1] !== 1 || grid[idx2] !== 1) continue;
+          if (!curInNoGo && noGoMask && (noGoMask[idx1] === 1 || noGoMask[idx2] === 1)) continue;
+        }
+
+        const stepMultiplier =
+          1 +
+          congestionCost[nIdx] * congestionWeight +
+          (nextInNoGo ? 12.0 : 0);
+        const tentative = gScore[cur] + baseCost * stepMultiplier;
+        if (tentative < gScore[nIdx]) {
+          cameFrom[nIdx] = cur;
+          gScore[nIdx] = tentative;
+          pushHeap(nIdx, tentative + octile(nc, nr, gc, gr));
+        }
+      }
+    }
+
+    const endIdx = found ? goalIdx : bestClosestIdx;
+    const rawPts: { x: number; z: number }[] = [];
+    let walk = endIdx;
+    while (walk !== -1) {
+      const wr = Math.floor(walk / cols);
+      const wc = walk - wr * cols;
+      rawPts.push({ x: (wc + 0.5) * cellSize, z: (wr + 0.5) * cellSize });
+      if (walk === startIdx) break;
+      walk = cameFrom[walk];
+    }
+    rawPts.reverse();
+
+    if (rawPts.length === 0) return [startPt, goalPt];
+    rawPts[0] = startPt;
+    if (found) rawPts[rawPts.length - 1] = goalPt;
+
+    // Greedy line-of-sight string-pull smoothing (preserving least-congested detours!)
+    const checkCongestion = algorithm === 'least-congested';
+    const smoothed: { x: number; z: number }[] = [rawPts[0]];
+    let anchor = 0;
+    while (anchor < rawPts.length - 1) {
+      let furthest = anchor + 1;
+      for (let probe = rawPts.length - 1; probe > anchor + 1; probe--) {
+        if (
+          hasCleanLineOfSight(
+            rawPts[anchor].x,
+            rawPts[anchor].z,
+            rawPts[probe].x,
+            rawPts[probe].z,
+            checkCongestion
+          )
+        ) {
+          furthest = probe;
+          break;
+        }
+      }
+      smoothed.push(rawPts[furthest]);
+      anchor = furthest;
+    }
+
+    return smoothed;
   };
 
   return {
@@ -271,12 +682,14 @@ export function buildFloorNavMesh(
     width,
     depth,
     grid,
+    congestionCost,
     walkableCount,
-    totalCount: cols * rows,
-    walkablePercent: cols * rows > 0 ? Math.round((walkableCount / (cols * rows)) * 100) : 0,
+    totalCount: total,
+    walkablePercent: total > 0 ? Math.round((walkableCount / total) * 100) : 0,
     isWalkable,
     resolveMove,
     findNearestWalkable,
+    findPath,
   };
 }
 
@@ -298,7 +711,6 @@ export function buildNavMeshVisualGroup(navMesh: FloorNavMesh, yOffset = 0.09): 
       const z0 = r * cs + inset;
       const z1 = (r + 1) * cs - inset;
 
-      // Two triangles per walkable cell
       positions.push(x0, yOffset, z0, x0, yOffset, z1, x1, yOffset, z1);
       positions.push(x0, yOffset, z0, x1, yOffset, z1, x1, yOffset, z0);
     }

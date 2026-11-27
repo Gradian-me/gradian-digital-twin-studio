@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   Box,
   Grid,
+  Lightbulb,
   Plus,
   Search,
   Sparkles,
@@ -17,6 +18,8 @@ import { DEFAULT_MATERIALS } from '../data/materialsLibrary';
 import { getProceduralMaterial } from '../engine/proceduralTextures';
 import { buildProceduralEquipmentGroup } from '../engine/equipmentBuilder';
 import { formatCurrency } from '../utils/spatial';
+import { attachCanvasPinchGuard } from '../utils/preventPinchZoom';
+import { LightingDesignerPanel } from './LightingDesignerPanel';
 import type { EquipmentCategory, ObjectLibraryItem, SpatialAsset } from '../types/twin';
 
 const isSoftwareGl = (() => {
@@ -105,6 +108,7 @@ export const ModelsGalleryModal: React.FC = () => {
   const setSelectedObjectTemplateId = useTwinStore((s) => s.setSelectedObjectTemplateId);
   const setActiveTool = useTwinStore((s) => s.setActiveTool);
 
+  const [galleryTab, setGalleryTab] = useState<'models' | 'lighting'>('models');
   const [search, setSearch] = useState('');
   const [cat, setCat] = useState<EquipmentCategory | 'All'>('All');
   const [selectedId, setSelectedId] = useState<string>(OBJECT_LIBRARY[0].id);
@@ -355,8 +359,18 @@ export const ModelsGalleryModal: React.FC = () => {
     });
     ro.observe(container);
 
+    const detachPinch = attachCanvasPinchGuard(container, (deltaY) => {
+      const factor = deltaY > 0 ? 1.06 : 0.94;
+      const offset = cam.position.clone().sub(controls.target);
+      offset.setLength(THREE.MathUtils.clamp(offset.length() * factor, 0.8, 40));
+      cam.position.copy(controls.target).add(offset);
+      controls.update();
+      requestRender();
+    });
+
     return () => {
       disposed = true;
+      detachPinch();
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
       ro.disconnect();
@@ -364,7 +378,7 @@ export const ModelsGalleryModal: React.FC = () => {
       envTex.dispose();
       renderer.dispose();
     };
-  }, [showModelsGallery, activeModel, wireframeOverlay]);
+  }, [showModelsGallery, activeModel, wireframeOverlay, galleryTab]);
 
   if (!showModelsGallery) return null;
 
@@ -383,8 +397,8 @@ export const ModelsGalleryModal: React.FC = () => {
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-3 sm:p-5">
-      <div className="w-full max-w-6xl h-[88vh] bg-white dark:bg-[#111114] border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+    <div className="fixed inset-0 z-50 bg-black/75 flex items-end sm:items-center justify-center p-0 sm:p-4">
+      <div className="w-full max-w-6xl h-[100dvh] sm:h-[88vh] bg-white dark:bg-[#111114] border-0 sm:border border-zinc-200 dark:border-zinc-800 rounded-none sm:rounded-2xl shadow-2xl flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-5 py-3.5 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-4 bg-zinc-50 dark:bg-[#0D0D10] shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
@@ -408,15 +422,50 @@ export const ModelsGalleryModal: React.FC = () => {
               </p>
             </div>
           </div>
-          <button
-            onClick={() => setShowModelsGallery(false)}
-            className="p-1.5 rounded-lg text-zinc-400 hover:text-zinc-900 dark:hover:text-white hover:bg-zinc-200/60 dark:hover:bg-zinc-800 shrink-0"
-          >
-            <X className="w-4 h-4" />
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="flex items-center p-0.5 rounded-xl bg-zinc-200/70 dark:bg-[#171720] border border-zinc-300 dark:border-zinc-800">
+              <button
+                type="button"
+                onClick={() => setGalleryTab('models')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                  galleryTab === 'models'
+                    ? 'bg-violet-600 text-white shadow-sm'
+                    : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
+                }`}
+              >
+                <Box className="w-3.5 h-3.5" />
+                3D Equipment ({allModels.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setGalleryTab('lighting')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer ${
+                  galleryTab === 'lighting'
+                    ? 'bg-amber-500 text-zinc-950 shadow-sm'
+                    : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
+                }`}
+              >
+                <Lightbulb className="w-3.5 h-3.5" />
+                Light &amp; Switch Designer
+              </button>
+            </div>
+            <button
+              onClick={() => setShowModelsGallery(false)}
+              className="p-1.5 rounded-lg text-zinc-400 hover:text-zinc-900 dark:hover:text-white hover:bg-zinc-200/60 dark:hover:bg-zinc-800 shrink-0"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
         </div>
 
-        {/* Body Split: Left Catalog Grid + Right Live 3D Inspector Stage */}
+        {galleryTab === 'lighting' ? (
+          <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-5 bg-white dark:bg-[#111116]">
+            <div className="max-w-4xl mx-auto">
+              <LightingDesignerPanel />
+            </div>
+          </div>
+        ) : (
+        /* Body Split: Left Catalog Grid + Right Live 3D Inspector Stage */
         <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-12 overflow-hidden">
           {/* Left Model Grid */}
           <div className="lg:col-span-7 flex flex-col min-h-0 border-b lg:border-b-0 lg:border-r border-zinc-200 dark:border-zinc-800">
@@ -431,12 +480,12 @@ export const ModelsGalleryModal: React.FC = () => {
                   className="w-full pl-8 pr-3 py-1.5 text-xs rounded-lg bg-zinc-50 dark:bg-[#18181C] border border-zinc-200 dark:border-zinc-800"
                 />
               </div>
-              <div className="flex flex-wrap gap-1">
+              <div className="flex items-center gap-1 overflow-x-auto pb-0.5">
                 {(['All', ...EQUIPMENT_CATEGORIES] as const).map((c) => (
                   <button
                     key={c}
                     onClick={() => setCat(c)}
-                    className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors ${
+                    className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap shrink-0 ${
                       cat === c
                         ? 'bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900'
                         : 'bg-zinc-100 dark:bg-[#18181C] text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
@@ -448,7 +497,7 @@ export const ModelsGalleryModal: React.FC = () => {
               </div>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-3 grid grid-cols-2 sm:grid-cols-3 gap-2.5 content-start">
+            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-3 grid grid-cols-2 sm:grid-cols-3 gap-2.5 content-start">
               {filtered.map((item) => {
                 const isSelected = item.id === activeModel?.id;
                 return (
@@ -564,6 +613,7 @@ export const ModelsGalleryModal: React.FC = () => {
             )}
           </div>
         </div>
+        )}
       </div>
     </div>
   );

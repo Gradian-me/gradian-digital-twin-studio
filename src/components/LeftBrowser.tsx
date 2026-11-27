@@ -35,9 +35,11 @@ import { useRiskIncidentStore, getTargetFmeaSummary } from '../store/useRiskInci
 import { useGmpStore } from '../store/useGmpStore';
 import { useTelemetryStore } from '../store/useTelemetryStore';
 import { SPACE_CATEGORIES, SPACE_TYPE_LIBRARY } from '../data/spaceTypes';
+import { SMART_ROOM_TEMPLATES } from '../data/smartRoomTemplates';
 import { EQUIPMENT_CATEGORIES, OBJECT_LIBRARY } from '../data/objectLibrary';
 import { formatArea, formatLength } from '../utils/spatial';
 import type { EquipmentCategory, SpaceCategory } from '../types/twin';
+import { VirtualList } from './VirtualList';
 
 type AssetPanelMode = 'placed' | 'catalog';
 type ElementTypeFilter = 'all' | 'asset' | 'room' | 'wall' | 'opening' | 'camera';
@@ -88,6 +90,7 @@ export const LeftBrowser: React.FC = () => {
   const addFloor = useTwinStore((s) => s.addFloor);
   const addBuilding = useTwinStore((s) => s.addBuilding);
   const addRoom = useTwinStore((s) => s.addRoom);
+  const addSmartRoomFromTemplate = useTwinStore((s) => s.addSmartRoomFromTemplate);
   const addAsset = useTwinStore((s) => s.addAsset);
   const updateLayer = useTwinStore((s) => s.updateLayer);
   const addLayer = useTwinStore((s) => s.addLayer);
@@ -117,10 +120,21 @@ export const LeftBrowser: React.FC = () => {
   const riskIncidents = useRiskIncidentStore((s) => s.incidents);
   const openRiskModal = useRiskIncidentStore((s) => s.openRiskModal);
   const complianceByAssetId = useGmpStore((s) => s.complianceByAssetId);
-  const sensors = useTelemetryStore((s) => s.sensors);
-  const readings = useTelemetryStore((s) => s.readings);
+  // Subscribe only to a stable alert signature string so 1.5s nominal telemetry ticks never re-render LeftBrowser
+  const sensorAlertSignature = useTelemetryStore((s) => {
+    const entries: string[] = [];
+    for (const sn of s.sensors) {
+      const st = s.readings[sn.id]?.status;
+      if (st === 'alarm' || st === 'warning') {
+        entries.push(`${sn.targetId}:${st}`);
+      }
+    }
+    entries.sort();
+    return entries.join('|');
+  });
 
   const [search, setSearch] = useState('');
+  const [spacesSubTab, setSpacesSubTab] = useState<'smart' | 'types'>('smart');
   const [spaceCat, setSpaceCat] = useState<'All' | 'Favorites' | SpaceCategory>('All');
   const [objCat, setObjCat] = useState<'All' | 'Favorites' | EquipmentCategory>('All');
   // Assets tab: Scene Elements locator vs Equipment Catalog
@@ -208,15 +222,18 @@ export const LeftBrowser: React.FC = () => {
     const floorCodeById = new Map(scene.floors.map((f) => [f.id, f.code]));
     const roomNameById = new Map(scene.rooms.map((r) => [r.id, `${r.code} ${r.name}`]));
 
-    // Build quick lookup of telemetry alarms/warnings by targetId
+    // Build quick lookup of telemetry alarms/warnings by targetId from stable alert signature
     const sensorAlertByTarget = new Map<string, 'alarm' | 'warning'>();
-    sensors.forEach((sn) => {
-      const st = readings[sn.id]?.status;
-      if (st === 'alarm' || st === 'warning') {
-        const prev = sensorAlertByTarget.get(sn.targetId);
-        if (st === 'alarm' || !prev) sensorAlertByTarget.set(sn.targetId, st);
+    if (sensorAlertSignature) {
+      for (const part of sensorAlertSignature.split('|')) {
+        const sepIdx = part.lastIndexOf(':');
+        if (sepIdx <= 0) continue;
+        const targetId = part.slice(0, sepIdx);
+        const st = part.slice(sepIdx + 1) as 'alarm' | 'warning';
+        const prev = sensorAlertByTarget.get(targetId);
+        if (st === 'alarm' || !prev) sensorAlertByTarget.set(targetId, st);
       }
-    });
+    }
 
     const items: IndexedSceneElement[] = [];
 
@@ -451,8 +468,7 @@ export const LeftBrowser: React.FC = () => {
     scene.unitSystem,
     riskIncidents,
     complianceByAssetId,
-    sensors,
-    readings,
+    sensorAlertSignature,
     showFmeaIndicators,
   ]);
 
@@ -1037,31 +1053,132 @@ export const LeftBrowser: React.FC = () => {
         </div>
       )}
 
-      {/* TAB 2: SPACE TYPE LIBRARY */}
+      {/* TAB 2: SMART ROOM TEMPLATES & SPACE TYPE LIBRARY */}
       {leftTab === 'spaces' && (
         <div className="flex-1 flex flex-col overflow-hidden">
-          <div className="px-2.5 py-2 border-b border-slate-200 dark:border-zinc-800 flex items-center gap-1.5">
-            <select
-              value={spaceCat}
-              onChange={(e) => setSpaceCat(e.target.value as any)}
-              className="flex-1 px-2 py-1 text-xs rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-            >
-              <option value="All">All Categories ({allSpaceTypes.length})</option>
-              <option value="Favorites">Favorites ({favoriteSpaceTypes.length})</option>
-              {SPACE_CATEGORIES.map((c) => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
-            <button
-              onClick={() => setShowCustomSpace((v) => !v)}
-              className="p-1.5 rounded border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-[#22222C]"
-              title="Save Custom Space Template"
-            >
-              <Plus className="w-3.5 h-3.5" />
-            </button>
+          <div className="px-2.5 pt-2 pb-1.5 border-b border-slate-200 dark:border-zinc-800 space-y-2">
+            <div className="grid grid-cols-2 gap-1 p-0.5 rounded-lg bg-slate-100 dark:bg-[#14141C] border border-slate-200 dark:border-zinc-800">
+              <button
+                type="button"
+                onClick={() => setSpacesSubTab('smart')}
+                className={`py-1 rounded-md text-[11px] font-semibold transition-colors cursor-pointer flex items-center justify-center gap-1 ${
+                  spacesSubTab === 'smart'
+                    ? 'bg-violet-600 text-white shadow-sm'
+                    : 'text-slate-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
+                }`}
+              >
+                <Sparkles className="w-3 h-3" />
+                Smart Rooms ({SMART_ROOM_TEMPLATES.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setSpacesSubTab('types')}
+                className={`py-1 rounded-md text-[11px] font-semibold transition-colors cursor-pointer ${
+                  spacesSubTab === 'types'
+                    ? 'bg-violet-600 text-white shadow-sm'
+                    : 'text-slate-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
+                }`}
+              >
+                Space Types ({allSpaceTypes.length})
+              </button>
+            </div>
+
+            {spacesSubTab === 'types' && (
+              <div className="flex items-center gap-1.5">
+                <select
+                  value={spaceCat}
+                  onChange={(e) => setSpaceCat(e.target.value as any)}
+                  className="flex-1 px-2 py-1 text-xs rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                >
+                  <option value="All">All Categories ({allSpaceTypes.length})</option>
+                  <option value="Favorites">Favorites ({favoriteSpaceTypes.length})</option>
+                  {SPACE_CATEGORIES.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+                <button
+                  onClick={() => setShowCustomSpace((v) => !v)}
+                  className="p-1.5 rounded border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-[#22222C]"
+                  title="Save Custom Space Template"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
           </div>
 
-          {showCustomSpace && (
+          {spacesSubTab === 'smart' && (
+            <div className="flex-1 overflow-y-auto p-2 space-y-2">
+              <div className="px-2 py-1.5 rounded-lg bg-violet-500/10 border border-violet-500/30 text-[10.5px] text-violet-300 leading-snug">
+                Drag any Smart Room card onto the 2D or 3D floor plan — or click{' '}
+                <span className="font-semibold text-white">Drop on Floor</span> — to auto-populate
+                walls, doors, HVAC, fire sensors, lighting switches, and standard equipment.
+              </div>
+              {SMART_ROOM_TEMPLATES.filter((t) => {
+                const q = search.trim().toLowerCase();
+                if (!q) return true;
+                return `${t.name} ${t.tagline} ${t.category} ${t.cleanroomGrade} ${t.hvac.ahuId}`
+                  .toLowerCase()
+                  .includes(q);
+              }).map((tpl) => (
+                <div
+                  key={tpl.id}
+                  draggable
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData('application/x-gradian-smart-room', tpl.id);
+                    e.dataTransfer.effectAllowed = 'copy';
+                  }}
+                  className="p-2.5 rounded-xl border border-slate-200 dark:border-zinc-800 bg-white dark:bg-[#15151E] hover:border-violet-500/60 transition cursor-grab active:cursor-grabbing space-y-2"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className="w-2.5 h-2.5 rounded-sm shrink-0"
+                          style={{ backgroundColor: tpl.badgeColor }}
+                        />
+                        <span className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                          {tpl.name}
+                        </span>
+                      </div>
+                      <p className="text-[10.5px] text-slate-500 dark:text-zinc-400 mt-0.5 line-clamp-2">
+                        {tpl.tagline}
+                      </p>
+                    </div>
+                    <span className="font-mono text-[9.5px] text-zinc-400 tabular-nums shrink-0">
+                      {tpl.width}×{tpl.depth}m
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-1 text-[9.5px] font-mono text-zinc-400">
+                    <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-[#1D1D29] truncate">
+                      HVAC: {tpl.hvac.hepaClass} · {tpl.airChangesPerHour} ACH
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-[#1D1D29] truncate">
+                      Fire: {tpl.fireSensors.length} sens · {tpl.fireExtinguishers.length} ext
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-[#1D1D29] truncate">
+                      Equip: {tpl.equipment.length} assets
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-[#1D1D29] truncate">
+                      Lights: {tpl.lights.length} · {tpl.switches.length} sw
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => addSmartRoomFromTemplate(tpl.id)}
+                    className="w-full py-1.5 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-semibold flex items-center justify-center gap-1 transition cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    Drop on Floor
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {spacesSubTab === 'types' && showCustomSpace && (
             <div className="p-2.5 border-b border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-[#14141A] space-y-2 text-xs">
               <input
                 value={customSpaceName}
@@ -1089,18 +1206,30 @@ export const LeftBrowser: React.FC = () => {
             </div>
           )}
 
-          <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
-            {filteredSpaces.map((sp) => {
+          {spacesSubTab === 'types' && (
+          <VirtualList
+            items={filteredSpaces}
+            itemHeight={102}
+            gap={6}
+            overscan={5}
+            resetScrollKey={`${spaceCat}-${search}`}
+            className="flex-1 min-h-0 p-2"
+            getKey={(sp) => sp.id}
+            emptyState={
+              <div className="p-6 text-center text-xs text-slate-500">
+                No space types match this filter.
+              </div>
+            }
+            renderItem={(sp) => {
               const active = selectedSpaceTypeId === sp.id;
               const isFav = favoriteSpaceTypes.includes(sp.id);
               return (
                 <div
-                  key={sp.id}
                   ref={(el) => {
                     if (el) navItemRefs.current.set(`sp-${sp.id}`, el);
                     else navItemRefs.current.delete(`sp-${sp.id}`);
                   }}
-                  className={`p-2.5 rounded-lg border transition-colors ${
+                  className={`h-full p-2.5 rounded-lg border transition-colors flex flex-col justify-between ${
                     active || kbdNavId === `sp-${sp.id}`
                       ? 'border-violet-500 bg-violet-500/10'
                       : 'border-slate-200 dark:border-zinc-800 hover:border-slate-300 dark:hover:border-slate-700'
@@ -1124,7 +1253,7 @@ export const LeftBrowser: React.FC = () => {
                           {sp.name}
                         </span>
                       </div>
-                      <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1 font-mono tabular-nums">
+                      <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-1 font-mono tabular-nums truncate">
                         {sp.environmental.cleanroomGrade} · {sp.environmental.pressurePa >= 0 ? `+${sp.environmental.pressurePa}` : sp.environmental.pressurePa} Pa · {sp.defaultWidth}×{sp.defaultDepth}m
                       </div>
                     </div>
@@ -1135,7 +1264,7 @@ export const LeftBrowser: React.FC = () => {
                       <Star className="w-3.5 h-3.5" fill={isFav ? 'currentColor' : 'none'} />
                     </button>
                   </div>
-                  <div className="flex gap-1.5 mt-2">
+                  <div className="flex gap-1.5 mt-1.5">
                     <button
                       onClick={() => {
                         setSelectedSpaceTypeId(sp.id);
@@ -1158,8 +1287,9 @@ export const LeftBrowser: React.FC = () => {
                   </div>
                 </div>
               );
-            })}
-          </div>
+            }}
+          />
+          )}
         </div>
       )}
 
@@ -1317,10 +1447,16 @@ export const LeftBrowser: React.FC = () => {
             )}
           </div>
 
-          {/* SCENE ELEMENTS RESULTS LIST */}
+          {/* SCENE ELEMENTS RESULTS LIST (VIRTUALIZED) */}
           {assetPanelMode === 'placed' && (
-            <div className="flex-1 overflow-y-auto divide-y divide-zinc-100 dark:divide-zinc-800/70">
-              {filteredSceneElements.length === 0 ? (
+            <VirtualList
+              items={filteredSceneElements}
+              itemHeight={58}
+              overscan={8}
+              resetScrollKey={`${assetScope}-${elementTypeFilter}-${elementStatusFilter}-${placedEqCat}-${search}`}
+              className="flex-1 min-h-0"
+              getKey={(el) => el.key}
+              emptyState={
                 <div className="p-5 text-center space-y-2.5">
                   <div className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
                     No matching elements found
@@ -1349,141 +1485,139 @@ export const LeftBrowser: React.FC = () => {
                     )}
                   </div>
                 </div>
-              ) : (
-                filteredSceneElements.map((el) => {
-                  const isSel = selected.some(
-                    (s) => s.type === el.entity.type && s.id === el.entity.id
-                  );
-                  const statusColorCls =
-                    el.statusTone === 'emerald'
-                      ? 'text-emerald-600 dark:text-emerald-400'
-                      : el.statusTone === 'amber'
-                        ? 'text-amber-600 dark:text-amber-400'
-                        : el.statusTone === 'rose'
-                          ? 'text-rose-600 dark:text-rose-400'
-                          : 'text-zinc-500 dark:text-zinc-400';
+              }
+              renderItem={(el) => {
+                const isSel = selected.some(
+                  (s) => s.type === el.entity.type && s.id === el.entity.id
+                );
+                const statusColorCls =
+                  el.statusTone === 'emerald'
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : el.statusTone === 'amber'
+                      ? 'text-amber-600 dark:text-amber-400'
+                      : el.statusTone === 'rose'
+                        ? 'text-rose-600 dark:text-rose-400'
+                        : 'text-zinc-500 dark:text-zinc-400';
 
-                  const KindIcon =
-                    el.kind === 'asset'
-                      ? Box
-                      : el.kind === 'room'
-                        ? Grid2X2
-                        : el.kind === 'opening'
-                          ? DoorOpen
-                          : el.kind === 'camera'
-                            ? Camera
-                            : Square;
+                const KindIcon =
+                  el.kind === 'asset'
+                    ? Box
+                    : el.kind === 'room'
+                      ? Grid2X2
+                      : el.kind === 'opening'
+                        ? DoorOpen
+                        : el.kind === 'camera'
+                          ? Camera
+                          : Square;
 
-                  return (
-                    <div
-                      key={el.key}
-                      ref={(node) => {
-                        if (node) navItemRefs.current.set(el.key, node);
-                        else navItemRefs.current.delete(el.key);
-                      }}
-                      onClick={() => {
-                        setKbdNavId(el.key);
-                        focusEntity(el.entity);
-                      }}
-                      className={`group px-2.5 py-2 cursor-pointer transition-colors ${
-                        isSel || kbdNavId === el.key
-                          ? 'bg-violet-500/12 dark:bg-violet-500/15'
-                          : 'hover:bg-zinc-50 dark:hover:bg-zinc-800/40'
-                      }`}
-                    >
-                      <div className="flex items-start justify-between gap-1.5">
-                        <div className="flex items-start gap-2 min-w-0 flex-1">
-                          <KindIcon
-                            className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${
-                              isSel
-                                ? 'text-violet-600 dark:text-violet-400'
-                                : 'text-zinc-400 dark:text-zinc-500'
-                            }`}
-                          />
-                          <div className="min-w-0 flex-1">
-                            <div className="flex items-center justify-between gap-1.5">
-                              <span
-                                className={`text-xs font-medium truncate ${
-                                  isSel
-                                    ? 'text-violet-700 dark:text-violet-300'
-                                    : 'text-zinc-900 dark:text-zinc-100'
-                                }`}
-                              >
-                                {el.name}
-                              </span>
-                              <span className="font-mono text-[10px] text-zinc-400 shrink-0 tabular-nums">
-                                {el.code}
-                              </span>
-                            </div>
-
-                            <div className="mt-0.5 flex items-center gap-1 text-[10.5px] text-zinc-500 dark:text-zinc-400 truncate">
-                              <span className="shrink-0">{el.kindLabel}</span>
-                              <span>·</span>
-                              <span className={`font-medium shrink-0 ${statusColorCls}`}>
-                                {el.statusLabel}
-                              </span>
-                              <span>·</span>
-                              <span className="truncate font-mono tabular-nums text-[10px]">
-                                {el.metaText}
-                              </span>
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-0.5 shrink-0">
-                          {el.fmeaShortLabel && el.fmeaIncidentId && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                openRiskModal({ mode: 'resolve', incidentId: el.fmeaIncidentId! });
-                              }}
-                              title="Open FMEA Risk Incident"
-                              className={`px-1 py-0.5 rounded font-mono text-[9px] font-bold tabular-nums cursor-pointer ${
-                                el.fmeaLevel === 'critical'
-                                  ? 'text-rose-500 bg-rose-500/12'
-                                  : el.fmeaLevel === 'high'
-                                    ? 'text-amber-500 bg-amber-500/12'
-                                    : el.fmeaLevel === 'mitigated'
-                                      ? 'text-emerald-500 bg-emerald-500/12'
-                                      : 'text-violet-400 bg-violet-500/12'
+                return (
+                  <div
+                    ref={(node) => {
+                      if (node) navItemRefs.current.set(el.key, node);
+                      else navItemRefs.current.delete(el.key);
+                    }}
+                    onClick={() => {
+                      setKbdNavId(el.key);
+                      focusEntity(el.entity);
+                    }}
+                    className={`h-full group px-2.5 py-2 border-b border-zinc-100 dark:border-zinc-800/70 cursor-pointer transition-colors flex items-center ${
+                      isSel || kbdNavId === el.key
+                        ? 'bg-violet-500/12 dark:bg-violet-500/15'
+                        : 'hover:bg-zinc-50 dark:hover:bg-zinc-800/40'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-1.5 w-full min-w-0">
+                      <div className="flex items-start gap-2 min-w-0 flex-1">
+                        <KindIcon
+                          className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${
+                            isSel
+                              ? 'text-violet-600 dark:text-violet-400'
+                              : 'text-zinc-400 dark:text-zinc-500'
+                          }`}
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center justify-between gap-1.5">
+                            <span
+                              className={`text-xs font-medium truncate ${
+                                isSel
+                                  ? 'text-violet-700 dark:text-violet-300'
+                                  : 'text-zinc-900 dark:text-zinc-100'
                               }`}
                             >
-                              {el.fmeaShortLabel}
-                            </button>
-                          )}
-                          {(el.kind === 'asset' || el.kind === 'room') && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                openEntityInfo({ type: el.kind as 'asset' | 'room', id: el.entity.id });
-                              }}
-                              className="p-1 rounded text-zinc-400 hover:text-violet-500 hover:bg-zinc-200/70 dark:hover:bg-zinc-800 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
-                              title="View full specs, SOP & history"
-                            >
-                              <Info className="w-3 h-3" />
-                            </button>
-                          )}
+                              {el.name}
+                            </span>
+                            <span className="font-mono text-[10px] text-zinc-400 shrink-0 tabular-nums">
+                              {el.code}
+                            </span>
+                          </div>
+
+                          <div className="mt-0.5 flex items-center gap-1 text-[10.5px] text-zinc-500 dark:text-zinc-400 truncate">
+                            <span className="shrink-0">{el.kindLabel}</span>
+                            <span>·</span>
+                            <span className={`font-medium shrink-0 ${statusColorCls}`}>
+                              {el.statusLabel}
+                            </span>
+                            <span>·</span>
+                            <span className="truncate font-mono tabular-nums text-[10px]">
+                              {el.metaText}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-0.5 shrink-0">
+                        {el.fmeaShortLabel && el.fmeaIncidentId && (
                           <button
                             type="button"
                             onClick={(e) => {
                               e.stopPropagation();
-                              setViewMode('3d-perspective');
-                              focusEntity(el.entity);
+                              openRiskModal({ mode: 'resolve', incidentId: el.fmeaIncidentId! });
                             }}
-                            className="p-1 rounded text-zinc-400 hover:text-emerald-500 hover:bg-zinc-200/70 dark:hover:bg-zinc-800 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
-                            title="Fly directly to element in 3D"
+                            title="Open FMEA Risk Incident"
+                            className={`px-1 py-0.5 rounded font-mono text-[9px] font-bold tabular-nums cursor-pointer ${
+                              el.fmeaLevel === 'critical'
+                                ? 'text-rose-500 bg-rose-500/12'
+                                : el.fmeaLevel === 'high'
+                                  ? 'text-amber-500 bg-amber-500/12'
+                                  : el.fmeaLevel === 'mitigated'
+                                    ? 'text-emerald-500 bg-emerald-500/12'
+                                    : 'text-violet-400 bg-violet-500/12'
+                            }`}
                           >
-                            <Focus className="w-3 h-3" />
+                            {el.fmeaShortLabel}
                           </button>
-                        </div>
+                        )}
+                        {(el.kind === 'asset' || el.kind === 'room') && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openEntityInfo({ type: el.kind as 'asset' | 'room', id: el.entity.id });
+                            }}
+                            className="p-1 rounded text-zinc-400 hover:text-violet-500 hover:bg-zinc-200/70 dark:hover:bg-zinc-800 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+                            title="View full specs, SOP & history"
+                          >
+                            <Info className="w-3 h-3" />
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setViewMode('3d-perspective');
+                            focusEntity(el.entity);
+                          }}
+                          className="p-1 rounded text-zinc-400 hover:text-emerald-500 hover:bg-zinc-200/70 dark:hover:bg-zinc-800 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+                          title="Fly directly to element in 3D"
+                        >
+                          <Focus className="w-3 h-3" />
+                        </button>
                       </div>
                     </div>
-                  );
-                })
-              )}
-            </div>
+                  </div>
+                );
+              }}
+            />
           )}
 
           {/* EQUIPMENT CATALOG VIEW */}
@@ -1531,13 +1665,24 @@ export const LeftBrowser: React.FC = () => {
                 </div>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-2 space-y-1.5">
-                {filteredObjects.map((obj) => {
+              <VirtualList
+                items={filteredObjects}
+                itemHeight={106}
+                gap={6}
+                overscan={5}
+                resetScrollKey={`${objCat}-${search}`}
+                className="flex-1 min-h-0 p-2"
+                getKey={(obj) => obj.id}
+                emptyState={
+                  <div className="p-6 text-center text-xs text-slate-500">
+                    No equipment templates match this filter.
+                  </div>
+                }
+                renderItem={(obj) => {
                   const active = selectedObjectTemplateId === obj.id;
                   const isFav = favoriteObjects.includes(obj.id);
                   return (
                     <div
-                      key={obj.id}
                       ref={(el) => {
                         if (el) navItemRefs.current.set(`obj-${obj.id}`, el);
                         else navItemRefs.current.delete(`obj-${obj.id}`);
@@ -1547,7 +1692,7 @@ export const LeftBrowser: React.FC = () => {
                         e.dataTransfer.setData('application/x-gradian-object', obj.id);
                         setSelectedObjectTemplateId(obj.id);
                       }}
-                      className={`p-2.5 rounded-lg border cursor-grab active:cursor-grabbing transition-colors ${
+                      className={`h-full p-2.5 rounded-lg border cursor-grab active:cursor-grabbing transition-colors flex flex-col justify-between ${
                         active || kbdNavId === `obj-${obj.id}`
                           ? 'border-violet-500 bg-violet-500/10'
                           : 'border-slate-200 dark:border-zinc-800 hover:border-slate-300 dark:hover:border-slate-700'
@@ -1561,7 +1706,7 @@ export const LeftBrowser: React.FC = () => {
                           <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
                             {obj.manufacturer} · {obj.model}
                           </div>
-                          <div className="text-[10px] font-mono tabular-nums text-slate-400 mt-0.5">
+                          <div className="text-[10px] font-mono tabular-nums text-slate-400 mt-0.5 truncate">
                             {formatLength(obj.width, scene.unitSystem, 1)} × {formatLength(obj.depth, scene.unitSystem, 1)} × {formatLength(obj.height, scene.unitSystem, 1)} · {obj.energyKw} kW
                           </div>
                         </div>
@@ -1572,7 +1717,7 @@ export const LeftBrowser: React.FC = () => {
                           <Star className="w-3.5 h-3.5" fill={isFav ? 'currentColor' : 'none'} />
                         </button>
                       </div>
-                      <div className="flex gap-1.5 mt-2">
+                      <div className="flex gap-1.5 mt-1.5">
                         <button
                           onClick={() => {
                             setSelectedObjectTemplateId(obj.id);
@@ -1594,8 +1739,8 @@ export const LeftBrowser: React.FC = () => {
                       </div>
                     </div>
                   );
-                })}
-              </div>
+                }}
+              />
             </>
           )}
         </div>

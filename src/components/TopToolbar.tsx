@@ -3,6 +3,7 @@ import {
   Activity,
   AppWindow,
   ArrowLeft,
+  Bot,
   Box,
   CalendarClock,
   Camera,
@@ -70,7 +71,50 @@ import { useRiskIncidentStore } from '../store/useRiskIncidentStore';
 import { useAclStore, computeEffectivePermissions, getActiveAclUser } from '../store/useAclStore';
 import { useAuth } from '../context/AuthContext';
 import { UserAvatarMenu } from './UserAvatarMenu';
+import { GlobalVoiceCommandListener } from './GlobalVoiceCommandListener';
 import type { OrthoPreset, ToolMode } from '../types/twin';
+
+interface IconTooltipProps {
+  label: string;
+  shortcut?: string;
+  align?: 'center' | 'left' | 'right';
+  className?: string;
+  children: React.ReactNode;
+}
+
+const IconTooltip: React.FC<IconTooltipProps> = ({
+  label,
+  shortcut,
+  align = 'center',
+  className = '',
+  children,
+}) => {
+  const posCls =
+    align === 'left'
+      ? 'left-0'
+      : align === 'right'
+        ? 'right-0'
+        : 'left-1/2 -translate-x-1/2';
+
+  return (
+    <div className={`relative group/tip inline-flex items-center ${className}`}>
+      {children}
+      <div
+        role="tooltip"
+        className={`pointer-events-none absolute top-full mt-2 ${posCls} z-[80] opacity-0 translate-y-0.5 group-hover/tip:opacity-100 group-hover/tip:translate-y-0 group-focus-within/tip:opacity-100 group-focus-within/tip:translate-y-0 transition-all duration-150 whitespace-nowrap`}
+      >
+        <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-zinc-950 dark:bg-zinc-900 text-zinc-100 border border-zinc-700/90 shadow-xl text-[11px] font-medium">
+          <span>{label}</span>
+          {shortcut && (
+            <kbd className="px-1 py-0.2 rounded bg-zinc-800 border border-zinc-700 text-[9.5px] font-mono text-zinc-300">
+              {shortcut}
+            </kbd>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
 
 export const TopToolbar: React.FC = () => {
   const scene = useTwinStore((s) => s.scene);
@@ -321,18 +365,20 @@ export const TopToolbar: React.FC = () => {
   return (
     <header
       ref={headerRef}
-      className="h-14 bg-white dark:bg-[#121216] border-b border-zinc-200 dark:border-zinc-800/90 px-3 lg:px-4 flex items-center justify-between gap-2 shrink-0 z-30"
+      className="h-13 sm:h-14 bg-white dark:bg-[#121216] border-b border-zinc-200 dark:border-zinc-800/90 px-2 sm:px-3 flex items-center justify-between gap-1.5 sm:gap-2 shrink-0 z-30"
     >
-      {/* ZONE 1 (Left): Back to Hub + Active Floor + Ctrl+K Search + Undo/Redo */}
-      <div className="flex items-center gap-2 min-w-0">
-        <button
-          onClick={() => setScreen('hub')}
-          className="flex items-center gap-1.5 h-9 px-2.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] text-zinc-700 dark:text-zinc-200 hover:border-violet-500 hover:text-violet-600 dark:hover:text-violet-300 text-xs font-medium transition-colors whitespace-nowrap shrink-0"
-          title="Back to Executive Overview Hub"
-        >
-          <ArrowLeft className="w-3.5 h-3.5" />
-          <span className="hidden xl:inline">Overview</span>
-        </button>
+      {/* ZONE 1 (Left): Overview + Active Floor + Search + Undo/Redo */}
+      <div className="flex items-center gap-1.5 min-w-0 shrink">
+        <IconTooltip label="Executive Overview Hub" align="left">
+          <button
+            type="button"
+            onClick={() => setScreen('hub')}
+            aria-label="Back to Executive Overview Hub"
+            className="flex items-center justify-center h-9 w-9 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] text-zinc-700 dark:text-zinc-200 hover:border-violet-500 hover:text-violet-600 dark:hover:text-violet-300 transition-colors shrink-0 cursor-pointer"
+          >
+            <ArrowLeft className="w-4 h-4" />
+          </button>
+        </IconTooltip>
 
         <select
           aria-label="Active Floor or Campus View"
@@ -355,7 +401,7 @@ export const TopToolbar: React.FC = () => {
               setActiveFloor(val);
             }
           }}
-          className="h-9 px-2.5 text-xs font-medium rounded-xl bg-zinc-100 dark:bg-[#18181F] border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100 max-w-[148px] lg:max-w-[192px] truncate focus:outline-none focus:border-violet-500"
+          className="h-9 px-2 text-xs font-medium rounded-xl bg-zinc-100 dark:bg-[#18181F] border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100 min-w-[84px] max-w-[118px] sm:max-w-[152px] lg:max-w-[186px] truncate focus:outline-none focus:border-violet-500"
         >
           <option value="__SITE__">All Buildings (Site)</option>
           <option value="__ALL_FLOORS__">All Floors (Building)</option>
@@ -366,100 +412,109 @@ export const TopToolbar: React.FC = () => {
           ))}
         </select>
 
-        {/* Global Ctrl+K Search Trigger */}
-        <button
-          onClick={() => setShowQuickSearch(true)}
-          className="flex items-center gap-2 h-9 px-3 rounded-xl bg-zinc-100 dark:bg-[#18181F] border border-zinc-200 dark:border-zinc-800 hover:border-violet-500/70 text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors whitespace-nowrap shrink-0"
-          title="Command & Direct Search (Ctrl+K)"
-        >
-          <Search className="w-3.5 h-3.5 text-violet-500" />
-          <span className="hidden lg:inline">Search...</span>
-          <kbd className="hidden sm:inline px-1.5 py-0.5 text-[10px] font-mono rounded-md bg-white dark:bg-[#111116] border border-zinc-200 dark:border-zinc-700 text-zinc-500">
-            ⌘K
-          </kbd>
-        </button>
+        {/* Global Ctrl+K Search Icon */}
+        <IconTooltip label="Command & Asset Search" shortcut="⌘K">
+          <button
+            type="button"
+            onClick={() => setShowQuickSearch(true)}
+            aria-label="Command & Asset Search"
+            className="flex items-center justify-center gap-1.5 h-9 w-9 xl:w-auto xl:px-2.5 rounded-xl bg-zinc-100 dark:bg-[#18181F] border border-zinc-200 dark:border-zinc-800 hover:border-violet-500/70 text-xs text-zinc-600 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors shrink-0 cursor-pointer"
+          >
+            <Search className="w-4 h-4 text-violet-500" />
+            <kbd className="hidden xl:inline px-1 py-0.5 text-[9.5px] font-mono rounded bg-white dark:bg-[#111116] border border-zinc-200 dark:border-zinc-700 text-zinc-500">
+              ⌘K
+            </kbd>
+          </button>
+        </IconTooltip>
 
         {/* Compact Undo / Redo */}
-        <div className="hidden xl:flex items-center gap-0.5 pl-1 border-l border-zinc-200 dark:border-zinc-800 shrink-0">
-          <button
-            onClick={undo}
-            disabled={past.length === 0}
-            className="p-2 rounded-xl text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-30 transition-colors"
-            title="Undo (Ctrl+Z)"
-          >
-            <Undo2 className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={redo}
-            disabled={future.length === 0}
-            className="p-2 rounded-xl text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-30 transition-colors"
-            title="Redo (Ctrl+Y)"
-          >
-            <Redo2 className="w-3.5 h-3.5" />
-          </button>
+        <div className="hidden lg:flex items-center gap-0.5 pl-1 border-l border-zinc-200 dark:border-zinc-800 shrink-0">
+          <IconTooltip label="Undo" shortcut="Ctrl+Z">
+            <button
+              type="button"
+              onClick={undo}
+              disabled={past.length === 0}
+              aria-label="Undo"
+              className="h-8 w-8 rounded-lg flex items-center justify-center text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-30 transition-colors cursor-pointer"
+            >
+              <Undo2 className="w-3.5 h-3.5" />
+            </button>
+          </IconTooltip>
+          <IconTooltip label="Redo" shortcut="Ctrl+Y">
+            <button
+              type="button"
+              onClick={redo}
+              disabled={future.length === 0}
+              aria-label="Redo"
+              className="h-8 w-8 rounded-lg flex items-center justify-center text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-30 transition-colors cursor-pointer"
+            >
+              <Redo2 className="w-3.5 h-3.5" />
+            </button>
+          </IconTooltip>
         </div>
       </div>
 
-      {/* ZONE 2 (Center): Design/View Lock + View Mode Switcher + CAD Tools & 3D/Heatmap Popovers */}
-      <div className="flex items-center gap-2 shrink-0">
-        {/* Strict Design / View Mode Segmented Switcher */}
-        <div
-          className="flex items-center bg-zinc-100 dark:bg-[#18181F] p-1 rounded-xl border border-zinc-200 dark:border-zinc-800"
-          title={
-            !aclCanEdit
-              ? 'ACL Read-Only — active role lacks spatial edit permission'
-              : 'Switch between Design Mode (editable) and View Mode (strict read-only)'
-          }
-        >
-          <button
-            onClick={() => {
-              if (!aclCanEdit) {
-                showToast('ACL Read-Only: active user role cannot enter Design Mode.', 'warning');
-                return;
-              }
-              setWorkspaceMode('design');
-            }}
-            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold whitespace-nowrap transition-colors ${
-              !isReadOnly
-                ? 'bg-violet-600 text-white shadow-xs'
-                : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
-            } ${!aclCanEdit ? 'opacity-45 cursor-not-allowed' : ''}`}
-          >
-            <Pencil className="w-3 h-3" />
-            <span className="hidden xl:inline">Design</span>
-          </button>
-          <button
-            onClick={() => setWorkspaceMode('view')}
-            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold whitespace-nowrap transition-colors ${
-              isReadOnly
-                ? 'bg-amber-500 text-zinc-950 shadow-xs'
-                : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
-            }`}
-          >
-            {!aclCanEdit ? <Lock className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
-            <span className="hidden xl:inline">{!aclCanEdit ? 'ACL Lock' : 'View'}</span>
-          </button>
+      {/* ZONE 2 (Center): Minimal Icon Controls — Mode, CAD Tools, View Dim, 3D Inspection, Walkthrough, VR */}
+      <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+        {/* Compact Design / View Icon Toggle */}
+        <div className="flex items-center bg-zinc-100 dark:bg-[#18181F] p-0.5 rounded-xl border border-zinc-200 dark:border-zinc-800">
+          <IconTooltip label={aclCanEdit ? 'Design Mode (Editable)' : 'ACL Read-Only'}>
+            <button
+              type="button"
+              onClick={() => {
+                if (!aclCanEdit) {
+                  showToast('ACL Read-Only: active user role cannot enter Design Mode.', 'warning');
+                  return;
+                }
+                setWorkspaceMode('design');
+              }}
+              aria-label="Design Mode"
+              className={`h-8 w-8 rounded-lg flex items-center justify-center transition-colors ${
+                !isReadOnly
+                  ? 'bg-violet-600 text-white shadow-xs'
+                  : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
+              } ${!aclCanEdit ? 'opacity-45 cursor-not-allowed' : 'cursor-pointer'}`}
+            >
+              <Pencil className="w-3.5 h-3.5" />
+            </button>
+          </IconTooltip>
+          <IconTooltip label={!aclCanEdit ? 'ACL Locked View' : 'View Mode (Read-Only)'}>
+            <button
+              type="button"
+              onClick={() => setWorkspaceMode('view')}
+              aria-label="View Mode"
+              className={`h-8 w-8 rounded-lg flex items-center justify-center transition-colors cursor-pointer ${
+                isReadOnly
+                  ? 'bg-amber-500 text-zinc-950 shadow-xs'
+                  : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
+              }`}
+            >
+              {!aclCanEdit ? <Lock className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+            </button>
+          </IconTooltip>
         </div>
 
-        {/* CAD Authoring Tools — Hover or Click Popover (Eliminates Always-Visible Clutter) */}
+        {/* CAD Authoring Tools — Minimal Icon Popover */}
         <div
           className="relative"
           onMouseEnter={() => setOpenMenu('tools')}
           onMouseLeave={() => setOpenMenu((m) => (m === 'tools' ? 'none' : m))}
         >
-          <button
-            onClick={() => setOpenMenu((m) => (m === 'tools' ? 'none' : 'tools'))}
-            className={`flex items-center gap-1.5 h-9 px-3 rounded-xl border text-xs font-medium whitespace-nowrap transition-colors ${
-              activeTool !== 'select' || openMenu === 'tools'
-                ? 'border-violet-500/70 bg-violet-500/12 text-violet-700 dark:text-violet-300'
-                : 'border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-[#18181F] text-zinc-700 dark:text-zinc-200 hover:border-violet-500/60'
-            }`}
-            title="Hover or click to choose CAD Drawing & Modeling Tools"
-          >
-            {activeTool === 'select' ? <Wrench className="w-3.5 h-3.5 text-violet-500" /> : currentToolMeta.icon}
-            <span className="hidden sm:inline">{activeTool === 'select' ? 'Tools' : currentToolMeta.label}</span>
-            <ChevronDown className="w-3 h-3 opacity-60" />
-          </button>
+          <IconTooltip label={activeTool === 'select' ? 'CAD Drawing & Modeling Tools' : `Active Tool: ${currentToolMeta.label}`}>
+            <button
+              type="button"
+              onClick={() => setOpenMenu((m) => (m === 'tools' ? 'none' : 'tools'))}
+              aria-label="CAD Drawing Tools"
+              className={`flex items-center justify-center gap-0.5 h-9 px-2 rounded-xl border text-xs font-medium transition-colors cursor-pointer ${
+                activeTool !== 'select' || openMenu === 'tools'
+                  ? 'border-violet-500/70 bg-violet-500/12 text-violet-700 dark:text-violet-300'
+                  : 'border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-[#18181F] text-zinc-700 dark:text-zinc-200 hover:border-violet-500/60'
+              }`}
+            >
+              {activeTool === 'select' ? <Wrench className="w-4 h-4 text-violet-500" /> : currentToolMeta.icon}
+              <ChevronDown className="w-3 h-3 opacity-60" />
+            </button>
+          </IconTooltip>
 
           {openMenu === 'tools' && (
             <div className="absolute left-0 top-full pt-1.5 z-50">
@@ -562,64 +617,77 @@ export const TopToolbar: React.FC = () => {
           )}
         </div>
 
-        {/* Clean Rounded View Mode Switcher */}
-        <div className="relative flex items-center bg-zinc-100 dark:bg-[#18181F] p-1 rounded-xl border border-zinc-200 dark:border-zinc-800">
-          <button
-            onClick={() => setViewMode('2d')}
-            className={`px-2.5 py-1 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors ${
-              viewMode === '2d'
-                ? 'bg-violet-600 text-white shadow-xs'
-                : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
-            }`}
-          >
-            2D
-          </button>
-          <button
-            onClick={() => setViewMode('3d-perspective')}
-            className={`px-2.5 py-1 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors ${
-              viewMode === '3d-perspective'
-                ? 'bg-violet-600 text-white shadow-xs'
-                : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
-            }`}
-          >
-            3D
-          </button>
-          <button
-            onClick={() => {
-              setViewMode('3d-ortho');
-              setOpenMenu((m) => (m === 'ortho' ? 'none' : 'ortho'));
-            }}
-            className={`hidden sm:inline-flex px-2.5 py-1 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors ${
-              viewMode === '3d-ortho'
-                ? 'bg-violet-600 text-white shadow-xs'
-                : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
-            }`}
-          >
-            Ortho
-          </button>
-          <button
-            onClick={() => setViewMode('split')}
-            title="Synchronized 2D + 3D Split View"
-            className={`px-2.5 py-1 rounded-lg text-xs font-semibold whitespace-nowrap flex items-center gap-1 transition-colors ${
-              viewMode === 'split'
-                ? 'bg-violet-600 text-white shadow-xs'
-                : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
-            }`}
-          >
-            <Columns2 className="w-3.5 h-3.5" />
-            <span className="hidden xl:inline">Split</span>
-          </button>
+        {/* Compact View Mode Switcher */}
+        <div className="relative flex items-center bg-zinc-100 dark:bg-[#18181F] p-0.5 rounded-xl border border-zinc-200 dark:border-zinc-800">
+          <IconTooltip label="2D Architectural Plan">
+            <button
+              type="button"
+              onClick={() => setViewMode('2d')}
+              className={`h-8 px-2 rounded-lg text-[11px] font-bold transition-colors cursor-pointer ${
+                viewMode === '2d'
+                  ? 'bg-violet-600 text-white shadow-xs'
+                  : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
+              }`}
+            >
+              2D
+            </button>
+          </IconTooltip>
+          <IconTooltip label="3D Perspective Digital Twin">
+            <button
+              type="button"
+              onClick={() => setViewMode('3d-perspective')}
+              className={`h-8 px-2 rounded-lg text-[11px] font-bold transition-colors cursor-pointer ${
+                viewMode === '3d-perspective'
+                  ? 'bg-violet-600 text-white shadow-xs'
+                  : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
+              }`}
+            >
+              3D
+            </button>
+          </IconTooltip>
+          <IconTooltip label="3D Orthographic Presets" className="hidden sm:inline-flex">
+            <button
+              type="button"
+              onClick={() => {
+                setViewMode('3d-ortho');
+                setOpenMenu((m) => (m === 'ortho' ? 'none' : 'ortho'));
+              }}
+              aria-label="3D Orthographic View"
+              className={`h-8 w-8 rounded-lg flex items-center justify-center transition-colors cursor-pointer ${
+                viewMode === '3d-ortho'
+                  ? 'bg-violet-600 text-white shadow-xs'
+                  : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
+              }`}
+            >
+              <Box className="w-3.5 h-3.5" />
+            </button>
+          </IconTooltip>
+          <IconTooltip label="2D + 3D Split View" className="hidden md:inline-flex">
+            <button
+              type="button"
+              onClick={() => setViewMode('split')}
+              aria-label="2D + 3D Split View"
+              className={`h-8 w-8 rounded-lg flex items-center justify-center transition-colors cursor-pointer ${
+                viewMode === 'split'
+                  ? 'bg-violet-600 text-white shadow-xs'
+                  : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
+              }`}
+            >
+              <Columns2 className="w-3.5 h-3.5" />
+            </button>
+          </IconTooltip>
 
           {openMenu === 'ortho' && (
             <div className="absolute right-0 top-full mt-1.5 bg-white dark:bg-[#15151C] border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-2xl p-1.5 w-36 z-50">
               {orthoOptions.map((p) => (
                 <button
                   key={p}
+                  type="button"
                   onClick={() => {
                     setOrthoPreset(p);
                     setOpenMenu('none');
                   }}
-                  className={`w-full text-left px-2.5 py-1.5 rounded-xl text-xs capitalize transition-colors ${
+                  className={`w-full text-left px-2.5 py-1.5 rounded-xl text-xs capitalize transition-colors cursor-pointer ${
                     orthoPreset === p
                       ? 'bg-violet-600 text-white font-medium'
                       : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
@@ -632,33 +700,30 @@ export const TopToolbar: React.FC = () => {
           )}
         </div>
 
-        {/* 3D Inspection & Heatmap — Hover or Click Popover */}
+        {/* 3D Inspection, Heatmaps, Section Cut & Decomposition — Minimal Icon Popover */}
         <div
           className="relative"
           onMouseEnter={() => setOpenMenu('inspect')}
           onMouseLeave={() => setOpenMenu((m) => (m === 'inspect' ? 'none' : m))}
         >
-          <button
-            onClick={() => setOpenMenu((m) => (m === 'inspect' ? 'none' : 'inspect'))}
-            className={`flex items-center gap-1.5 h-9 px-3 rounded-xl border text-xs font-medium whitespace-nowrap transition-colors ${
-              heatmapMetric !== 'none' || sectionCutEnabled || explodedFactor > 0 || firstPersonMode
-                ? 'border-amber-500/70 bg-amber-500/12 text-amber-600 dark:text-amber-300'
-                : 'border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-[#18181F] text-zinc-700 dark:text-zinc-200 hover:border-amber-500/60'
-            }`}
-            title="Live 3D Heatmaps, Section Cut, Exploded Floors & Walk Mode"
-          >
-            <Thermometer className="w-3.5 h-3.5 text-amber-500" />
-            <span className="hidden lg:inline">
-              {heatmapMetric === 'none'
-                ? '3D & Map'
-                : heatmapMetric === 'temperature'
-                  ? 'Temp Map'
-                  : heatmapMetric === 'humidity'
-                    ? 'RH Map'
-                    : 'ΔP Map'}
-            </span>
-            <ChevronDown className="w-3 h-3 opacity-60" />
-          </button>
+          <IconTooltip label="Heatmaps, Section Cut & Floor Decomposition">
+            <button
+              type="button"
+              onClick={() => setOpenMenu((m) => (m === 'inspect' ? 'none' : 'inspect'))}
+              aria-label="3D Inspection & Heatmaps"
+              className={`relative flex items-center justify-center gap-0.5 h-9 px-2 rounded-xl border transition-colors cursor-pointer ${
+                heatmapMetric !== 'none' || sectionCutEnabled || explodedFactor > 0
+                  ? 'border-amber-500/70 bg-amber-500/12 text-amber-600 dark:text-amber-300'
+                  : 'border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-[#18181F] text-zinc-700 dark:text-zinc-200 hover:border-amber-500/60'
+              }`}
+            >
+              <Thermometer className="w-4 h-4 text-amber-500" />
+              <ChevronDown className="w-3 h-3 opacity-60" />
+              {(heatmapMetric !== 'none' || sectionCutEnabled || explodedFactor > 0) && (
+                <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-amber-500" />
+              )}
+            </button>
+          </IconTooltip>
 
           {openMenu === 'inspect' && (
             <div className="absolute right-0 top-full pt-1.5 z-50">
@@ -866,193 +931,225 @@ export const TopToolbar: React.FC = () => {
           )}
         </div>
 
-        {/* Dedicated Separate Character Walkthrough Button */}
-        <button
-          onClick={() => {
-            if (!firstPersonMode && viewMode === '2d') setViewMode('3d-perspective');
-            setFirstPersonMode(!firstPersonMode);
-          }}
-          className={`flex items-center gap-1.5 h-9 px-3 rounded-xl border text-xs font-semibold whitespace-nowrap transition-colors ${
-            firstPersonMode
-              ? 'border-violet-500 bg-violet-600 text-white shadow-sm'
-              : 'border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-[#18181F] text-zinc-700 dark:text-zinc-200 hover:border-violet-500'
-          }`}
-          title="First-Person Character Walkthrough (NavMesh + WASD + Space Jump + Area Tablet)"
-        >
-          <Footprints className={`w-3.5 h-3.5 ${firstPersonMode ? 'text-white' : 'text-violet-500'}`} />
-          <span className="hidden lg:inline">{firstPersonMode ? 'Exit Walk' : 'Walkthrough'}</span>
-        </button>
+        {/* Character Walkthrough Icon (1st / 3rd Person) */}
+        <IconTooltip label={firstPersonMode ? 'Exit Character Walkthrough' : 'Character Walkthrough (1st / 3rd Person)'}>
+          <button
+            type="button"
+            onClick={() => {
+              if (!firstPersonMode && viewMode === '2d') setViewMode('3d-perspective');
+              setFirstPersonMode(!firstPersonMode);
+            }}
+            aria-label="Character Walkthrough"
+            className={`flex items-center justify-center h-9 w-9 rounded-xl border transition-colors cursor-pointer ${
+              firstPersonMode
+                ? 'border-violet-500 bg-violet-600 text-white shadow-sm'
+                : 'border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-[#18181F] text-zinc-700 dark:text-zinc-200 hover:border-violet-500'
+            }`}
+          >
+            <Footprints className={`w-4 h-4 ${firstPersonMode ? 'text-white' : 'text-violet-500'}`} />
+          </button>
+        </IconTooltip>
 
-        {/* WebXR VR Immersion Toggle */}
-        <button
-          type="button"
-          onClick={() => {
-            if (!vrSessionActive && viewMode === '2d') {
-              setViewMode('3d-perspective');
-              setTimeout(() => requestVrToggle(), 80);
-            } else {
-              requestVrToggle();
-            }
-          }}
-          className={`flex items-center gap-1.5 h-9 px-3 rounded-xl border text-xs font-semibold whitespace-nowrap transition-colors cursor-pointer ${
-            vrSessionActive
-              ? 'border-cyan-400 bg-cyan-500 text-zinc-950 shadow-sm'
-              : 'border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-[#18181F] text-zinc-700 dark:text-zinc-200 hover:border-cyan-500'
-          }`}
-          title="Launch WebXR VR Immersion Session for Active 3D Viewport"
-        >
-          <Glasses className={`w-3.5 h-3.5 ${vrSessionActive ? 'text-zinc-950' : 'text-cyan-500'}`} />
-          <span className="hidden xl:inline">{vrSessionActive ? 'Exit VR' : 'VR Immersion'}</span>
-        </button>
+        {/* WebXR VR Immersion Icon */}
+        <IconTooltip label={vrSessionActive ? 'Exit VR Immersion' : 'VR Immersion Session'} className="hidden sm:inline-flex">
+          <button
+            type="button"
+            onClick={() => {
+              if (!vrSessionActive && viewMode === '2d') {
+                setViewMode('3d-perspective');
+                setTimeout(() => requestVrToggle(), 80);
+              } else {
+                requestVrToggle();
+              }
+            }}
+            aria-label="VR Immersion"
+            className={`flex items-center justify-center h-9 w-9 rounded-xl border transition-colors cursor-pointer ${
+              vrSessionActive
+                ? 'border-cyan-400 bg-cyan-500 text-zinc-950 shadow-sm'
+                : 'border-zinc-200 dark:border-zinc-800 bg-zinc-100 dark:bg-[#18181F] text-zinc-700 dark:text-zinc-200 hover:border-cyan-500'
+            }`}
+          >
+            <Glasses className={`w-4 h-4 ${vrSessionActive ? 'text-zinc-950' : 'text-cyan-500'}`} />
+          </button>
+        </IconTooltip>
       </div>
 
-      {/* ZONE 3 (Right): Save & Validate + Maya AI + Telemetry + Ellipsis Overflow Menu */}
-      <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-        {/* Validate & Save Gate Button (Pre-Save Full Audit + AI Auto-Fix + Confirmation) */}
-        <button
-          onClick={() => {
-            refreshValidation();
-            setShowSaveValidationModal(true);
-          }}
-          className={`flex items-center gap-1.5 h-9 px-2.5 sm:px-3 rounded-xl border text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
-            validationIssues.length > 0
-              ? 'border-amber-500/60 bg-amber-500/12 text-amber-600 dark:text-amber-300 hover:bg-amber-500/20'
-              : 'border-emerald-500/50 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/20'
-          }`}
-          title="Run Comprehensive GMP Validation, AI Auto-Fix & Save (Ctrl+S)"
+      {/* ZONE 3 (Right): Minimal Icon Actions with Modern Hover Tooltips */}
+      <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+        {/* Validate & Save */}
+        <IconTooltip
+          label={validationIssues.length > 0 ? `Save & Validate (${validationIssues.length} checks)` : 'Save & Validate'}
+          shortcut="Ctrl+S"
         >
-          <Save className="w-3.5 h-3.5" />
-          <span className="hidden xl:inline">Save</span>
-          {validationIssues.length > 0 && (
-            <span className="px-1.5 py-0.5 rounded-full bg-amber-500 text-zinc-950 font-mono text-[10px] font-bold">
-              {validationIssues.length}
-            </span>
-          )}
-        </button>
-
-        {/* Auto-save Toggle (60s Inactivity → Save & Validation Workflow) */}
-        <button
-          role="switch"
-          aria-checked={autoSaveEnabled}
-          onClick={() => setAutoSaveEnabled(!autoSaveEnabled)}
-          className={`flex items-center gap-1.5 h-9 px-2.5 rounded-xl border text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
-            autoSaveEnabled
-              ? 'border-violet-500/70 bg-violet-500/15 text-violet-700 dark:text-violet-300 hover:bg-violet-500/25'
-              : 'border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] text-zinc-600 dark:text-zinc-400 hover:border-violet-500/50 hover:text-zinc-900 dark:hover:text-zinc-200'
-          }`}
-          title={
-            autoSaveEnabled
-              ? `Auto-save active: triggers Save & Validation after 60s of inactivity (${autoSaveSecondsLeft}s left)`
-              : 'Enable Auto-save (triggers Save & Validation after 60s of inactivity)'
-          }
-        >
-          <Timer className={`w-3.5 h-3.5 ${autoSaveEnabled ? 'text-violet-500 dark:text-violet-400' : 'text-zinc-400'}`} />
-          <span className="hidden md:inline">Auto-save</span>
-          <span
-            className={`relative inline-flex items-center w-7 h-4 rounded-full transition-colors ${
-              autoSaveEnabled ? 'bg-violet-600' : 'bg-zinc-300 dark:bg-zinc-700'
+          <button
+            type="button"
+            onClick={() => {
+              refreshValidation();
+              setShowSaveValidationModal(true);
+            }}
+            aria-label="Save and Validate"
+            className={`relative flex items-center justify-center h-9 w-9 rounded-xl border transition-colors shrink-0 cursor-pointer ${
+              validationIssues.length > 0
+                ? 'border-amber-500/60 bg-amber-500/12 text-amber-600 dark:text-amber-300 hover:bg-amber-500/20'
+                : 'border-emerald-500/50 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/20'
             }`}
           >
+            <Save className="w-4 h-4" />
+            {validationIssues.length > 0 && (
+              <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-amber-500 text-zinc-950 font-mono text-[9px] font-bold flex items-center justify-center tabular-nums">
+                {validationIssues.length}
+              </span>
+            )}
+          </button>
+        </IconTooltip>
+
+        {/* Auto-save Icon Toggle */}
+        <IconTooltip
+          label={autoSaveEnabled ? `Auto-save ON (${autoSaveSecondsLeft}s idle)` : 'Auto-save OFF'}
+          className="hidden md:inline-flex"
+        >
+          <button
+            type="button"
+            role="switch"
+            aria-checked={autoSaveEnabled}
+            aria-label="Auto-save toggle"
+            onClick={() => setAutoSaveEnabled(!autoSaveEnabled)}
+            className={`relative flex items-center justify-center h-9 w-9 rounded-xl border transition-colors shrink-0 cursor-pointer ${
+              autoSaveEnabled
+                ? 'border-violet-500/70 bg-violet-500/15 text-violet-700 dark:text-violet-300 hover:bg-violet-500/25'
+                : 'border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] text-zinc-500 hover:border-violet-500/50'
+            }`}
+          >
+            <Timer className="w-4 h-4" />
             <span
-              className={`inline-block w-3 h-3 rounded-full bg-white shadow-xs transform transition-transform ${
-                autoSaveEnabled ? 'translate-x-3.5' : 'translate-x-0.5'
+              className={`absolute bottom-1 right-1 w-2 h-2 rounded-full ${
+                autoSaveEnabled ? 'bg-emerald-400' : 'bg-zinc-400 dark:bg-zinc-600'
               }`}
             />
-          </span>
-          {autoSaveEnabled && (
-            <span className="hidden xl:inline font-mono text-[10px] text-amber-600 dark:text-amber-400 tabular-nums">
-              {autoSaveSecondsLeft}s
-            </span>
-          )}
-        </button>
-
-        {/* Standalone Maya AI Map Designer Chat */}
-        <button
-          onClick={() => setShowMayaChat(!showMayaChat)}
-          className="flex items-center gap-1.5 h-9 px-3 rounded-xl gradian-violet-amber text-white text-xs font-semibold shadow-sm hover:opacity-95 transition-opacity whitespace-nowrap shrink-0"
-          title="Open Maya AI Map Designer Chat (Design & Edit Map by Chat)"
-        >
-          <Sparkles className="w-3.5 h-3.5" />
-          <span className="hidden sm:inline">Maya AI</span>
-        </button>
-
-        {/* Live Telemetry Dashboard */}
-        <button
-          onClick={() => openDashboard({ tab: 'trends' })}
-          className="flex items-center gap-1.5 h-9 px-2.5 sm:px-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] hover:border-violet-500 text-zinc-800 dark:text-zinc-200 text-xs font-medium whitespace-nowrap shrink-0 transition-colors"
-          title="Open Live Sensors, Trends & 3D Equipment Console"
-        >
-          <Activity className={`w-3.5 h-3.5 ${activeAlarmCount > 0 ? 'text-rose-500' : 'text-amber-500'}`} />
-          <span className="hidden lg:inline">Telemetry</span>
-          {activeAlarmCount > 0 && (
-            <span className="px-1.5 py-0.5 rounded-full bg-rose-500/20 text-rose-500 font-mono text-[10px] font-bold">
-              {activeAlarmCount}
-            </span>
-          )}
-        </button>
-
-        {/* GMP Operations & Production Line Eligibility */}
-        <button
-          onClick={() => openGmpModal({ tab: 'lines' })}
-          className="flex items-center gap-1.5 h-9 px-2.5 sm:px-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] hover:border-emerald-500 text-zinc-800 dark:text-zinc-200 text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
-          title="GMP Production Line Eligibility, Calibration/PQ, Work Orders, Calendar, SOPs & Wiki"
-        >
-          <ClipboardCheck className="w-3.5 h-3.5 text-emerald-500" />
-          <span className="hidden xl:inline">GMP Ops</span>
-          {overdueWorkOrders > 0 && (
-            <span className="px-1.5 py-0.5 rounded-full bg-rose-500 text-white font-mono text-[10px] font-bold">
-              {overdueWorkOrders}
-            </span>
-          )}
-        </button>
-
-        {/* Telemetry-Gated Resource & Zone Scheduling */}
-        <button
-          onClick={() => openResourceSchedulingModal(null)}
-          className="hidden sm:flex items-center gap-1.5 h-9 px-2.5 sm:px-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] hover:border-violet-500 text-zinc-800 dark:text-zinc-200 text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
-          title="Telemetry-Gated Resource & Zone Scheduling (Personnel & GMP Equipment)"
-        >
-          <CalendarClock className="w-3.5 h-3.5 text-violet-500" />
-          <span className="hidden xl:inline">Schedule</span>
-          {heldSchedulesCount > 0 && (
-            <span className="px-1.5 py-0.5 rounded-full bg-amber-500/20 text-amber-500 font-mono text-[10px] font-bold tabular-nums">
-              {heldSchedulesCount}
-            </span>
-          )}
-        </button>
-
-        {/* Dedicated CAD / DWG / SVG -> Plan Walls OCR Tool */}
-        <button
-          onClick={() => setShowCadOcrModal(true)}
-          className="hidden md:flex items-center gap-1.5 h-9 px-2.5 sm:px-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] hover:border-cyan-500 text-zinc-800 dark:text-zinc-200 text-xs font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
-          title="DWG / DXF / SVG to Plan Walls & Glass Curtain Walls using Vision OCR"
-        >
-          <ScanText className="w-3.5 h-3.5 text-cyan-400" />
-          <span className="hidden xl:inline">CAD / SVG OCR</span>
-        </button>
-
-        {/* QR / Barcode Camera Scanner & Label Designer */}
-        <button
-          onClick={() => openQrLabelModal('scanner')}
-          className="hidden sm:flex items-center justify-center h-9 w-9 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] hover:border-amber-500 text-zinc-700 dark:text-zinc-200 transition-colors shrink-0 cursor-pointer"
-          title="QR / Barcode / DataMatrix Camera Scanner & Industrial Label Designer"
-        >
-          <QrCode className="w-4 h-4 text-amber-500" />
-        </button>
-
-        {/* Modern Ellipsis Overflow Menu (Replaces 10+ Cluttered Header Buttons) */}
-        <div className="relative">
-          <button
-            onClick={() => setOpenMenu((m) => (m === 'more' ? 'none' : 'more'))}
-            className={`h-9 w-9 rounded-xl border flex items-center justify-center transition-colors shrink-0 ${
-              openMenu === 'more'
-                ? 'border-violet-500 bg-violet-500/15 text-violet-500'
-                : 'border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] text-zinc-600 dark:text-zinc-300 hover:border-violet-500/60'
-            }`}
-            title="More Workspace Tools (AI Planner, 3D Gallery, VR/AR, Export, Sync, Theme)"
-          >
-            <MoreHorizontal className="w-4 h-4" />
           </button>
+        </IconTooltip>
+
+        {/* Global Voice Command Listener ("Maya, ...") */}
+        <IconTooltip label='Global Voice Command ("Maya, ...")'>
+          <GlobalVoiceCommandListener />
+        </IconTooltip>
+
+        {/* Maya AI Icon Button */}
+        <IconTooltip label="Maya AI Twin Copilot">
+          <button
+            type="button"
+            onClick={() => setShowMayaChat(!showMayaChat)}
+            aria-label="Maya AI Twin Copilot"
+            className="flex items-center justify-center gap-1.5 h-9 w-9 2xl:w-auto 2xl:px-3 rounded-xl gradian-violet-amber text-white text-xs font-semibold shadow-sm hover:opacity-95 transition-opacity shrink-0 cursor-pointer"
+          >
+            <Sparkles className="w-4 h-4" />
+            <span className="hidden 2xl:inline">Maya AI</span>
+          </button>
+        </IconTooltip>
+
+        {/* MAYA Life Studio Dedicated Page */}
+        <IconTooltip label="MAYA Life · 3D Companion, SOPs & AI">
+          <button
+            type="button"
+            onClick={() => setScreen('maya-life')}
+            aria-label="MAYA Life Studio"
+            className="flex items-center justify-center h-9 w-9 rounded-xl border border-violet-500/40 bg-violet-500/12 hover:bg-violet-500/20 text-violet-600 dark:text-violet-300 shrink-0 transition-colors cursor-pointer"
+          >
+            <Bot className="w-4 h-4" />
+          </button>
+        </IconTooltip>
+
+        {/* Live Telemetry Icon */}
+        <IconTooltip label={activeAlarmCount > 0 ? `Telemetry (${activeAlarmCount} active alarms)` : 'Live Telemetry & Trends'}>
+          <button
+            type="button"
+            onClick={() => openDashboard({ tab: 'trends' })}
+            aria-label="Live Telemetry Dashboard"
+            className="relative flex items-center justify-center h-9 w-9 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] hover:border-violet-500 text-zinc-800 dark:text-zinc-200 shrink-0 transition-colors cursor-pointer"
+          >
+            <Activity className={`w-4 h-4 ${activeAlarmCount > 0 ? 'text-rose-500' : 'text-amber-500'}`} />
+            {activeAlarmCount > 0 && (
+              <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-rose-500 text-white font-mono text-[9px] font-bold flex items-center justify-center tabular-nums">
+                {activeAlarmCount}
+              </span>
+            )}
+          </button>
+        </IconTooltip>
+
+        {/* GMP Ops Icon */}
+        <IconTooltip label="GMP Operations & Production Lines" className="hidden sm:inline-flex">
+          <button
+            type="button"
+            onClick={() => openGmpModal({ tab: 'lines' })}
+            aria-label="GMP Operations"
+            className="relative flex items-center justify-center h-9 w-9 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] hover:border-emerald-500 text-zinc-800 dark:text-zinc-200 shrink-0 transition-colors cursor-pointer"
+          >
+            <ClipboardCheck className="w-4 h-4 text-emerald-500" />
+            {overdueWorkOrders > 0 && (
+              <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-rose-500 text-white font-mono text-[9px] font-bold flex items-center justify-center tabular-nums">
+                {overdueWorkOrders}
+              </span>
+            )}
+          </button>
+        </IconTooltip>
+
+        {/* Resource Schedule Icon */}
+        <IconTooltip label="Resource & Zone Scheduling" className="hidden lg:inline-flex">
+          <button
+            type="button"
+            onClick={() => openResourceSchedulingModal(null)}
+            aria-label="Resource Scheduling"
+            className="relative flex items-center justify-center h-9 w-9 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] hover:border-violet-500 text-zinc-800 dark:text-zinc-200 shrink-0 transition-colors cursor-pointer"
+          >
+            <CalendarClock className="w-4 h-4 text-violet-500" />
+            {heldSchedulesCount > 0 && (
+              <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-amber-500 text-zinc-950 font-mono text-[9px] font-bold flex items-center justify-center tabular-nums">
+                {heldSchedulesCount}
+              </span>
+            )}
+          </button>
+        </IconTooltip>
+
+        {/* CAD / SVG OCR Icon */}
+        <IconTooltip label="DWG / SVG to Plan Walls OCR" className="hidden xl:inline-flex">
+          <button
+            type="button"
+            onClick={() => setShowCadOcrModal(true)}
+            aria-label="CAD / SVG OCR"
+            className="flex items-center justify-center h-9 w-9 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] hover:border-cyan-500 text-zinc-800 dark:text-zinc-200 shrink-0 transition-colors cursor-pointer"
+          >
+            <ScanText className="w-4 h-4 text-cyan-400" />
+          </button>
+        </IconTooltip>
+
+        {/* QR Scanner Icon */}
+        <IconTooltip label="QR Camera Scanner & Labels" className="hidden md:inline-flex">
+          <button
+            type="button"
+            onClick={() => openQrLabelModal('scanner')}
+            aria-label="QR Camera Scanner"
+            className="flex items-center justify-center h-9 w-9 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] hover:border-amber-500 text-zinc-700 dark:text-zinc-200 transition-colors shrink-0 cursor-pointer"
+          >
+            <QrCode className="w-4 h-4 text-amber-500" />
+          </button>
+        </IconTooltip>
+
+        {/* Modern Ellipsis Overflow Menu */}
+        <div className="relative">
+          <IconTooltip label="More Studios, Export & Settings" align="right">
+            <button
+              type="button"
+              onClick={() => setOpenMenu((m) => (m === 'more' ? 'none' : 'more'))}
+              aria-label="More Workspace Tools"
+              className={`h-9 w-9 rounded-xl border flex items-center justify-center transition-colors shrink-0 cursor-pointer ${
+                openMenu === 'more'
+                  ? 'border-violet-500 bg-violet-500/15 text-violet-500'
+                  : 'border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-[#18181F] text-zinc-600 dark:text-zinc-300 hover:border-violet-500/60'
+              }`}
+            >
+              <MoreHorizontal className="w-4 h-4" />
+            </button>
+          </IconTooltip>
 
           {openMenu === 'more' && (
             <div className="absolute right-0 top-full mt-1.5 w-64 rounded-2xl bg-white dark:bg-[#15151C] border border-zinc-200 dark:border-zinc-800 shadow-2xl p-2 space-y-1 z-50">

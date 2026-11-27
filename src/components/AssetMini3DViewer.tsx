@@ -6,6 +6,7 @@ import { Pause, Play, RotateCcw } from 'lucide-react';
 import type { Room, SpatialAsset } from '../types/twin';
 import { buildProceduralEquipmentGroup } from '../engine/equipmentBuilder';
 import { DEFAULT_MATERIALS } from '../data/materialsLibrary';
+import { attachCanvasPinchGuard } from '../utils/preventPinchZoom';
 
 interface AssetMini3DViewerProps {
   asset?: SpatialAsset | null;
@@ -196,6 +197,19 @@ export const AssetMini3DViewer: React.FC<AssetMini3DViewerProps> = ({
     };
     animate();
 
+    const detachPinchGuard = attachCanvasPinchGuard(el, (deltaY) => {
+      const factor = deltaY > 0 ? 1.06 : 0.94;
+      const offset = camera.position.clone().sub(controls.target);
+      const nextLen = THREE.MathUtils.clamp(
+        offset.length() * factor,
+        controls.minDistance,
+        controls.maxDistance
+      );
+      offset.setLength(nextLen);
+      camera.position.copy(controls.target).add(offset);
+      controls.update();
+    });
+
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const nw = Math.max(200, Math.floor(entry.contentRect.width));
@@ -208,6 +222,7 @@ export const AssetMini3DViewer: React.FC<AssetMini3DViewerProps> = ({
     ro.observe(el);
 
     return () => {
+      detachPinchGuard();
       cancelAnimationFrame(raf);
       ro.disconnect();
       controls.dispose();

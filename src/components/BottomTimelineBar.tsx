@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -14,6 +14,7 @@ import {
   Play,
   RotateCcw,
   Wrench,
+  X,
 } from 'lucide-react';
 import { useTwinStore } from '../store/useTwinStore';
 import { useTelemetryStore } from '../store/useTelemetryStore';
@@ -109,6 +110,7 @@ export const BottomTimelineBar: React.FC = () => {
   const complianceByAssetId = useGmpStore((s) => s.complianceByAssetId);
   const createWorkOrder = useGmpStore((s) => s.createWorkOrder);
   const personnel = useGmpStore((s) => s.personnel);
+  const [drawerTab, setDrawerTab] = useState<'phases' | 'maintenance'>('phases');
 
   const maintenanceMilestones = useMemo(
     () => computeAssetFailurePredictions(sensors, readings, scene.assets, complianceByAssetId),
@@ -238,38 +240,42 @@ export const BottomTimelineBar: React.FC = () => {
 
   return (
     <footer className="bg-white dark:bg-[#111114] border-t border-zinc-200 dark:border-zinc-800 shrink-0 z-20">
-      {/* Expandable 5D Digital Twin Timeline Drawer */}
+      {/* Simplified, Clean 5D Digital Twin Timeline Drawer */}
       {bottomTimelineOpen && (
-        <div className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/95 dark:bg-[#0D0D10] space-y-2.5 max-h-[42vh] overflow-y-auto">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs font-semibold text-slate-800 dark:text-slate-100 flex items-center gap-1.5">
+        <div className="px-3 sm:px-4 py-2.5 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/95 dark:bg-[#0D0D11] space-y-2">
+          {/* Row 1: Compact Controls + Tab Switcher + Concise 5D Metrics */}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-100 flex items-center gap-1 mr-0.5">
                 <Clock className="w-3.5 h-3.5 text-violet-500" />
-                5D Lifecycle &amp; Maintenance Timeline
+                <span>5D Timeline</span>
               </span>
               <button
+                type="button"
                 onClick={() => setTimelinePlaying(!timelinePlaying)}
-                className="flex items-center gap-1 px-2.5 py-1 rounded bg-violet-600 hover:bg-violet-500 text-white text-xs font-medium whitespace-nowrap cursor-pointer"
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-semibold whitespace-nowrap cursor-pointer"
+                title={timelinePlaying ? 'Pause 5D Playback' : 'Play 5D Timeline'}
               >
                 {timelinePlaying ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
-                {timelinePlaying ? 'Pause' : 'Play'}
+                <span>{timelinePlaying ? 'Pause' : 'Play'}</span>
               </button>
               <button
+                type="button"
                 onClick={() => {
                   setTimelinePlaying(false);
                   setActiveMilestoneAssetId(null);
                   setTimelineDate('2024-03-01');
                 }}
-                className="p-1 rounded border border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-[#22222C] cursor-pointer"
+                className="p-1 rounded-lg border border-zinc-300 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-[#1E1E28] cursor-pointer"
                 title="Reset timeline to project start"
               >
-                <RotateCcw className="w-3.5 h-3.5" />
+                <RotateCcw className="w-3 h-3" />
               </button>
               <select
                 aria-label="Timeline Playback Speed"
                 value={timelineSpeed}
                 onChange={(e) => setTimelineSpeed(Number(e.target.value))}
-                className="h-6 px-1.5 rounded text-[11px] font-mono bg-white dark:bg-[#1C1C24] border border-slate-300 dark:border-zinc-700"
+                className="h-6 px-1.5 rounded-lg text-[11px] font-mono bg-white dark:bg-[#181822] border border-zinc-300 dark:border-zinc-700 cursor-pointer"
               >
                 <option value={1}>1x</option>
                 <option value={2}>2x</option>
@@ -282,18 +288,20 @@ export const BottomTimelineBar: React.FC = () => {
                 min="2024-01-01"
                 max={maxDateIso}
                 onChange={(e) => setTimelineDate(e.target.value)}
-                className="h-6 px-2 rounded text-[11px] font-mono bg-white dark:bg-[#1C1C24] border border-slate-300 dark:border-zinc-700"
+                className="h-6 px-1.5 rounded-lg text-[11px] font-mono bg-white dark:bg-[#181822] border border-zinc-300 dark:border-zinc-700"
               />
               <button
+                type="button"
                 onClick={() => setCompareDate(compareDate ? null : '2025-06-01')}
-                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium border whitespace-nowrap cursor-pointer ${
+                className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium border whitespace-nowrap cursor-pointer ${
                   compareDate
-                    ? 'border-violet-500 bg-violet-500/10 text-violet-600 dark:text-violet-400'
-                    : 'border-slate-300 dark:border-zinc-700 text-slate-600 dark:text-slate-300'
+                    ? 'border-violet-500 bg-violet-500/15 text-violet-600 dark:text-violet-300'
+                    : 'border-zinc-300 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:border-zinc-500'
                 }`}
+                title="Compare active date against a baseline date"
               >
                 <GitCompare className="w-3 h-3" />
-                {compareDate ? 'Comparing' : 'Compare Date'}
+                <span className="hidden sm:inline">{compareDate ? 'Comparing' : 'Compare'}</span>
               </button>
               {compareDate && (
                 <input
@@ -303,228 +311,245 @@ export const BottomTimelineBar: React.FC = () => {
                   min="2024-01-01"
                   max={maxDateIso}
                   onChange={(e) => setCompareDate(e.target.value)}
-                  className="h-6 px-2 rounded text-[11px] font-mono bg-white dark:bg-[#1C1C24] border border-blue-400 dark:border-blue-600"
+                  className="h-6 px-1.5 rounded-lg text-[11px] font-mono bg-white dark:bg-[#181822] border border-violet-400 dark:border-violet-600"
                 />
               )}
+
+              {/* Focused Strip Switcher: Phases vs Maintenance */}
+              <div className="inline-flex items-center p-0.5 rounded-lg bg-zinc-200/70 dark:bg-[#171722] border border-zinc-300/70 dark:border-zinc-800 ml-0.5">
+                <button
+                  type="button"
+                  onClick={() => setDrawerTab('phases')}
+                  className={`px-2 py-0.5 rounded-md text-[10.5px] font-semibold whitespace-nowrap cursor-pointer transition-colors ${
+                    drawerTab === 'phases'
+                      ? 'bg-violet-600 text-white'
+                      : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
+                  }`}
+                >
+                  Phases ({scene.timelineEvents.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDrawerTab('maintenance');
+                    setShowMaintenanceMilestones(true);
+                  }}
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10.5px] font-semibold whitespace-nowrap cursor-pointer transition-colors ${
+                    drawerTab === 'maintenance'
+                      ? 'bg-amber-500 text-zinc-950'
+                      : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
+                  }`}
+                >
+                  <Wrench className="w-2.5 h-2.5" />
+                  <span>Maint. ({timelineMilestones.length})</span>
+                </button>
+              </div>
+
               <button
-                onClick={() => setShowMaintenanceMilestones(!showMaintenanceMilestones)}
-                className={`flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium border whitespace-nowrap cursor-pointer ${
-                  showMaintenanceMilestones
-                    ? 'border-amber-500/60 bg-amber-500/10 text-amber-600 dark:text-amber-400'
-                    : 'border-slate-300 dark:border-zinc-700 text-slate-500 dark:text-slate-400'
-                }`}
-                title="Toggle Predictive Maintenance Milestones from Telemetry Sensor History"
-              >
-                <Wrench className="w-3 h-3" />
-                <span>Maintenance Milestones ({timelineMilestones.length})</span>
-              </button>
-              <button
+                type="button"
                 onClick={() => openDashboard({ tab: 'predictive' })}
-                className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium border border-zinc-200 dark:border-zinc-700 hover:border-violet-500 text-zinc-700 dark:text-zinc-200 whitespace-nowrap cursor-pointer"
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium border border-zinc-200 dark:border-zinc-800 hover:border-violet-500 text-zinc-700 dark:text-zinc-200 whitespace-nowrap cursor-pointer"
+                title="Open Predictive Telemetry Charts"
               >
                 <Activity className="w-3 h-3 text-violet-500" />
-                <span>Predictive Telemetry</span>
+                <span className="hidden md:inline">Forecast</span>
               </button>
             </div>
 
-            {/* 5D Operational & Cost Metrics */}
-            <div className="flex flex-wrap items-center gap-4 text-[11px] font-mono tabular-nums">
-              <div>
-                <span className="text-slate-500 dark:text-slate-400">Spaces </span>
-                <span className="font-semibold text-slate-900 dark:text-white">{current5D.rooms}</span>
-                {compare5D && (
-                  <span className="text-violet-500 ml-1">
-                    ({current5D.rooms - compare5D.rooms >= 0 ? '+' : ''}
+            {/* Concise Single-Line 5D KPI Summary */}
+            <div className="flex items-center gap-2.5 text-[11px] font-mono tabular-nums text-zinc-600 dark:text-zinc-400">
+              <span>
+                <strong className="text-zinc-900 dark:text-white">{current5D.rooms}</strong> rooms
+                {compare5D && current5D.rooms !== compare5D.rooms && (
+                  <span className="text-violet-400 ml-0.5">
+                    ({current5D.rooms - compare5D.rooms > 0 ? '+' : ''}
                     {current5D.rooms - compare5D.rooms})
                   </span>
                 )}
-              </div>
-              <div>
-                <span className="text-slate-500 dark:text-slate-400">Assets </span>
-                <span className="font-semibold text-slate-900 dark:text-white">{current5D.assets}</span>
-                {compare5D && (
-                  <span className="text-violet-500 ml-1">
-                    ({current5D.assets - compare5D.assets >= 0 ? '+' : ''}
+              </span>
+              <span className="text-zinc-400 dark:text-zinc-700">·</span>
+              <span>
+                <strong className="text-zinc-900 dark:text-white">{current5D.assets}</strong> assets
+                {compare5D && current5D.assets !== compare5D.assets && (
+                  <span className="text-violet-400 ml-0.5">
+                    ({current5D.assets - compare5D.assets > 0 ? '+' : ''}
                     {current5D.assets - compare5D.assets})
                   </span>
                 )}
-              </div>
-              <div>
-                <span className="text-slate-500 dark:text-slate-400">CapEx </span>
-                <span className="font-semibold text-slate-900 dark:text-white">
-                  {formatCurrency(current5D.capex)}
-                </span>
-                {compare5D && (
-                  <span className="text-violet-500 ml-1">
-                    ({current5D.capex >= compare5D.capex ? '+' : '-'}
-                    {formatCurrency(Math.abs(current5D.capex - compare5D.capex))})
-                  </span>
-                )}
-              </div>
-              <div>
-                <span className="text-slate-500 dark:text-slate-400">Annual OpEx </span>
-                <span className="font-semibold text-slate-900 dark:text-white">
-                  {formatCurrency(current5D.opex)}
-                </span>
-              </div>
-              <div>
-                <span className="text-slate-500 dark:text-slate-400">Load </span>
-                <span className="font-semibold text-slate-900 dark:text-white">
-                  {current5D.energyKw.toFixed(0)} kW
-                </span>
-              </div>
+              </span>
+              <span className="text-zinc-400 dark:text-zinc-700">·</span>
+              <span>
+                CapEx <strong className="text-zinc-900 dark:text-white">{formatCurrency(current5D.capex)}</strong>
+              </span>
+              <span className="hidden xl:inline text-zinc-400 dark:text-zinc-700">·</span>
+              <span className="hidden xl:inline">
+                OpEx <strong className="text-zinc-900 dark:text-white">{formatCurrency(current5D.opex)}</strong>
+              </span>
+              <span className="hidden lg:inline text-zinc-400 dark:text-zinc-700">·</span>
+              <span className="hidden lg:inline">
+                <strong className="text-zinc-900 dark:text-white">{current5D.energyKw.toFixed(0)}</strong> kW
+              </span>
             </div>
           </div>
 
-          {/* Scrubber Track + Overlaid Predictive Maintenance Milestone Diamond Pins */}
-          <div className="space-y-2">
-            <div className="relative pt-3.5">
-              {/* Maintenance Milestone Pins positioned accurately along the timeline */}
-              {showMaintenanceMilestones && timelineMilestones.length > 0 && (
-                <div className="absolute inset-x-1 top-0 h-3.5 pointer-events-none">
-                  {timelineMilestones.map((m) => {
-                    const leftPct = dateToPct(m.predictedFailureDate, maxTs);
-                    const tone = milestoneTone(m.severity);
-                    const isFocused = activeMilestone?.assetId === m.assetId;
-                    return (
-                      <button
-                        key={m.id}
-                        type="button"
-                        onClick={() => handleSelectMilestone(m)}
-                        style={{ left: `${leftPct}%` }}
-                        title={`Maintenance Milestone · ${m.assetCode} (${m.assetName}) · Predicted Failure ${m.predictedFailureDate} (${m.daysUntilFailure}d) · Driver ${m.driverSensorTag}`}
-                        className={`pointer-events-auto absolute top-0.5 -translate-x-1/2 w-2.5 h-2.5 rotate-45 border cursor-pointer transition-transform ${tone.pin} ${
-                          isFocused ? 'scale-125 ring-2 ring-violet-500' : 'hover:scale-125'
-                        }`}
-                      />
-                    );
-                  })}
-                </div>
-              )}
-
-              <input
-                type="range"
-                aria-label="5D Timeline Scrubber"
-                min={0}
-                max={100}
-                step={0.25}
-                value={dateToPct(timelineDate, maxTs)}
-                onChange={(e) => setTimelineDate(pctToDate(Number(e.target.value), maxTs))}
-                className="w-full accent-violet-600"
-              />
-            </div>
-
-            {/* Facility Phase Milestones */}
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-[10.5px] font-medium text-zinc-500 dark:text-zinc-400 mr-1">
-                Phases:
-              </span>
-              {scene.timelineEvents.map((ev) => {
-                const isActive = timelineDate >= ev.date;
-                return (
-                  <button
-                    key={ev.id}
-                    onClick={() => {
-                      setActiveMilestoneAssetId(null);
-                      setTimelineDate(ev.date);
-                    }}
-                    title={`${ev.date}: ${ev.description}`}
-                    className={`px-2 py-0.5 rounded text-[11px] border transition-colors whitespace-nowrap cursor-pointer ${
-                      timelineDate === ev.date && !activeMilestone
-                        ? 'border-violet-500 bg-violet-600 text-white'
-                        : isActive
-                          ? 'border-slate-300 dark:border-zinc-700 bg-white dark:bg-[#1C1C24] text-slate-800 dark:text-slate-200'
-                          : 'border-slate-200 dark:border-zinc-800 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
-                    }`}
-                  >
-                    <span className="font-mono mr-1 opacity-75">{ev.date.slice(0, 7)}</span>
-                    {ev.title}
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Predictive Maintenance Milestones Row */}
+          {/* Row 2: Slim Scrubber Track with Clickable Milestone Diamonds */}
+          <div className="relative pt-3">
             {showMaintenanceMilestones && timelineMilestones.length > 0 && (
-              <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-zinc-200/70 dark:border-zinc-800/70">
-                <span className="text-[10.5px] font-semibold text-amber-600 dark:text-amber-400 flex items-center gap-1 mr-1">
-                  <Wrench className="w-3 h-3" />
-                  Maintenance Milestones:
-                </span>
+              <div className="absolute inset-x-1 top-0 h-3 pointer-events-none">
                 {timelineMilestones.map((m) => {
+                  const leftPct = dateToPct(m.predictedFailureDate, maxTs);
                   const tone = milestoneTone(m.severity);
-                  const isSel = activeMilestone?.assetId === m.assetId;
+                  const isFocused = activeMilestone?.assetId === m.assetId;
                   return (
                     <button
                       key={m.id}
                       type="button"
-                      onClick={() => handleSelectMilestone(m)}
-                      title={`Predicted Failure ${m.predictedFailureDate} (${m.daysUntilFailure}d) · ${m.driverSensorTag}: ${m.currentValue}${m.unit} vs ${m.alarmThreshold}${m.unit} alarm · ${m.confidencePct}% confidence`}
-                      className={`px-2 py-0.5 rounded text-[11px] border transition-colors whitespace-nowrap font-mono tabular-nums cursor-pointer ${
-                        isSel ? tone.chipActive : tone.chipIdle
+                      onClick={() => {
+                        setDrawerTab('maintenance');
+                        handleSelectMilestone(m);
+                      }}
+                      style={{ left: `${leftPct}%` }}
+                      title={`${m.assetCode} · Predicted Failure ${m.predictedFailureDate} (${m.daysUntilFailure}d) · ${m.driverSensorTag}`}
+                      className={`pointer-events-auto absolute top-0.5 -translate-x-1/2 w-2.5 h-2.5 rotate-45 border cursor-pointer transition-transform ${tone.pin} ${
+                        isFocused ? 'scale-125 ring-2 ring-violet-500' : 'hover:scale-125'
                       }`}
-                    >
-                      <span className="mr-1">{tone.glyph}</span>
-                      <span className="font-semibold">{m.assetCode}</span>
-                      <span className="mx-1 opacity-70">·</span>
-                      <span>{m.predictedFailureDate.slice(5)}</span>
-                      <span className="ml-1 opacity-75">({m.daysUntilFailure}d)</span>
-                    </button>
+                    />
                   );
                 })}
               </div>
             )}
 
-            {/* Selected Maintenance Milestone Engineering Readout */}
-            {showMaintenanceMilestones && activeMilestone && (() => {
-              const tone = milestoneTone(activeMilestone.severity);
-              return (
-                <div className="px-3 py-2 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#14141C] flex flex-wrap items-center justify-between gap-2 text-[11px]">
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 min-w-0">
-                    <span className={`font-mono font-bold ${tone.text}`}>
-                      {tone.glyph} {activeMilestone.assetCode}
-                    </span>
-                    <span className="font-semibold text-zinc-900 dark:text-zinc-100 truncate">
-                      {activeMilestone.assetName}
-                    </span>
-                    <span className="text-zinc-400">·</span>
-                    <span className="font-mono tabular-nums text-zinc-600 dark:text-zinc-300">
-                      Predicted Failure {activeMilestone.predictedFailureDate} ({activeMilestone.daysUntilFailure}d)
-                    </span>
-                    <span className="text-zinc-400">·</span>
-                    <span className="font-mono tabular-nums text-zinc-500 dark:text-zinc-400">
-                      {activeMilestone.driverSensorTag}: {activeMilestone.currentValue}
-                      {activeMilestone.unit} / Limit {activeMilestone.alarmThreshold}
-                      {activeMilestone.unit} ({activeMilestone.confidencePct}% conf.)
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setActiveMilestoneAssetId(activeMilestone.assetId);
-                        openDashboard({
-                          tab: 'predictive',
-                          assetId: activeMilestone.assetId,
-                          sensorId: activeMilestone.driverSensorId,
-                        });
-                      }}
-                      className="px-2.5 py-1 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:border-violet-500 text-zinc-700 dark:text-zinc-200 font-medium cursor-pointer"
-                    >
-                      Inspect Forecast
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleScheduleMilestonePm(activeMilestone)}
-                      className="px-2.5 py-1 rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-semibold cursor-pointer"
-                    >
-                      Schedule PM
-                    </button>
-                  </div>
-                </div>
-              );
-            })()}
+            <input
+              type="range"
+              aria-label="5D Timeline Scrubber"
+              min={0}
+              max={100}
+              step={0.25}
+              value={dateToPct(timelineDate, maxTs)}
+              onChange={(e) => setTimelineDate(pctToDate(Number(e.target.value), maxTs))}
+              className="w-full h-1.5 accent-violet-600 cursor-pointer"
+            />
           </div>
+
+          {/* Row 3: Single Clean Horizontal Scrollable Strip (Phases OR Maintenance — never stacked clutter) */}
+          {drawerTab === 'phases' ? (
+            <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5 no-scrollbar">
+              {scene.timelineEvents.map((ev) => {
+                const isSelected = timelineDate === ev.date && !activeMilestone;
+                const isReached = timelineDate >= ev.date;
+                const shortTitle =
+                  ev.title.length > 28 ? `${ev.title.slice(0, 26).trim()}…` : ev.title;
+                return (
+                  <button
+                    key={ev.id}
+                    type="button"
+                    onClick={() => {
+                      setActiveMilestoneAssetId(null);
+                      setTimelineDate(ev.date);
+                    }}
+                    title={`${ev.date} · ${ev.title} — ${ev.description}`}
+                    className={`px-2 py-1 rounded-lg text-[10.5px] border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      isSelected
+                        ? 'border-violet-500 bg-violet-600 text-white font-semibold'
+                        : isReached
+                          ? 'border-zinc-300 dark:border-zinc-700 bg-white dark:bg-[#171722] text-zinc-800 dark:text-zinc-200 hover:border-violet-500/60'
+                          : 'border-zinc-200 dark:border-zinc-800 text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200'
+                    }`}
+                  >
+                    <span className="font-mono opacity-75 mr-1">{ev.date.slice(0, 7)}</span>
+                    <span>{shortTitle}</span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5 no-scrollbar">
+                {timelineMilestones.length === 0 ? (
+                  <span className="text-[11px] text-zinc-500">All monitored equipment within nominal predictive thresholds.</span>
+                ) : (
+                  timelineMilestones.map((m) => {
+                    const tone = milestoneTone(m.severity);
+                    const isSel = activeMilestone?.assetId === m.assetId;
+                    return (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => handleSelectMilestone(m)}
+                        title={`${m.assetCode} (${m.assetName}) · Predicted Failure ${m.predictedFailureDate} (${m.daysUntilFailure}d) · ${m.driverSensorTag}: ${m.currentValue}${m.unit} / ${m.alarmThreshold}${m.unit}`}
+                        className={`px-2 py-1 rounded-lg text-[10.5px] border transition-colors whitespace-nowrap shrink-0 font-mono tabular-nums cursor-pointer ${
+                          isSel ? tone.chipActive : tone.chipIdle
+                        }`}
+                      >
+                        <span className="mr-1">{tone.glyph}</span>
+                        <span className="font-semibold">{m.assetCode}</span>
+                        <span className="mx-1 opacity-70">·</span>
+                        <span>{m.daysUntilFailure}d</span>
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+
+              {/* Compact Action Strip ONLY when a milestone is selected */}
+              {activeMilestone && (() => {
+                const tone = milestoneTone(activeMilestone.severity);
+                return (
+                  <div className="px-2.5 py-1.5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#14141C] flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 min-w-0">
+                      <span className={`font-mono font-bold ${tone.text}`}>
+                        {tone.glyph} {activeMilestone.assetCode}
+                      </span>
+                      <span className="font-semibold text-zinc-900 dark:text-zinc-100 truncate max-w-[200px]">
+                        {activeMilestone.assetName}
+                      </span>
+                      <span className="text-zinc-400">·</span>
+                      <span className="font-mono tabular-nums text-zinc-600 dark:text-zinc-300">
+                        Due {activeMilestone.predictedFailureDate} ({activeMilestone.daysUntilFailure}d)
+                      </span>
+                      <span className="hidden md:inline text-zinc-400">·</span>
+                      <span className="hidden md:inline font-mono tabular-nums text-zinc-500 dark:text-zinc-400">
+                        {activeMilestone.driverSensorTag}: {activeMilestone.currentValue}
+                        {activeMilestone.unit} / {activeMilestone.alarmThreshold}
+                        {activeMilestone.unit} ({activeMilestone.confidencePct}%)
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setActiveMilestoneAssetId(activeMilestone.assetId);
+                          openDashboard({
+                            tab: 'predictive',
+                            assetId: activeMilestone.assetId,
+                            sensorId: activeMilestone.driverSensorId,
+                          });
+                        }}
+                        className="px-2 py-0.5 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:border-violet-500 text-zinc-700 dark:text-zinc-200 font-medium cursor-pointer"
+                      >
+                        Forecast
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleScheduleMilestonePm(activeMilestone)}
+                        className="px-2 py-0.5 rounded-lg bg-violet-600 hover:bg-violet-500 text-white font-semibold cursor-pointer"
+                      >
+                        Schedule PM
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setActiveMilestoneAssetId(null)}
+                        className="p-0.5 rounded text-zinc-400 hover:text-zinc-200 cursor-pointer"
+                        title="Dismiss milestone detail"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
         </div>
       )}
 
@@ -580,6 +605,7 @@ export const BottomTimelineBar: React.FC = () => {
             <button
               type="button"
               onClick={() => {
+                setDrawerTab('maintenance');
                 setShowMaintenanceMilestones(true);
                 setBottomTimelineOpen(true);
               }}

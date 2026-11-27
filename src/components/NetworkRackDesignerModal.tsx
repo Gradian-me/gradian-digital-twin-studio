@@ -31,6 +31,7 @@ import {
   Route,
   Server,
   ShieldAlert,
+  Sparkles,
   Trash2,
   Wifi,
   X,
@@ -46,11 +47,13 @@ import {
   YAxis,
 } from 'recharts';
 import { useTwinStore } from '../store/useTwinStore';
-import { useAclStore, computeEffectivePermissions } from '../store/useAclStore';
+import { useAclStore, computeEffectivePermissions, getActiveAclUser } from '../store/useAclStore';
 import { useGmpStore } from '../store/useGmpStore';
 import { DataCenter3DViewer } from './DataCenter3DViewer';
 import { LivePortTopologyCanvas } from './LivePortTopologyCanvas';
 import { ItLabelPrintModal, type ItLabelPayload } from './ItLabelPrintModal';
+import { ItArchitectureQuickBuilder } from './ItArchitectureQuickBuilder';
+import { It3DDetailDialog, type It3DDetailTarget } from './It3DDetailDialog';
 import type {
   MonitoringApiConnector,
   NetworkInterRackLink,
@@ -65,7 +68,7 @@ import type {
   SpatialAsset,
 } from '../types/twin';
 
-type DesignerTab = 'live-map' | 'racks' | 'user-nodes' | 'topology' | 'monitoring';
+type DesignerTab = 'live-map' | 'racks' | 'user-nodes' | 'topology' | 'builder' | 'monitoring';
 
 type InspectedTarget =
   | { kind: 'rack'; rackId: string }
@@ -414,8 +417,9 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
   const activeAclUserId = useAclStore((s) => s.activeAclUserId);
 
   const aclCanEdit = useMemo(() => {
-    const u = aclUsers.find((x) => x.id === activeAclUserId) ?? aclUsers[0];
+    const u = getActiveAclUser({ users: aclUsers, activeAclUserId });
     if (!u) return true;
+    if (u.status === 'suspended') return false;
     return computeEffectivePermissions(u, aclRoles, aclGroups).includes('spatial.edit');
   }, [aclUsers, aclRoles, aclGroups, activeAclUserId]);
 
@@ -459,7 +463,22 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
   const [inspected, setInspected] = useState<InspectedTarget | null>(null);
   const [mobilePane, setMobilePane] = useState<'workspace' | 'inspector'>('workspace');
   const [labelToPrint, setLabelToPrint] = useState<ItLabelPayload | null>(null);
+  const [detail3DTarget, setDetail3DTarget] = useState<It3DDetailTarget | null>(null);
   const [blinkTick, setBlinkTick] = useState(0);
+  const [hoverTip, setHoverTip] = useState<{
+    x: number;
+    y: number;
+    title: string;
+    badge: string;
+    badgeTone: 'cyan' | 'violet' | 'emerald' | 'amber' | 'rose' | 'blue';
+    subtitle?: string;
+    rows: { label: string; value: string }[];
+    hint?: string;
+  } | null>(null);
+
+  useEffect(() => {
+    setHoverTip(null);
+  }, [activeTab, viewDim]);
 
   // Provision IDF / Core Rack Modal
   const [showProvisionModal, setShowProvisionModal] = useState(false);
@@ -538,6 +557,41 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
   const getFloorById = (fid?: string) => scene.floors.find((f) => f.id === fid);
   const getRoomById = (rid?: string) => scene.rooms.find((r) => r.id === rid);
   const getRackById = (rid?: string) => itAssets.find((a) => a.id === rid);
+
+  // Unified inspect + reveal helper so clicking any object in 3-Tier, 3D, or 2D always navigates cleanly
+  const [topologyBuildingFilter, setTopologyBuildingFilter] = useState<string>('all');
+  const handleInspectAndReveal = (target: InspectedTarget, openMobileInspector = true) => {
+    setInspected(target);
+    if (target.kind === 'rack' || target.kind === 'device' || target.kind === 'port') {
+      setSelectedAssetId(target.rackId);
+    }
+    setShowInspectorPane(true);
+    if (openMobileInspector && typeof window !== 'undefined' && window.innerWidth < 1024) {
+      setMobilePane('inspector');
+    }
+  };
+
+  const handleLocateObjectIn3DTwin = (opts: { buildingId?: string; floorId?: string; rackId?: string; nodeId?: string }) => {
+    setCategoryFilter('IT');
+    setViewMode('3d-perspective');
+    setScreen('workspace');
+    closeRackDesigner();
+    const twin = useTwinStore.getState();
+    if (opts.rackId) {
+      drillInto('asset', opts.rackId);
+      twin.selectEntity({ type: 'asset', id: opts.rackId });
+      showToast('Focused IT rack in 3D Digital Twin', 'info');
+    } else if (opts.floorId) {
+      twin.setShowAllFloors(false);
+      twin.setActiveFloor(opts.floorId);
+      drillInto('floor', opts.floorId);
+      showToast('Navigated to floor in 3D Digital Twin', 'info');
+    } else if (opts.buildingId) {
+      drillInto('building', opts.buildingId);
+      twin.setShowAllFloors(true);
+      showToast('Navigated to building in 3D Digital Twin', 'info');
+    }
+  };
 
   // Resolve full 3-tier uplink path for any User Node: User Node -> 2960 Access -> IDF Dist -> Core DC
   const resolveNodePath = (node: NetworkUserNode) => {
@@ -1348,10 +1402,10 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
               </div>
               <div className="min-w-0">
                 <h2 className="text-xs sm:text-sm font-bold text-zinc-900 dark:text-white truncate">
-                  Data Center &amp; IT Network Architecture
+                  IT &amp; Data Center
                 </h2>
                 <p className="hidden xl:block text-[10.5px] text-zinc-500 dark:text-zinc-400 truncate">
-                  Core MDF · Floor IDF Distribution · Cisco 2960-X User Drops · Port Tracing · 3D &amp; Monitoring APIs
+                  MDF Core · Floor IDFs · Endpoints · 3-Tier Topology &amp; 3D Studio
                 </p>
               </div>
             </div>
@@ -1378,12 +1432,12 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                 className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold transition-colors whitespace-nowrap ${
                   !isReadOnly
                     ? 'bg-violet-600 text-white shadow-sm'
-                    : 'text-zinc-500 dark:text-zinc-400 disabled:opacity-40 cursor-pointer'
+                    : 'text-zinc-500 dark:text-zinc-400 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer'
                 }`}
                 title={aclCanEdit ? 'Design Mode — Edit Racks, Ports, Nodes & Links' : 'ACL role is Read-Only'}
               >
                 <Pencil className="w-3 h-3" />
-                Design
+                <span>Edit</span>
               </button>
               <button
                 type="button"
@@ -1395,19 +1449,19 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                 }`}
               >
                 {aclCanEdit ? <Eye className="w-3 h-3" /> : <Lock className="w-3 h-3" />}
-                {aclCanEdit ? 'View' : 'ACL Lock'}
+                <span>{aclCanEdit ? 'View' : 'Locked'}</span>
               </button>
             </div>
 
-            {/* 2D / 3D Switcher */}
-            {(activeTab === 'racks' || activeTab === 'topology') && (
+            {/* 2D / 3D Switcher across Live Map, Racks & Ports, User Nodes, and 3-Tier Architecture */}
+            {(activeTab === 'live-map' || activeTab === 'racks' || activeTab === 'user-nodes' || activeTab === 'topology') && (
               <div className="flex items-center p-0.5 rounded-xl bg-zinc-200/70 dark:bg-[#171720] border border-zinc-300/70 dark:border-zinc-800">
                 {(['2d', '3d'] as const).map((dim) => (
                   <button
                     key={dim}
                     type="button"
                     onClick={() => setViewDim(dim)}
-                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold uppercase transition-colors cursor-pointer ${
+                    className={`px-2 py-1 rounded-lg text-[11px] font-bold uppercase transition-colors cursor-pointer ${
                       viewDim === dim
                         ? 'bg-cyan-600 text-white shadow-sm'
                         : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white'
@@ -1422,11 +1476,11 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
             <button
               type="button"
               onClick={handleGoTo3DTwin}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border border-cyan-500/40 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-600 dark:text-cyan-300 text-xs font-semibold whitespace-nowrap cursor-pointer"
+              className="flex items-center gap-1 px-2 py-1.5 rounded-xl border border-cyan-500/40 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-600 dark:text-cyan-300 text-xs font-semibold whitespace-nowrap cursor-pointer"
               title="Open 3D Digital Twin with IT X-Ray Focus"
             >
               <Box className="w-3.5 h-3.5" />
-              <span>3D Twin</span>
+              <span className="hidden sm:inline">3D Twin</span>
             </button>
 
             {!isReadOnly && (
@@ -1437,10 +1491,10 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                   setShowProvisionModal(true);
                 }}
                 className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-violet-600 hover:bg-violet-500 text-white text-xs font-semibold whitespace-nowrap cursor-pointer"
+                title="Provision a new MDF or Floor IDF Rack"
               >
                 <Plus className="w-3.5 h-3.5" />
-                <span className="hidden md:inline">Add IDF / DC Rack</span>
-                <span className="md:hidden">Add Rack</span>
+                <span>Add Rack</span>
               </button>
             )}
 
@@ -1457,23 +1511,25 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
           </div>
         </div>
 
-        {/* Sub-Bar: 5 Enterprise Studio Tabs + Live Telemetry KPIs */}
-        <div className="px-3 sm:px-4 py-1.5 border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#111117] flex items-center justify-between gap-3 overflow-x-auto shrink-0">
+        {/* Sub-Bar: Compact Responsive Studio Tabs + Live KPIs */}
+        <div className="px-2.5 sm:px-4 py-1.5 border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#111117] flex items-center justify-between gap-2 overflow-x-auto no-scrollbar shrink-0">
           <div className="flex items-center gap-1 shrink-0">
             {(
               [
-                { id: 'live-map', label: 'Live Port Map', icon: <Network className="w-3.5 h-3.5" />, badge: totalLivePorts },
-                { id: 'racks', label: 'Racks & Ports', icon: <Server className="w-3.5 h-3.5" />, badge: itAssets.length },
-                { id: 'user-nodes', label: 'User Nodes (2960-X)', icon: <Monitor className="w-3.5 h-3.5" />, badge: netArch.userNodes.length },
-                { id: 'topology', label: '3-Tier Architecture', icon: <GitBranch className="w-3.5 h-3.5" />, badge: netArch.interRackLinks.length },
-                { id: 'monitoring', label: 'Monitoring APIs', icon: <PlugZap className="w-3.5 h-3.5" />, badge: netArch.monitoringApis.length },
+                { id: 'live-map', label: 'Port Map', title: 'Live Port & Cable Topology Map', icon: <Network className="w-3.5 h-3.5" />, badge: totalLivePorts },
+                { id: 'racks', label: 'Racks', title: 'Racks, Cabinets & Port Elevation', icon: <Server className="w-3.5 h-3.5" />, badge: itAssets.length },
+                { id: 'user-nodes', label: 'Endpoints', title: 'Room Endpoints & Wall Drops', icon: <Monitor className="w-3.5 h-3.5" />, badge: netArch.userNodes.length },
+                { id: 'topology', label: '3-Tier', title: '3-Tier Campus Architecture', icon: <GitBranch className="w-3.5 h-3.5" />, badge: netArch.interRackLinks.length },
+                { id: 'builder', label: 'Builder', title: 'Quick IT Architecture Builder', icon: <Sparkles className="w-3.5 h-3.5" />, badge: scene.rooms.length },
+                { id: 'monitoring', label: 'APIs', title: 'SNMP / Monitoring Connectors', icon: <PlugZap className="w-3.5 h-3.5" />, badge: netArch.monitoringApis.length },
               ] as const
             ).map((tab) => (
               <button
                 key={tab.id}
                 type="button"
+                title={tab.title}
                 onClick={() => setActiveTab(tab.id)}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors whitespace-nowrap cursor-pointer ${
                   activeTab === tab.id
                     ? 'bg-violet-600 text-white shadow-sm'
                     : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800/70'
@@ -1482,7 +1538,7 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                 {tab.icon}
                 <span>{tab.label}</span>
                 <span
-                  className={`px-1.5 py-0.2 rounded-md font-mono text-[10px] ${
+                  className={`px-1 py-0.2 rounded font-mono text-[9.5px] tabular-nums ${
                     activeTab === tab.id ? 'bg-white/20 text-white' : 'bg-zinc-200/70 dark:bg-zinc-800 text-zinc-500'
                   }`}
                 >
@@ -1492,16 +1548,18 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
             ))}
           </div>
 
-          <div className="hidden lg:flex items-center gap-3 text-[11px] font-mono tabular-nums shrink-0">
+          <div className="hidden xl:flex items-center gap-2.5 text-[11px] font-mono tabular-nums shrink-0">
             <span className="text-zinc-500">
-              IT Load: <strong className="text-amber-500">{totalFacilityKw.toFixed(2)} kW</strong>
+              <strong className="text-amber-500">{totalFacilityKw.toFixed(1)} kW</strong>
             </span>
+            <span className="text-zinc-700">·</span>
             <span className="text-zinc-500">
-              Core/IDF: <strong className="text-cyan-400">{coreRacks.length}/{idfRacks.length}</strong>
+              <strong className="text-cyan-400">{coreRacks.length}/{idfRacks.length}</strong> MDF/IDF
             </span>
+            <span className="text-zinc-700">·</span>
             <span className={totalErrors > 0 ? 'text-rose-400 font-bold flex items-center gap-1' : 'text-emerald-500 flex items-center gap-1'}>
-              {totalErrors > 0 ? <AlertTriangle className="w-3.5 h-3.5" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
-              {totalErrors > 0 ? `${totalErrors} Active Alerts` : 'All Links Nominal'}
+              {totalErrors > 0 ? <AlertTriangle className="w-3 h-3" /> : <CheckCircle2 className="w-3 h-3" />}
+              {totalErrors > 0 ? `${totalErrors} Alerts` : 'Nominal'}
             </span>
             <button
               type="button"
@@ -1510,7 +1568,7 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
               title={showInspectorPane ? 'Expand workspace canvas (hide right inspector)' : 'Show Inspector & Trace sidebar'}
             >
               {showInspectorPane ? <PanelRightClose className="w-3.5 h-3.5" /> : <PanelRightOpen className="w-3.5 h-3.5" />}
-              <span className="font-sans text-[10.5px] font-semibold">{showInspectorPane ? 'Wide Map' : 'Inspector'}</span>
+              <span className="font-sans text-[10.5px] font-semibold">{showInspectorPane ? 'Wide' : 'Inspect'}</span>
             </button>
           </div>
         </div>
@@ -1554,21 +1612,22 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
               showInspectorPane ? 'lg:col-span-8 lg:border-r' : 'lg:col-span-12'
             } flex-col border-zinc-200 dark:border-zinc-800 overflow-y-auto overscroll-contain touch-pan-y lg:overflow-hidden`}
           >
-            {/* ==================== TAB 0: LIVE PORT MAP & VISUAL EDITOR (Vantage-Style) ==================== */}
+            {/* ==================== TAB 0: LIVE PORT MAP & VISUAL EDITOR (2D & 3D) ==================== */}
             {activeTab === 'live-map' && (
               <LivePortTopologyCanvas
                 itAssets={itAssets}
                 userNodes={netArch.userNodes}
                 interRackLinks={netArch.interRackLinks}
                 topologyMap={netArch.topologyMap}
+                buildings={scene.buildings}
+                rooms={scene.rooms}
+                walls={scene.walls}
+                floors={scene.floors}
+                viewDim={viewDim}
+                onViewDimChange={setViewDim}
                 isReadOnly={isReadOnly}
                 inspected={inspected}
-                onInspect={(target) => {
-                  setInspected(target);
-                  if (target.kind === 'rack' || target.kind === 'device' || target.kind === 'port') {
-                    setSelectedAssetId(target.rackId);
-                  }
-                }}
+                onInspect={(target) => handleInspectAndReveal(target, false)}
                 onJumpTo3D={({ rackId, nodeId }) => {
                   if (nodeId) {
                     setInspected({ kind: 'user-node', nodeId });
@@ -1727,19 +1786,19 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                         userNodes={netArch.userNodes}
                         interRackLinks={netArch.interRackLinks}
                         floors={scene.floors}
+                        buildings={scene.buildings}
+                        rooms={scene.rooms}
+                        walls={scene.walls}
                         selectedItemId={selected3DItemId}
-                        onSelectRack={(rId) => {
-                          setSelectedAssetId(rId);
-                          setInspected({ kind: 'rack', rackId: rId });
-                        }}
-                        onSelectDevice={(rId, dId) => setInspected({ kind: 'device', rackId: rId, deviceId: dId })}
+                        onSelectRack={(rId) => handleInspectAndReveal({ kind: 'rack', rackId: rId })}
+                        onSelectDevice={(rId, dId) => handleInspectAndReveal({ kind: 'device', rackId: rId, deviceId: dId })}
                         onSelectPort={(rId, dId, pId) =>
-                          setInspected({ kind: 'port', rackId: rId, deviceId: dId, portId: pId })
+                          handleInspectAndReveal({ kind: 'port', rackId: rId, deviceId: dId, portId: pId })
                         }
                       />
                     </div>
                   ) : (
-                    <div className="flex-1 overflow-y-auto p-3 space-y-4">
+                    <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-3 space-y-4">
                       {/* 42U Cabinet Elevation with Live Blinking Port & Uplink LEDs */}
                       <div className="mx-auto max-w-[440px] rounded-xl border-2 border-zinc-700 bg-[#12121A] p-2 shadow-2xl space-y-0.5">
                         {Array.from({ length: rackConfig.totalUnits }, (_, idx) => {
@@ -2042,11 +2101,42 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                   )}
                 </div>
 
-                {/* Interactive Scaled Floor Plan SVG for User Nodes + 2960-X Wiring */}
+                {/* Interactive Scaled Floor Plan SVG (2D) OR Real 3D Floor Map (3D) */}
+                {viewDim === '3d' ? (
+                  <div className="flex-1 min-h-[320px] relative overflow-hidden">
+                    <DataCenter3DViewer
+                      mode="campus-topology"
+                      rackAssets={floorRacks.length > 0 ? floorRacks : itAssets}
+                      activeRackId={activeAsset?.id ?? null}
+                      userNodes={floorUserNodes}
+                      interRackLinks={netArch.interRackLinks}
+                      floors={activeNodeFloor ? [activeNodeFloor] : scene.floors}
+                      buildings={scene.buildings}
+                      rooms={floorRooms}
+                      walls={scene.walls.filter((w) => w.floorId === activeNodeFloor?.id)}
+                      selectedItemId={selected3DItemId}
+                      onSelectRack={(rId) => {
+                        handleInspectAndReveal({ kind: 'rack', rackId: rId });
+                        setDetail3DTarget({ kind: 'rack', rackId: rId });
+                      }}
+                      onSelectDevice={(rId, dId) => {
+                        handleInspectAndReveal({ kind: 'device', rackId: rId, deviceId: dId });
+                        setDetail3DTarget({ kind: 'device', rackId: rId, deviceId: dId });
+                      }}
+                      onSelectUserNode={(nId) => {
+                        handleInspectAndReveal({ kind: 'user-node', nodeId: nId });
+                        setDetail3DTarget({ kind: 'user-node', nodeId: nId });
+                      }}
+                      onSelectRoom={(rmId, flId) => {
+                        setDetail3DTarget({ kind: 'room', roomId: rmId, floorId: flId });
+                      }}
+                    />
+                  </div>
+                ) : (
                 <div className="flex-1 min-h-[260px] sm:min-h-[340px] relative p-2.5 sm:p-3 overflow-hidden flex items-center justify-center">
                   {placingNodeKind && !isReadOnly && (
                     <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 px-3 py-1 rounded-xl bg-violet-600 text-white text-xs font-semibold shadow-xl max-w-[92%] text-center">
-                      Tap inside any room to place {USER_NODE_PALETTE.find((p) => p.kind === placingNodeKind)?.label} &amp; wire to 2960-X
+                      Tap inside any room to place {USER_NODE_PALETTE.find((p) => p.kind === placingNodeKind)?.label} &amp; wire to Floor Access Switch
                     </div>
                   )}
 
@@ -2068,7 +2158,10 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                         updateNetworkUserNode(draggingNodeId, { x: pt.x, z: pt.z, roomId: rm?.id });
                       }}
                       onPointerUp={() => setDraggingNodeId(null)}
-                      onPointerLeave={() => setDraggingNodeId(null)}
+                      onPointerLeave={() => {
+                        setDraggingNodeId(null);
+                        setHoverTip(null);
+                      }}
                     >
                       {/* Floor Slab */}
                       <rect
@@ -2082,32 +2175,57 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                         strokeWidth={0.14}
                       />
 
-                      {/* Rooms */}
-                      {floorRooms.map((rm) => (
-                        <g key={rm.id}>
-                          <rect
-                            x={rm.x}
-                            y={rm.z}
-                            width={rm.width}
-                            height={rm.depth}
-                            fill="#181D2E"
-                            stroke="#334155"
-                            strokeWidth={0.1}
-                          />
-                          <text
-                            x={rm.x + 0.4}
-                            y={rm.z + 0.85}
-                            fontSize={0.62}
-                            fill="#94A3B8"
-                            fontFamily="ui-monospace, monospace"
-                            fontWeight="600"
+                      {/* Rooms with interactive hover tooltips */}
+                      {floorRooms.map((rm) => {
+                        const rmRacks = floorRacks.filter((r) => r.roomId === rm.id);
+                        const rmNodes = floorUserNodes.filter((n) => n.roomId === rm.id);
+                        const showRoomTip = (e: React.MouseEvent) => {
+                          setHoverTip({
+                            x: e.clientX,
+                            y: e.clientY,
+                            title: `${rm.code} · ${rm.name}`,
+                            badge: rm.environmental?.cleanroomGrade ?? rm.category,
+                            badgeTone: 'blue',
+                            subtitle: `${activeNodeFloor.code} · ${activeNodeFloor.name}`,
+                            rows: [
+                              { label: 'Footprint', value: `${rm.width.toFixed(1)}m × ${rm.depth.toFixed(1)}m (${Math.round(rm.width * rm.depth)} m²)` },
+                              { label: 'IT Racks', value: rmRacks.length > 0 ? rmRacks.map((r) => r.assetId).join(', ') : 'None' },
+                              { label: 'Endpoints', value: `${rmNodes.length} connected drop${rmNodes.length === 1 ? '' : 's'}` },
+                            ],
+                            hint: placingNodeKind ? 'Click to place endpoint in this room' : 'Hover racks/endpoints for port details',
+                          });
+                        };
+                        return (
+                          <g
+                            key={rm.id}
+                            onMouseEnter={showRoomTip}
+                            onMouseMove={showRoomTip}
+                            onMouseLeave={() => setHoverTip(null)}
                           >
-                            {rm.code} · {rm.name.slice(0, 18)}
-                          </text>
-                        </g>
-                      ))}
+                            <rect
+                              x={rm.x}
+                              y={rm.z}
+                              width={rm.width}
+                              height={rm.depth}
+                              fill="#181D2E"
+                              stroke="#334155"
+                              strokeWidth={0.1}
+                            />
+                            <text
+                              x={rm.x + 0.4}
+                              y={rm.z + 0.85}
+                              fontSize={0.62}
+                              fill="#94A3B8"
+                              fontFamily="ui-monospace, monospace"
+                              fontWeight="600"
+                            >
+                              {rm.code} · {rm.name.slice(0, 18)}
+                            </text>
+                          </g>
+                        );
+                      })}
 
-                      {/* Structured Cat6A / Fiber Drop Lines from User Nodes -> Floor IDF / 2960-X Racks */}
+                      {/* Structured Cat6A / Fiber Drop Lines from User Nodes -> Floor IDF / Access Racks */}
                       {floorUserNodes.map((node) => {
                         const targetRack = floorRacks.find((r) => r.id === node.connectedRackId);
                         if (!targetRack) return null;
@@ -2140,11 +2258,34 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                       {floorRacks.map((rack) => {
                         const isCore = rack.rackConfig?.rackRole === 'core-dc';
                         const isSel = inspected?.kind === 'rack' && inspected.rackId === rack.id;
+                        const rm = getRoomById(rack.roomId);
+                        const devs = rack.rackConfig?.devices ?? [];
+                        const dropsCount = floorUserNodes.filter((n) => n.connectedRackId === rack.id).length;
+                        const showRackTip = (e: React.MouseEvent) => {
+                          e.stopPropagation();
+                          setHoverTip({
+                            x: e.clientX,
+                            y: e.clientY,
+                            title: `${rack.assetId} · ${rack.name}`,
+                            badge: isCore ? 'CORE MDF' : 'IDF RACK',
+                            badgeTone: isCore ? 'cyan' : 'blue',
+                            subtitle: rm ? `${rm.code} · ${rm.name}` : activeNodeFloor.name,
+                            rows: [
+                              { label: 'Mounted Gear', value: `${devs.length} device${devs.length === 1 ? '' : 's'}` },
+                              { label: 'Room Drops', value: `${dropsCount} endpoint${dropsCount === 1 ? '' : 's'}` },
+                              { label: 'Subnet', value: rack.rackConfig?.subnetCidr ?? '—' },
+                            ],
+                            hint: 'Click to inspect rack & devices',
+                          });
+                        };
                         return (
                           <g
                             key={rack.id}
                             transform={`translate(${rack.x}, ${rack.z})`}
                             className="cursor-pointer"
+                            onMouseEnter={showRackTip}
+                            onMouseMove={showRackTip}
+                            onMouseLeave={() => setHoverTip(null)}
                             onClick={(e) => {
                               e.stopPropagation();
                               setSelectedAssetId(rack.id);
@@ -2192,11 +2333,34 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                             : node.status === 'degraded'
                               ? '#F59E0B'
                               : pal.color;
+                        const rm = getRoomById(node.roomId);
+                        const pathInfo = resolveNodePath(node);
+                        const showNodeTip = (e: React.MouseEvent) => {
+                          e.stopPropagation();
+                          setHoverTip({
+                            x: e.clientX,
+                            y: e.clientY,
+                            title: `${node.code} · ${node.name}`,
+                            badge: node.status.toUpperCase(),
+                            badgeTone: node.status === 'error' || node.status === 'offline' ? 'rose' : node.status === 'degraded' ? 'amber' : 'emerald',
+                            subtitle: rm ? `${rm.code} · ${rm.name}` : activeNodeFloor.name,
+                            rows: [
+                              { label: 'Type / Jack', value: `${pal.label} · ${node.wallJackId}` },
+                              { label: 'IP / VLAN', value: `${node.ipAddress} · ${node.vlan}` },
+                              { label: 'Uplink', value: `${pathInfo.accessDev?.name ?? 'Access SW'} [${pathInfo.accessPort?.label ?? 'Gi1'}]` },
+                              { label: 'Media / PoE', value: `${node.media}${node.poeWatts > 0 ? ` · ${node.poeWatts}W` : ''}` },
+                            ],
+                            hint: isReadOnly ? 'Click to inspect endpoint' : 'Click to inspect · Drag to relocate',
+                          });
+                        };
                         return (
                           <g
                             key={node.id}
                             transform={`translate(${node.x}, ${node.z})`}
                             className={isReadOnly ? 'cursor-pointer' : 'cursor-move'}
+                            onMouseEnter={showNodeTip}
+                            onMouseMove={showNodeTip}
+                            onMouseLeave={() => setHoverTip(null)}
                             onPointerDown={(e) => {
                               e.stopPropagation();
                               setInspected({ kind: 'user-node', nodeId: node.id });
@@ -2266,22 +2430,40 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                     </svg>
                   )}
                 </div>
+                )}
 
                 {/* Bottom User Node Connection Strip (3-Tier Summary) */}
                 <div className="px-3 py-2 border-t border-zinc-800 bg-[#0F1018] flex items-center gap-2 overflow-x-auto shrink-0">
                   {floorUserNodes.length === 0 ? (
                     <span className="text-[11px] text-zinc-500">
-                      No user nodes placed on this floor yet. Select a node type above and click inside any room.
+                      No endpoints placed on this floor yet. Select a node type above and click inside any room, or use IT Builder for batch drops.
                     </span>
                   ) : (
                     floorUserNodes.map((n) => {
                       const isSel = inspected?.kind === 'user-node' && inspected.nodeId === n.id;
                       const p = resolveNodePath(n);
+                      const rm = getRoomById(n.roomId);
                       return (
                         <button
                           key={n.id}
                           type="button"
                           onClick={() => setInspected({ kind: 'user-node', nodeId: n.id })}
+                          onMouseEnter={(e) =>
+                            setHoverTip({
+                              x: e.clientX,
+                              y: e.clientY,
+                              title: `${n.code} · ${n.name}`,
+                              badge: n.status.toUpperCase(),
+                              badgeTone: n.status === 'error' || n.status === 'offline' ? 'rose' : n.status === 'degraded' ? 'amber' : 'emerald',
+                              subtitle: rm ? `${rm.code} · ${rm.name}` : activeNodeFloor?.name,
+                              rows: [
+                                { label: 'Wall Jack / IP', value: `${n.wallJackId} · ${n.ipAddress}` },
+                                { label: 'Switch Port', value: `${p.accessDev?.name ?? 'Access SW'} [${p.accessPort?.label ?? 'Gi1'}]` },
+                                { label: 'VLAN', value: n.vlan },
+                              ],
+                            })
+                          }
+                          onMouseLeave={() => setHoverTip(null)}
                           className={`px-2.5 py-1.5 rounded-xl border text-left text-[10.5px] shrink-0 transition-colors cursor-pointer ${
                             isSel
                               ? 'border-amber-400 bg-violet-950/60 text-white'
@@ -2303,7 +2485,7 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                             {n.code} ({n.wallJackId})
                           </div>
                           <div className="text-[9.5px] font-mono text-zinc-400">
-                            {p.accessDev?.model?.slice(0, 15) ?? '2960-X'} [{p.accessPort?.label ?? 'Gi1'}] → {p.coreRack?.assetId ?? 'DC-R01'}
+                            {p.accessDev?.model?.slice(0, 15) ?? 'Access SW'} [{p.accessPort?.label ?? 'Gi1'}] → {p.coreRack?.assetId ?? 'DC-R01'}
                           </div>
                         </button>
                       );
@@ -2325,255 +2507,674 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                       userNodes={netArch.userNodes}
                       interRackLinks={netArch.interRackLinks}
                       floors={scene.floors}
+                      buildings={scene.buildings}
+                      rooms={scene.rooms}
+                      walls={scene.walls}
                       selectedItemId={selected3DItemId}
                       onSelectRack={(rId) => {
-                        setSelectedAssetId(rId);
-                        setInspected({ kind: 'rack', rackId: rId });
+                        handleInspectAndReveal({ kind: 'rack', rackId: rId });
+                        setDetail3DTarget({ kind: 'rack', rackId: rId });
                       }}
-                      onSelectUserNode={(nId) => setInspected({ kind: 'user-node', nodeId: nId })}
+                      onSelectDevice={(rId, dId) => {
+                        handleInspectAndReveal({ kind: 'device', rackId: rId, deviceId: dId });
+                        setDetail3DTarget({ kind: 'device', rackId: rId, deviceId: dId });
+                      }}
+                      onSelectUserNode={(nId) => {
+                        handleInspectAndReveal({ kind: 'user-node', nodeId: nId });
+                        setDetail3DTarget({ kind: 'user-node', nodeId: nId });
+                      }}
+                      onSelectRoom={(rmId, flId) => {
+                        setDetail3DTarget({ kind: 'room', roomId: rmId, floorId: flId });
+                      }}
                     />
                   </div>
                 ) : (
-                  <div className="flex-1 overflow-y-auto p-4 space-y-5">
-                    {/* Tier 1: Core Data Center (MDF) */}
-                    <div className="space-y-2">
-                      <div className="text-[10.5px] font-bold uppercase tracking-wider text-cyan-400 flex items-center gap-2">
-                        <span className="w-2 h-2 rounded-full bg-cyan-400" />
-                        Tier 1 · Core Data Center Layer (MDF · 40G/100G Nexus Fabric)
-                      </div>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                        {coreRacks.map((rack) => {
-                          const fl = getFloorById(rack.floorId);
-                          const rm = getRoomById(rack.roomId);
-                          return (
-                            <div
-                              key={rack.id}
-                              onClick={() => {
-                                setSelectedAssetId(rack.id);
-                                setInspected({ kind: 'rack', rackId: rack.id });
-                              }}
-                              className="p-3 rounded-2xl bg-[#111522] border border-cyan-500/45 hover:border-cyan-400 cursor-pointer space-y-2"
+                  <div
+                    className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-3.5 sm:p-4 space-y-5"
+                    onScroll={() => setHoverTip(null)}
+                  >
+                    {/* Interactive Campus Buildings & Floors Navigator */}
+                    {scene.buildings.length > 0 && (
+                      <div className="space-y-2">
+                        <div className="flex items-center justify-between gap-2 flex-wrap">
+                          <div className="text-[10.5px] font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+                            <Layers className="w-3.5 h-3.5 text-cyan-400" />
+                            Campus Buildings &amp; Floors — Hover for Room/Equipment Summary · Click to Filter or Jump to 3D Twin
+                          </div>
+                          {topologyBuildingFilter !== 'all' && (
+                            <button
+                              type="button"
+                              onClick={() => setTopologyBuildingFilter('all')}
+                              className="text-[10.5px] text-cyan-400 hover:underline cursor-pointer"
                             >
-                              <div className="flex items-center justify-between">
-                                <div>
-                                  <div className="text-xs font-bold text-white">{rack.name}</div>
-                                  <div className="text-[10px] font-mono text-cyan-300">
-                                    {rack.assetId} · {fl?.code} {rm?.code ? `(${rm.code})` : ''} · {rack.rackConfig?.subnetCidr}
+                              Show All Buildings
+                            </button>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2">
+                          {scene.buildings.map((bldg) => {
+                            const bFloors = scene.floors.filter((f) => f.buildingId === bldg.id);
+                            const bFloorIds = new Set(bFloors.map((f) => f.id));
+                            const bRooms = scene.rooms.filter((rm) => bFloorIds.has(rm.floorId));
+                            const bRacks = itAssets.filter((r) => bFloorIds.has(r.floorId));
+                            const bNodes = netArch.userNodes.filter((n) => bFloorIds.has(n.floorId));
+                            const isFiltered = topologyBuildingFilter === bldg.id;
+                            const bPowerW = bRacks.reduce(
+                              (sum, rk) => sum + (rk.rackConfig?.devices ?? []).reduce((ds, d) => ds + d.powerW, 0),
+                              0
+                            );
+                            const showBldgTip = (e: React.MouseEvent) => {
+                              setHoverTip({
+                                x: e.clientX,
+                                y: e.clientY,
+                                title: `${bldg.code} · ${bldg.name}`,
+                                badge: 'BUILDING',
+                                badgeTone: 'cyan',
+                                subtitle: `${bFloors.length} floor${bFloors.length === 1 ? '' : 's'} · ${bRooms.length} rooms`,
+                                rows: [
+                                  { label: 'IT Racks', value: `${bRacks.length} (${bRacks.map((r) => r.assetId).slice(0, 4).join(', ') || 'None'})` },
+                                  { label: 'Endpoints', value: `${bNodes.length} active room drops` },
+                                  { label: 'IT Power Load', value: `${(bPowerW / 1000).toFixed(2)} kW` },
+                                ],
+                                hint: 'Click to filter 3-Tier topology by this building',
+                              });
+                            };
+                            return (
+                              <div
+                                key={bldg.id}
+                                onMouseEnter={showBldgTip}
+                                onMouseMove={showBldgTip}
+                                onMouseLeave={() => setHoverTip(null)}
+                                onClick={() => {
+                                  setTopologyBuildingFilter((cur) => (cur === bldg.id ? 'all' : bldg.id));
+                                  if (bRacks[0]) {
+                                    handleInspectAndReveal({ kind: 'rack', rackId: bRacks[0].id }, false);
+                                  }
+                                }}
+                                className={`p-2.5 rounded-xl border transition-colors cursor-pointer space-y-1.5 ${
+                                  isFiltered
+                                    ? 'bg-cyan-950/35 border-cyan-400 ring-1 ring-cyan-400/40'
+                                    : 'bg-[#10131F] border-zinc-800 hover:border-cyan-500/60'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="min-w-0">
+                                    <div className="text-xs font-bold text-white truncate">
+                                      {bldg.code} · {bldg.name}
+                                    </div>
+                                    <div className="text-[10px] font-mono text-zinc-400 tabular-nums">
+                                      {bFloors.length} floors · {bRooms.length} rooms · {bRacks.length} racks · {bNodes.length} endpoints
+                                    </div>
                                   </div>
-                                </div>
-                                <span className={`w-2.5 h-2.5 rounded-full ${getLedVisual('up', true, blinkTick)}`} />
-                              </div>
-                              <div className="flex flex-wrap gap-1.5">
-                                {(rack.rackConfig?.devices ?? []).map((d) => (
                                   <button
-                                    key={d.id}
                                     type="button"
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      setInspected({ kind: 'device', rackId: rack.id, deviceId: d.id });
+                                      handleLocateObjectIn3DTwin({ buildingId: bldg.id });
                                     }}
-                                    className="px-2 py-1 rounded-lg bg-[#1A2033] border border-zinc-700 hover:border-cyan-400 text-[10px] font-mono text-zinc-200 cursor-pointer"
+                                    className="px-2 py-1 rounded-lg bg-cyan-500/15 border border-cyan-500/40 hover:bg-cyan-500/30 text-[10px] font-mono font-semibold text-cyan-300 shrink-0 cursor-pointer"
+                                    title="Open this building in 3D Digital Twin"
                                   >
-                                    {d.name} ({d.ipAddress})
+                                    3D Twin
                                   </button>
-                                ))}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Active Inter-Rack Fiber Trunks */}
-                    <div className="p-3 rounded-2xl bg-[#121420] border border-zinc-800 space-y-2.5">
-                      <div className="flex items-center justify-between gap-2 flex-wrap">
-                        <div className="text-[10.5px] font-bold uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
-                          <Cable className="w-3.5 h-3.5" />
-                          Inter-Rack Fiber Uplinks (IDF Distribution ⇄ Core DC · {netArch.interRackLinks.length})
-                        </div>
-                        {!isReadOnly && (
-                          <div className="flex items-center gap-1.5 flex-wrap text-[11px]">
-                            <select
-                              value={uplinkFromRack}
-                              onChange={(e) => setUplinkFromRack(e.target.value)}
-                              className="px-2 py-1 rounded-lg bg-[#0A0B11] border border-zinc-700 text-zinc-200"
-                            >
-                              <option value="">From IDF Rack…</option>
-                              {itAssets.map((r) => (
-                                <option key={r.id} value={r.id}>{r.assetId} · {r.name.slice(0, 18)}</option>
-                              ))}
-                            </select>
-                            <ArrowRight className="w-3 h-3 text-zinc-500" />
-                            <select
-                              value={uplinkToRack}
-                              onChange={(e) => setUplinkToRack(e.target.value)}
-                              className="px-2 py-1 rounded-lg bg-[#0A0B11] border border-zinc-700 text-zinc-200"
-                            >
-                              <option value="">To Core/Dist Rack…</option>
-                              {itAssets.map((r) => (
-                                <option key={r.id} value={r.id}>{r.assetId} · {r.name.slice(0, 18)}</option>
-                              ))}
-                            </select>
-                            <select
-                              value={uplinkSpeed}
-                              onChange={(e) => setUplinkSpeed(Number(e.target.value))}
-                              className="px-2 py-1 rounded-lg bg-[#0A0B11] border border-zinc-700 text-zinc-200"
-                            >
-                              <option value={10}>10G SFP+</option>
-                              <option value={40}>40G QSFP+</option>
-                              <option value={100}>100G QSFP28</option>
-                            </select>
-                            <select
-                              value={uplinkMedia}
-                              onChange={(e) => setUplinkMedia(e.target.value as NetworkInterRackLink['media'])}
-                              className="px-2 py-1 rounded-lg bg-[#0A0B11] border border-zinc-700 text-zinc-200"
-                            >
-                              <option value="OM4 Fiber">OM4 Fiber</option>
-                              <option value="OS2 Single-Mode">OS2 Fiber</option>
-                              <option value="DAC Twinax">DAC Twinax</option>
-                            </select>
-                            <button
-                              type="button"
-                              onClick={handleAddInterRackUplink}
-                              className="px-2.5 py-1 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-semibold cursor-pointer"
-                            >
-                              + Add Trunk
-                            </button>
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                        {netArch.interRackLinks.map((lnk, lIdx) => {
-                          const rFrom = getRackById(lnk.fromRackId);
-                          const rTo = getRackById(lnk.toRackId);
-                          return (
-                            <div
-                              key={lnk.id}
-                              className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-[#0B0D15] border border-zinc-800 text-[11px]"
-                            >
-                              <div className="flex items-center gap-2 min-w-0">
-                                <span
-                                  className={`w-2 h-2 rounded-full shrink-0 ${getLedVisual(
-                                    lnk.status === 'down' ? 'down' : lnk.status === 'degraded' ? 'error' : 'up',
-                                    true,
-                                    blinkTick + lIdx
-                                  )}`}
-                                />
-                                <div className="min-w-0">
-                                  <div className="font-semibold text-zinc-100 truncate">
-                                    {rFrom?.assetId ?? lnk.fromRackId} ── {lnk.speedGbps}G {lnk.media} ──▶ {rTo?.assetId ?? lnk.toRackId}
-                                  </div>
-                                  <div className="text-[10px] font-mono text-zinc-400">
-                                    {lnk.vlanTrunk} · Util {lnk.utilizationPct}% · Rx {lnk.opticalRxDbm} dBm · CRC {lnk.crcErrors}
-                                  </div>
                                 </div>
+                                <div className="flex flex-wrap gap-1">
+                                  {bFloors.map((fl) => {
+                                    const flRooms = scene.rooms.filter((rm) => rm.floorId === fl.id);
+                                    const flRacks = itAssets.filter((r) => r.floorId === fl.id);
+                                    const flNodes = netArch.userNodes.filter((n) => n.floorId === fl.id);
+                                    return (
+                                      <button
+                                        key={fl.id}
+                                        type="button"
+                                        onMouseEnter={(e) => {
+                                          e.stopPropagation();
+                                          setHoverTip({
+                                            x: e.clientX,
+                                            y: e.clientY,
+                                            title: `${fl.code} · ${fl.name}`,
+                                            badge: `LEVEL ${fl.levelIndex}`,
+                                            badgeTone: 'violet',
+                                            subtitle: `${bldg.code} · ${bldg.name}`,
+                                            rows: [
+                                              { label: 'Rooms', value: `${flRooms.length} (${flRooms.slice(0, 4).map((r) => r.code).join(', ')})` },
+                                              { label: 'Racks', value: `${flRacks.length}` },
+                                              { label: 'Endpoints', value: `${flNodes.length}` },
+                                            ],
+                                            hint: 'Click to open Endpoints & Drops floor plan',
+                                          });
+                                        }}
+                                        onMouseMove={(e) => {
+                                          e.stopPropagation();
+                                          setHoverTip((prev) => (prev ? { ...prev, x: e.clientX, y: e.clientY } : prev));
+                                        }}
+                                        onMouseLeave={() => setHoverTip(null)}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setNodeFloorId(fl.id);
+                                          setActiveTab('user-nodes');
+                                          showToast(`Opened ${fl.code} · ${fl.name} Endpoints & Drops map`, 'info');
+                                        }}
+                                        className="px-1.5 py-0.5 rounded bg-[#181D2E] border border-zinc-700/80 hover:border-cyan-400 text-[9.5px] font-mono text-zinc-300 cursor-pointer"
+                                      >
+                                        {fl.code}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Tier 1: Core Data Center (MDF) */}
+                    {(() => {
+                      const matchesBuilding = (floorId: string) => {
+                        if (topologyBuildingFilter === 'all') return true;
+                        const fl = getFloorById(floorId);
+                        return fl?.buildingId === topologyBuildingFilter;
+                      };
+                      const filteredCoreRacks = coreRacks.filter((r) => matchesBuilding(r.floorId));
+                      const filteredIdfRacks = idfRacks.filter((r) => matchesBuilding(r.floorId));
+                      return (
+                        <>
+                          <div className="space-y-2">
+                            <div className="text-[10.5px] font-bold uppercase tracking-wider text-cyan-400 flex items-center gap-2">
+                              <span className="w-2 h-2 rounded-full bg-cyan-400" />
+                              Tier 1 · Core Data Center Layer (MDF · 40G/100G Core Fabric · {filteredCoreRacks.length})
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                              {filteredCoreRacks.map((rack) => {
+                                const fl = getFloorById(rack.floorId);
+                                const rm = getRoomById(rack.roomId);
+                                const devs = rack.rackConfig?.devices ?? [];
+                                const totalPorts = devs.reduce((s, d) => s + d.ports.length, 0);
+                                const upPorts = devs.reduce((s, d) => s + d.ports.filter((p) => p.status === 'up').length, 0);
+                                const isRackSelected =
+                                  (inspected?.kind === 'rack' || inspected?.kind === 'device' || inspected?.kind === 'port') &&
+                                  inspected.rackId === rack.id;
+                                const showCoreRackTip = (e: React.MouseEvent) => {
+                                  setHoverTip({
+                                    x: e.clientX,
+                                    y: e.clientY,
+                                    title: `${rack.assetId} · ${rack.name}`,
+                                    badge: 'CORE MDF',
+                                    badgeTone: 'cyan',
+                                    subtitle: `${fl?.code ?? ''}${rm ? ` · ${rm.code} ${rm.name}` : ''}`,
+                                    rows: [
+                                      { label: 'Room & Zone', value: rm ? `${rm.code} · ${rm.name}` : rack.rackConfig?.locationZone ?? 'MDF' },
+                                      { label: 'Subnet / Cooling', value: `${rack.rackConfig?.subnetCidr ?? '—'} · ${rack.rackConfig?.coolingZone ?? 'Aisle A1'}` },
+                                      { label: 'Gear & Ports', value: `${devs.length} devices · ${upPorts}/${totalPorts} ports UP` },
+                                    ],
+                                    hint: 'Click to inspect rack details in side inspector',
+                                  });
+                                };
+                                return (
+                                  <div
+                                    key={rack.id}
+                                    onMouseEnter={showCoreRackTip}
+                                    onMouseMove={showCoreRackTip}
+                                    onMouseLeave={() => setHoverTip(null)}
+                                    onClick={() => handleInspectAndReveal({ kind: 'rack', rackId: rack.id })}
+                                    className={`p-3 rounded-2xl bg-[#111522] border transition-all cursor-pointer space-y-2 ${
+                                      isRackSelected
+                                        ? 'border-amber-400 ring-1 ring-amber-400/50'
+                                        : 'border-cyan-500/45 hover:border-cyan-400'
+                                    }`}
+                                  >
+                                    <div className="flex items-start justify-between gap-2">
+                                      <div className="min-w-0">
+                                        <div className="text-xs font-bold text-white truncate">{rack.name}</div>
+                                        <div className="text-[10px] font-mono text-cyan-300 truncate">
+                                          {rack.assetId} · {fl?.code} {rm ? `(${rm.code} · ${rm.name})` : ''} · {rack.rackConfig?.subnetCidr}
+                                        </div>
+                                      </div>
+                                      <div className="flex items-center gap-1 shrink-0">
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setSelectedAssetId(rack.id);
+                                            setInspected({ kind: 'rack', rackId: rack.id });
+                                            setActiveTab('racks');
+                                          }}
+                                          className="px-1.5 py-0.5 rounded-md bg-zinc-800 hover:bg-violet-600 text-[9.5px] font-mono text-zinc-200 hover:text-white cursor-pointer"
+                                          title="Open 42U Rack & Ports Designer"
+                                        >
+                                          Ports
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleLocateObjectIn3DTwin({ rackId: rack.id });
+                                          }}
+                                          className="px-1.5 py-0.5 rounded-md bg-cyan-950/70 border border-cyan-500/40 hover:bg-cyan-600 text-[9.5px] font-mono text-cyan-200 hover:text-white cursor-pointer"
+                                          title="Locate in 3D Digital Twin"
+                                        >
+                                          3D
+                                        </button>
+                                        <span className={`w-2.5 h-2.5 rounded-full ml-0.5 ${getLedVisual('up', true, blinkTick)}`} />
+                                      </div>
+                                    </div>
+                                    <div className="flex flex-wrap gap-1.5">
+                                      {devs.map((d) => {
+                                        const isDevSel =
+                                          (inspected?.kind === 'device' || inspected?.kind === 'port') &&
+                                          inspected.deviceId === d.id;
+                                        const dUp = d.ports.filter((p) => p.status === 'up').length;
+                                        return (
+                                          <button
+                                            key={d.id}
+                                            type="button"
+                                            onMouseEnter={(e) => {
+                                              e.stopPropagation();
+                                              setHoverTip({
+                                                x: e.clientX,
+                                                y: e.clientY,
+                                                title: d.name,
+                                                badge: d.status.toUpperCase(),
+                                                badgeTone: d.status === 'offline' ? 'rose' : d.status === 'warning' ? 'amber' : 'emerald',
+                                                subtitle: `${rack.assetId} · U${d.uStart}${rm ? ` · ${rm.code} ${rm.name}` : ''}`,
+                                                rows: [
+                                                  { label: 'Model', value: `${d.vendor} ${d.model}` },
+                                                  { label: 'IP / VLAN', value: `${d.ipAddress} · ${d.vlan}` },
+                                                  { label: 'Ports / Power', value: `${dUp}/${d.ports.length} UP · ${d.powerW}W` },
+                                                ],
+                                                hint: 'Click to inspect device & ports',
+                                              });
+                                            }}
+                                            onMouseMove={(e) => {
+                                              e.stopPropagation();
+                                              setHoverTip((prev) => (prev ? { ...prev, x: e.clientX, y: e.clientY } : prev));
+                                            }}
+                                            onMouseLeave={() => setHoverTip(null)}
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              handleInspectAndReveal({ kind: 'device', rackId: rack.id, deviceId: d.id });
+                                            }}
+                                            className={`px-2 py-1 rounded-lg border text-[10px] font-mono cursor-pointer transition-colors ${
+                                              isDevSel
+                                                ? 'bg-cyan-500/20 border-amber-400 text-white'
+                                                : 'bg-[#1A2033] border-zinc-700 hover:border-cyan-400 text-zinc-200'
+                                            }`}
+                                          >
+                                            {d.name} ({d.ipAddress})
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          {/* Active Inter-Rack Fiber Trunks */}
+                          <div className="p-3 rounded-2xl bg-[#121420] border border-zinc-800 space-y-2.5">
+                            <div className="flex items-center justify-between gap-2 flex-wrap">
+                              <div className="text-[10.5px] font-bold uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
+                                <Cable className="w-3.5 h-3.5" />
+                                Inter-Rack Fiber Uplinks (IDF Distribution ⇄ Core DC · {netArch.interRackLinks.length})
                               </div>
                               {!isReadOnly && (
-                                <button
-                                  type="button"
-                                  onClick={() => deleteInterRackLink(lnk.id)}
-                                  className="text-zinc-500 hover:text-rose-400 cursor-pointer shrink-0"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Tier 2 & 3: Floor Distribution IDF Racks -> Access 2960-X -> User Endpoints */}
-                    <div className="space-y-2">
-                      <div className="text-[10.5px] font-bold uppercase tracking-wider text-blue-400 flex items-center gap-2">
-                        <span className="w-2 h-2 rounded-full bg-blue-400" />
-                        Tier 2 &amp; 3 · Floor Distribution IDF Racks → Cisco 2960-X Access → User Nodes
-                      </div>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                        {idfRacks.map((rack) => {
-                          const fl = getFloorById(rack.floorId);
-                          const rm = getRoomById(rack.roomId);
-                          const connectedNodes = netArch.userNodes.filter((n) => n.connectedRackId === rack.id);
-                          return (
-                            <div
-                              key={rack.id}
-                              className="p-3 rounded-2xl bg-[#111420] border border-blue-500/35 space-y-2.5"
-                            >
-                              <div
-                                className="flex items-center justify-between cursor-pointer"
-                                onClick={() => {
-                                  setSelectedAssetId(rack.id);
-                                  setInspected({ kind: 'rack', rackId: rack.id });
-                                }}
-                              >
-                                <div>
-                                  <div className="text-xs font-bold text-white">{rack.name}</div>
-                                  <div className="text-[10px] font-mono text-blue-300">
-                                    {rack.assetId} · {fl?.code} {rm ? `(${rm.code} ${rm.name})` : ''}
-                                  </div>
-                                </div>
-                                <span className="text-[10px] font-mono text-zinc-400">
-                                  {connectedNodes.length} user drops
-                                </span>
-                              </div>
-
-                              {/* Distribution & Access 2960-X Switches inside this IDF */}
-                              <div className="space-y-1">
-                                {(rack.rackConfig?.devices ?? []).map((dev) => (
-                                  <button
-                                    key={dev.id}
-                                    type="button"
-                                    onClick={() => setInspected({ kind: 'device', rackId: rack.id, deviceId: dev.id })}
-                                    className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-xl bg-[#181C2C] border border-zinc-800 hover:border-teal-400 text-left text-[10.5px] cursor-pointer"
+                                <div className="flex items-center gap-1.5 flex-wrap text-[11px]">
+                                  <select
+                                    value={uplinkFromRack}
+                                    onChange={(e) => setUplinkFromRack(e.target.value)}
+                                    className="px-2 py-1 rounded-lg bg-[#0A0B11] border border-zinc-700 text-zinc-200"
                                   >
-                                    <span className="truncate font-semibold text-zinc-100">
-                                      {dev.name} <span className="font-mono text-zinc-400">({dev.model})</span>
-                                    </span>
-                                    <span className="flex items-center gap-1 shrink-0">
-                                      {dev.ports.slice(0, 5).map((p, idx) => (
-                                        <span
-                                          key={p.id}
-                                          className={`w-1.5 h-1.5 rounded-full ${getLedVisual(p.status, p.isUplink, blinkTick + idx)}`}
-                                        />
-                                      ))}
-                                    </span>
+                                    <option value="">From IDF Rack…</option>
+                                    {itAssets.map((r) => (
+                                      <option key={r.id} value={r.id}>{r.assetId} · {r.name.slice(0, 18)}</option>
+                                    ))}
+                                  </select>
+                                  <ArrowRight className="w-3 h-3 text-zinc-500" />
+                                  <select
+                                    value={uplinkToRack}
+                                    onChange={(e) => setUplinkToRack(e.target.value)}
+                                    className="px-2 py-1 rounded-lg bg-[#0A0B11] border border-zinc-700 text-zinc-200"
+                                  >
+                                    <option value="">To Core/Dist Rack…</option>
+                                    {itAssets.map((r) => (
+                                      <option key={r.id} value={r.id}>{r.assetId} · {r.name.slice(0, 18)}</option>
+                                    ))}
+                                  </select>
+                                  <select
+                                    value={uplinkSpeed}
+                                    onChange={(e) => setUplinkSpeed(Number(e.target.value))}
+                                    className="px-2 py-1 rounded-lg bg-[#0A0B11] border border-zinc-700 text-zinc-200"
+                                  >
+                                    <option value={10}>10G SFP+</option>
+                                    <option value={40}>40G QSFP+</option>
+                                    <option value={100}>100G QSFP28</option>
+                                  </select>
+                                  <select
+                                    value={uplinkMedia}
+                                    onChange={(e) => setUplinkMedia(e.target.value as NetworkInterRackLink['media'])}
+                                    className="px-2 py-1 rounded-lg bg-[#0A0B11] border border-zinc-700 text-zinc-200"
+                                  >
+                                    <option value="OM4 Fiber">OM4 Fiber</option>
+                                    <option value="OS2 Single-Mode">OS2 Fiber</option>
+                                    <option value="DAC Twinax">DAC Twinax</option>
+                                  </select>
+                                  <button
+                                    type="button"
+                                    onClick={handleAddInterRackUplink}
+                                    className="px-2.5 py-1 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-semibold cursor-pointer"
+                                  >
+                                    + Add Trunk
                                   </button>
-                                ))}
-                              </div>
-
-                              {/* Connected User Nodes */}
-                              {connectedNodes.length > 0 && (
-                                <div className="flex flex-wrap gap-1.5 pt-1 border-t border-zinc-800/80">
-                                  {connectedNodes.map((n) => (
-                                    <button
-                                      key={n.id}
-                                      type="button"
-                                      onClick={() => setInspected({ kind: 'user-node', nodeId: n.id })}
-                                      className={`px-2 py-0.5 rounded-lg text-[10px] font-mono border cursor-pointer ${
-                                        n.status === 'error'
-                                          ? 'border-rose-500/70 bg-rose-950/50 text-rose-300'
-                                          : 'border-teal-500/40 bg-teal-950/30 text-teal-200 hover:border-teal-400'
-                                      }`}
-                                    >
-                                      {n.code} · {n.wallJackId}
-                                    </button>
-                                  ))}
                                 </div>
                               )}
                             </div>
-                          );
-                        })}
-                      </div>
-                    </div>
+
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                              {netArch.interRackLinks.map((lnk, lIdx) => {
+                                const rFrom = getRackById(lnk.fromRackId);
+                                const rTo = getRackById(lnk.toRackId);
+                                const rmFrom = rFrom ? getRoomById(rFrom.roomId) : undefined;
+                                const rmTo = rTo ? getRoomById(rTo.roomId) : undefined;
+                                const showLinkTip = (e: React.MouseEvent) => {
+                                  setHoverTip({
+                                    x: e.clientX,
+                                    y: e.clientY,
+                                    title: `${rFrom?.assetId ?? lnk.fromRackId} ⇄ ${rTo?.assetId ?? lnk.toRackId}`,
+                                    badge: `${lnk.speedGbps}G ${lnk.status.toUpperCase()}`,
+                                    badgeTone: lnk.status === 'down' ? 'rose' : lnk.status === 'degraded' ? 'amber' : 'cyan',
+                                    subtitle: `${lnk.media} · ${lnk.vlanTrunk}`,
+                                    rows: [
+                                      { label: 'Source Room', value: rmFrom ? `${rmFrom.code} · ${rmFrom.name}` : rFrom?.name ?? '—' },
+                                      { label: 'Target Room', value: rmTo ? `${rmTo.code} · ${rmTo.name}` : rTo?.name ?? '—' },
+                                      { label: 'Telemetry', value: `Util ${lnk.utilizationPct}% · Rx ${lnk.opticalRxDbm} dBm · CRC ${lnk.crcErrors}` },
+                                    ],
+                                    hint: 'Click to inspect uplink transceiver port',
+                                  });
+                                };
+                                return (
+                                  <div
+                                    key={lnk.id}
+                                    onMouseEnter={showLinkTip}
+                                    onMouseMove={showLinkTip}
+                                    onMouseLeave={() => setHoverTip(null)}
+                                    onClick={() => {
+                                      if (rFrom) {
+                                        handleInspectAndReveal({
+                                          kind: 'port',
+                                          rackId: rFrom.id,
+                                          deviceId: lnk.fromDeviceId,
+                                          portId: lnk.fromPortId,
+                                        });
+                                      }
+                                    }}
+                                    className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-[#0B0D15] border border-zinc-800 hover:border-amber-400/70 text-[11px] cursor-pointer transition-colors"
+                                  >
+                                    <div className="flex items-center gap-2 min-w-0">
+                                      <span
+                                        className={`w-2 h-2 rounded-full shrink-0 ${getLedVisual(
+                                          lnk.status === 'down' ? 'down' : lnk.status === 'degraded' ? 'error' : 'up',
+                                          true,
+                                          blinkTick + lIdx
+                                        )}`}
+                                      />
+                                      <div className="min-w-0">
+                                        <div className="font-semibold text-zinc-100 truncate">
+                                          {rFrom?.assetId ?? lnk.fromRackId} ── {lnk.speedGbps}G {lnk.media} ──▶ {rTo?.assetId ?? lnk.toRackId}
+                                        </div>
+                                        <div className="text-[10px] font-mono text-zinc-400">
+                                          {lnk.vlanTrunk} · Util {lnk.utilizationPct}% · Rx {lnk.opticalRxDbm} dBm · CRC {lnk.crcErrors}
+                                        </div>
+                                      </div>
+                                    </div>
+                                    {!isReadOnly && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          deleteInterRackLink(lnk.id);
+                                        }}
+                                        className="text-zinc-500 hover:text-rose-400 cursor-pointer shrink-0"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          {/* Tier 2 & 3: Floor Distribution IDF Racks -> Access Switches -> Endpoints */}
+                          <div className="space-y-2">
+                            <div className="text-[10.5px] font-bold uppercase tracking-wider text-blue-400 flex items-center gap-2">
+                              <span className="w-2 h-2 rounded-full bg-blue-400" />
+                              Tier 2 &amp; 3 · Floor Distribution IDF Racks → Access Switches → Room Endpoints ({filteredIdfRacks.length})
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                              {filteredIdfRacks.map((rack) => {
+                                const fl = getFloorById(rack.floorId);
+                                const rm = getRoomById(rack.roomId);
+                                const connectedNodes = netArch.userNodes.filter((n) => n.connectedRackId === rack.id);
+                                const devs = rack.rackConfig?.devices ?? [];
+                                const isRackSelected =
+                                  (inspected?.kind === 'rack' || inspected?.kind === 'device' || inspected?.kind === 'port') &&
+                                  inspected.rackId === rack.id;
+                                const showIdfRackTip = (e: React.MouseEvent) => {
+                                  setHoverTip({
+                                    x: e.clientX,
+                                    y: e.clientY,
+                                    title: `${rack.assetId} · ${rack.name}`,
+                                    badge: rack.rackConfig?.rackRole === 'access-closet' ? 'ACCESS CLOSET' : 'FLOOR IDF',
+                                    badgeTone: 'blue',
+                                    subtitle: `${fl?.code ?? ''}${rm ? ` · ${rm.code} ${rm.name}` : ''}`,
+                                    rows: [
+                                      { label: 'Room', value: rm ? `${rm.code} · ${rm.name}` : 'Floor Closet' },
+                                      { label: 'Mounted Switches', value: `${devs.length} unit${devs.length === 1 ? '' : 's'}` },
+                                      { label: 'Room Endpoints', value: `${connectedNodes.length} active drop${connectedNodes.length === 1 ? '' : 's'}` },
+                                    ],
+                                    hint: 'Click to inspect rack · Use Ports or 3D buttons to jump',
+                                  });
+                                };
+                                return (
+                                  <div
+                                    key={rack.id}
+                                    onMouseEnter={showIdfRackTip}
+                                    onMouseMove={showIdfRackTip}
+                                    onMouseLeave={() => setHoverTip(null)}
+                                    className={`p-3 rounded-2xl bg-[#111420] border transition-all space-y-2.5 ${
+                                      isRackSelected
+                                        ? 'border-amber-400 ring-1 ring-amber-400/50'
+                                        : 'border-blue-500/35 hover:border-blue-400/70'
+                                    }`}
+                                  >
+                                    <div
+                                      className="flex items-start justify-between gap-2 cursor-pointer"
+                                      onClick={() => handleInspectAndReveal({ kind: 'rack', rackId: rack.id })}
+                                    >
+                                      <div className="min-w-0">
+                                        <div className="text-xs font-bold text-white truncate">{rack.name}</div>
+                                        <div className="text-[10px] font-mono text-blue-300 truncate">
+                                          {rack.assetId} · {fl?.code} {rm ? `(${rm.code} ${rm.name})` : ''}
+                                        </div>
+                                      </div>
+                                      <div className="flex items-center gap-1 shrink-0">
+                                        <span className="text-[9.5px] font-mono text-zinc-400 mr-1">
+                                          {connectedNodes.length} drops
+                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setSelectedAssetId(rack.id);
+                                            setInspected({ kind: 'rack', rackId: rack.id });
+                                            setActiveTab('racks');
+                                          }}
+                                          className="px-1.5 py-0.5 rounded-md bg-zinc-800 hover:bg-violet-600 text-[9.5px] font-mono text-zinc-200 hover:text-white cursor-pointer"
+                                        >
+                                          Ports
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleLocateObjectIn3DTwin({ rackId: rack.id });
+                                          }}
+                                          className="px-1.5 py-0.5 rounded-md bg-cyan-950/70 border border-cyan-500/40 hover:bg-cyan-600 text-[9.5px] font-mono text-cyan-200 hover:text-white cursor-pointer"
+                                        >
+                                          3D
+                                        </button>
+                                      </div>
+                                    </div>
+
+                                    {/* Distribution & Access Switches inside this IDF */}
+                                    <div className="space-y-1">
+                                      {devs.map((dev) => {
+                                        const isDevSel =
+                                          (inspected?.kind === 'device' || inspected?.kind === 'port') &&
+                                          inspected.deviceId === dev.id;
+                                        const dUp = dev.ports.filter((p) => p.status === 'up').length;
+                                        return (
+                                          <button
+                                            key={dev.id}
+                                            type="button"
+                                            onMouseEnter={(e) => {
+                                              e.stopPropagation();
+                                              setHoverTip({
+                                                x: e.clientX,
+                                                y: e.clientY,
+                                                title: dev.name,
+                                                badge: dev.status.toUpperCase(),
+                                                badgeTone: dev.status === 'offline' ? 'rose' : dev.status === 'warning' ? 'amber' : 'emerald',
+                                                subtitle: `${rack.assetId} · U${dev.uStart}${rm ? ` · ${rm.code} ${rm.name}` : ''}`,
+                                                rows: [
+                                                  { label: 'Model', value: `${dev.vendor} ${dev.model}` },
+                                                  { label: 'IP / VLAN', value: `${dev.ipAddress} · ${dev.vlan}` },
+                                                  { label: 'Ports / Power', value: `${dUp}/${dev.ports.length} UP · ${dev.powerW}W` },
+                                                ],
+                                                hint: 'Click to inspect switch ports & telemetry',
+                                              });
+                                            }}
+                                            onMouseMove={(e) => {
+                                              e.stopPropagation();
+                                              setHoverTip((prev) => (prev ? { ...prev, x: e.clientX, y: e.clientY } : prev));
+                                            }}
+                                            onMouseLeave={() => setHoverTip(null)}
+                                            onClick={() => handleInspectAndReveal({ kind: 'device', rackId: rack.id, deviceId: dev.id })}
+                                            className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-xl border text-left text-[10.5px] cursor-pointer transition-colors ${
+                                              isDevSel
+                                                ? 'bg-cyan-500/15 border-amber-400 text-white'
+                                                : 'bg-[#181C2C] border-zinc-800 hover:border-teal-400 text-zinc-100'
+                                            }`}
+                                          >
+                                            <span className="truncate font-semibold">
+                                              {dev.name} <span className="font-mono text-zinc-400">({dev.model})</span>
+                                            </span>
+                                            <span className="flex items-center gap-1 shrink-0">
+                                              {dev.ports.slice(0, 5).map((p, idx) => (
+                                                <span
+                                                  key={p.id}
+                                                  className={`w-1.5 h-1.5 rounded-full ${getLedVisual(p.status, p.isUplink, blinkTick + idx)}`}
+                                                />
+                                              ))}
+                                            </span>
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+
+                                    {/* Connected User Nodes */}
+                                    {connectedNodes.length > 0 && (
+                                      <div className="flex flex-wrap gap-1.5 pt-1 border-t border-zinc-800/80">
+                                        {connectedNodes.map((n) => {
+                                          const isNodeSel = inspected?.kind === 'user-node' && inspected.nodeId === n.id;
+                                          const nRm = getRoomById(n.roomId);
+                                          const nFl = getFloorById(n.floorId);
+                                          return (
+                                            <button
+                                              key={n.id}
+                                              type="button"
+                                              onMouseEnter={(e) => {
+                                                e.stopPropagation();
+                                                setHoverTip({
+                                                  x: e.clientX,
+                                                  y: e.clientY,
+                                                  title: `${n.code} · ${n.name}`,
+                                                  badge: n.status.toUpperCase(),
+                                                  badgeTone: n.status === 'error' || n.status === 'offline' ? 'rose' : n.status === 'degraded' ? 'amber' : 'emerald',
+                                                  subtitle: `${nFl?.code ?? ''}${nRm ? ` · ${nRm.code} ${nRm.name}` : ''}`,
+                                                  rows: [
+                                                    { label: 'Room & Jack', value: `${nRm ? `${nRm.code} · ${nRm.name}` : 'Floor'} (${n.wallJackId})` },
+                                                    { label: 'IP / VLAN', value: `${n.ipAddress} · ${n.vlan}` },
+                                                    { label: 'Media / PoE', value: `${n.media}${n.poeWatts > 0 ? ` · ${n.poeWatts}W` : ''}` },
+                                                  ],
+                                                  hint: 'Click to inspect endpoint & trace path',
+                                                });
+                                              }}
+                                              onMouseMove={(e) => {
+                                                e.stopPropagation();
+                                                setHoverTip((prev) => (prev ? { ...prev, x: e.clientX, y: e.clientY } : prev));
+                                              }}
+                                              onMouseLeave={() => setHoverTip(null)}
+                                              onClick={() => handleInspectAndReveal({ kind: 'user-node', nodeId: n.id })}
+                                              className={`px-2 py-0.5 rounded-lg text-[10px] font-mono border cursor-pointer transition-colors ${
+                                                isNodeSel
+                                                  ? 'border-amber-400 bg-amber-500/20 text-white ring-1 ring-amber-400/50'
+                                                  : n.status === 'error'
+                                                    ? 'border-rose-500/70 bg-rose-950/50 text-rose-300'
+                                                    : 'border-teal-500/40 bg-teal-950/30 text-teal-200 hover:border-teal-400'
+                                              }`}
+                                            >
+                                              {n.code} · {nRm?.code ?? n.wallJackId}
+                                            </button>
+                                          );
+                                        })}
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </>
+                      );
+                    })()}
                   </div>
                 )}
               </div>
             )}
 
+            {/* ==================== TAB 4: QUICK IT ARCHITECTURE DESIGNER (FAST DATA ENTRY) ==================== */}
+            {activeTab === 'builder' && (
+              <ItArchitectureQuickBuilder
+                buildings={scene.buildings}
+                floors={scene.floors}
+                rooms={scene.rooms}
+                itAssets={itAssets}
+                userNodes={netArch.userNodes}
+                interRackLinks={netArch.interRackLinks}
+                isReadOnly={isReadOnly}
+                onAddRack={addDistributionRackToRoom}
+                onUpdateRackAsset={updateAsset}
+                onAddUserNode={addNetworkUserNode}
+                onAddInterRackLink={addInterRackLink}
+                onInspectTarget={(target) => handleInspectAndReveal(target)}
+                onOpenRackPorts={(rackId) => {
+                  setSelectedAssetId(rackId);
+                  setInspected({ kind: 'rack', rackId });
+                  setActiveTab('racks');
+                }}
+                onLocateIn3D={({ rackId, floorId }) =>
+                  handleLocateObjectIn3DTwin({ rackId, floorId })
+                }
+                showToast={showToast}
+              />
+            )}
+
             {/* ==================== TAB 4: MONITORING API CONNECTORS ==================== */}
             {activeTab === 'monitoring' && (
-              <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-zinc-50 dark:bg-[#0D0E14]">
+              <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-4 space-y-4 bg-zinc-50 dark:bg-[#0D0E14]">
                 <div className="flex items-start justify-between gap-3 flex-wrap">
                   <div>
                     <h3 className="text-sm font-bold text-zinc-900 dark:text-white flex items-center gap-2">
@@ -3128,7 +3729,7 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                       <div className="flex items-center justify-between">
                         <span className="font-bold text-zinc-900 dark:text-white flex items-center gap-1.5">
                           <Wifi className="w-3.5 h-3.5 text-teal-500" />
-                          User Node Wiring (2960-X Port Binding)
+                          Endpoint Wiring (Access Switch Port Binding)
                         </span>
                         {!isReadOnly && (
                           <button
@@ -3187,7 +3788,7 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                           </select>
                         </label>
                         <label className="space-y-0.5">
-                          <span className="text-[10px] text-zinc-500">Access Switch (e.g. 2960-X)</span>
+                          <span className="text-[10px] text-zinc-500">Access Switch</span>
                           <select
                             value={n.connectedDeviceId}
                             onChange={(e) => {
@@ -3503,9 +4104,9 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
                   onChange={(e) => setProvRole(e.target.value as any)}
                   className="w-full px-3 py-2 rounded-xl bg-zinc-50 dark:bg-[#0C0D14] border border-zinc-200 dark:border-zinc-700"
                 >
-                  <option value="distribution-idf">Floor Distribution Rack (IDF · C9300 + 2960-X)</option>
-                  <option value="access-closet">Room Access Closet (24U · Cisco 2960-X)</option>
-                  <option value="core-dc">Core Data Center Rack (MDF · Nexus 9336C)</option>
+                  <option value="distribution-idf">Floor Distribution Rack (IDF · Dist + Access SW)</option>
+                  <option value="access-closet">Room Access Closet (24U · Edge Access Switch)</option>
+                  <option value="core-dc">Core Data Center Rack (MDF · Core Fabric)</option>
                 </select>
               </label>
 
@@ -3567,11 +4168,80 @@ const NetworkRackDesignerView: React.FC<{ mode: 'modal' | 'page' }> = ({ mode })
         </div>
       )}
 
+      {/* Floating Room & Equipment Hover Tooltip (Endpoints & Drops + 3-Tier Architecture) */}
+      {hoverTip && (() => {
+        const vw = typeof window !== 'undefined' ? window.innerWidth : 1280;
+        const vh = typeof window !== 'undefined' ? window.innerHeight : 800;
+        const cardW = 280;
+        const cardH = 160;
+        const left = Math.min(Math.max(12, hoverTip.x + 14), Math.max(12, vw - cardW - 14));
+        const top = Math.min(Math.max(12, hoverTip.y + 14), Math.max(12, vh - cardH - 14));
+        const badgeClass =
+          hoverTip.badgeTone === 'cyan'
+            ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
+            : hoverTip.badgeTone === 'violet'
+              ? 'bg-violet-500/20 text-violet-300 border-violet-500/40'
+              : hoverTip.badgeTone === 'emerald'
+                ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                : hoverTip.badgeTone === 'amber'
+                  ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                  : hoverTip.badgeTone === 'rose'
+                    ? 'bg-rose-500/20 text-rose-300 border-rose-500/40'
+                    : 'bg-blue-500/20 text-blue-300 border-blue-500/40';
+        return (
+          <div
+            className="fixed z-[95] pointer-events-none w-[276px] rounded-xl bg-[#0D101B]/95 border border-zinc-700/90 shadow-2xl p-2.5 text-[11px] text-zinc-100"
+            style={{ left, top }}
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div className="font-bold text-white leading-tight truncate">{hoverTip.title}</div>
+              <span className={`px-1.5 py-0.5 rounded border font-mono text-[9px] font-bold uppercase shrink-0 ${badgeClass}`}>
+                {hoverTip.badge}
+              </span>
+            </div>
+            {hoverTip.subtitle && (
+              <div className="text-[10px] font-mono text-zinc-400 truncate mt-0.5">
+                {hoverTip.subtitle}
+              </div>
+            )}
+            <div className="mt-2 pt-1.5 border-t border-zinc-800 space-y-1">
+              {hoverTip.rows.map((r) => (
+                <div key={r.label} className="flex items-center justify-between gap-2 text-[10px]">
+                  <span className="text-zinc-400 shrink-0">{r.label}</span>
+                  <span className="font-mono text-zinc-200 truncate text-right">{r.value}</span>
+                </div>
+              ))}
+            </div>
+            {hoverTip.hint && (
+              <div className="mt-1.5 pt-1 border-t border-zinc-800/80 text-[9.5px] text-cyan-300/90">
+                {hoverTip.hint}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {/* Printable Industrial IT Identification Label Modal */}
       <ItLabelPrintModal
         label={labelToPrint}
         onClose={() => setLabelToPrint(null)}
         onOpenLabelStudio={(assetId) => openQrLabelModal('designer', [`asset:${assetId}`])}
+      />
+
+      {/* Detailed IT 3D Equipment & Room Modal (3D preview, live telemetry, history & Go to 3D Model) */}
+      <It3DDetailDialog
+        target={detail3DTarget}
+        onClose={() => setDetail3DTarget(null)}
+        onChangeTarget={setDetail3DTarget}
+        onOpenInRackTab={(rackId, deviceId) => {
+          setSelectedAssetId(rackId);
+          setActiveTab('racks');
+          if (deviceId) {
+            setInspected({ kind: 'device', rackId, deviceId });
+          } else {
+            setInspected({ kind: 'rack', rackId });
+          }
+        }}
       />
     </div>
   );
