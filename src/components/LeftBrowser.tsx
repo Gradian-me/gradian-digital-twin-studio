@@ -37,6 +37,8 @@ import { useTelemetryStore } from '../store/useTelemetryStore';
 import { SPACE_CATEGORIES, SPACE_TYPE_LIBRARY } from '../data/spaceTypes';
 import { SMART_ROOM_TEMPLATES } from '../data/smartRoomTemplates';
 import { EQUIPMENT_CATEGORIES, OBJECT_LIBRARY } from '../data/objectLibrary';
+import { OPENING_PRESETS } from '../data/materialsLibrary';
+import { OPENING_DND_MIME, setActiveDraggedOpeningSubtype } from '../utils/openingPlacement';
 import { formatArea, formatLength } from '../utils/spatial';
 import type { EquipmentCategory, SpaceCategory } from '../types/twin';
 import { VirtualList } from './VirtualList';
@@ -86,6 +88,7 @@ export const LeftBrowser: React.FC = () => {
   const setViewMode = useTwinStore((s) => s.setViewMode);
   const setSelectedSpaceTypeId = useTwinStore((s) => s.setSelectedSpaceTypeId);
   const setSelectedObjectTemplateId = useTwinStore((s) => s.setSelectedObjectTemplateId);
+  const setSelectedOpeningSubtype = useTwinStore((s) => s.setSelectedOpeningSubtype);
   const focusEntity = useTwinStore((s) => s.focusEntity);
   const addFloor = useTwinStore((s) => s.addFloor);
   const addBuilding = useTwinStore((s) => s.addBuilding);
@@ -1662,6 +1665,47 @@ export const LeftBrowser: React.FC = () => {
                 </button>
                 <div className="text-[11px] text-zinc-500 dark:text-zinc-400">
                   Drag any item onto the 2D or 3D canvas, or inspect in 3D Gallery.
+                </div>
+
+                {/* Draggable Doors & Windows Quick Wall Palette */}
+                <div className="pt-1.5 border-t border-slate-200/80 dark:border-zinc-800/80 space-y-1.5">
+                  <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+                    <span className="flex items-center gap-1">
+                      <DoorOpen className="w-3 h-3 text-emerald-500" /> Doors &amp; Windows
+                    </span>
+                    <span className="text-[9.5px] normal-case font-normal text-zinc-400">Drag onto wall</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-1">
+                    {OPENING_PRESETS.slice(0, 6).map((preset) => (
+                      <button
+                        key={preset.subtype}
+                        type="button"
+                        draggable
+                        onDragStart={(e) => {
+                          e.dataTransfer.setData(OPENING_DND_MIME, preset.subtype);
+                          e.dataTransfer.effectAllowed = 'copy';
+                          setActiveDraggedOpeningSubtype(preset.subtype);
+                          setSelectedOpeningSubtype(preset.subtype);
+                        }}
+                        onDragEnd={() => setActiveDraggedOpeningSubtype(null)}
+                        onClick={() => {
+                          setSelectedOpeningSubtype(preset.subtype);
+                          setActiveTool(preset.kind === 'window' ? 'place-window' : 'place-door');
+                        }}
+                        title={`${preset.name} (${preset.width}×${preset.height}m) — Drag onto any 2D wall or click to place`}
+                        className="px-2 py-1 rounded-lg border border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-[#171720] hover:border-emerald-500/70 hover:bg-emerald-500/8 text-left flex items-center gap-1.5 cursor-grab active:cursor-grabbing transition-colors"
+                      >
+                        <span
+                          className={`w-2 h-2 rounded-xs shrink-0 ${
+                            preset.kind === 'window' ? 'bg-sky-400' : 'bg-amber-400'
+                          }`}
+                        />
+                        <span className="text-[10.5px] font-medium text-slate-800 dark:text-zinc-200 truncate">
+                          {preset.name.replace('Door', '').replace('Window', '').trim() || preset.name}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
 

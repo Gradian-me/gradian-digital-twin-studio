@@ -9,6 +9,8 @@ import { AuthProvider } from './context/AuthContext';
 import { useTwinStore } from './store/useTwinStore';
 import { ProjectHub } from './components/ProjectHub';
 import { TopToolbar } from './components/TopToolbar';
+import { DesignStudioBar } from './components/DesignStudioBar';
+import { PolygonSpaceNameModal } from './components/PolygonSpaceNameModal';
 import { LeftBrowser } from './components/LeftBrowser';
 import { RightInspector } from './components/RightInspector';
 import { Viewport3D } from './components/Viewport3D';
@@ -283,6 +285,15 @@ const WorkspaceShell: React.FC = () => {
       }
 
       if (e.key === 'Escape') {
+        if (state.pendingPolygonSpace) {
+          state.setPendingPolygonSpace(null);
+          return;
+        }
+        // First Escape stops the active continuous wall chain while keeping Wall tool ready
+        if (state.activeTool === 'draw-wall' && state.wallChainAnchor) {
+          state.setWallChainAnchor(null);
+          return;
+        }
         state.setActiveTool('select');
         state.clearSelection();
         state.clearMeasure();
@@ -358,6 +369,8 @@ const WorkspaceShell: React.FC = () => {
           {/* Desktop & Tablet Professional CAD Workspace (>= md) */}
           <div className="hidden md:flex flex-col h-screen w-screen overflow-hidden bg-zinc-100 dark:bg-[#09090B] text-zinc-900 dark:text-zinc-100 select-none">
             <TopToolbar />
+            <DesignStudioBar />
+            <PolygonSpaceNameModal />
 
             <div className="flex-1 flex min-h-0 overflow-hidden">
               {leftPanelOpen && <LeftBrowser />}

@@ -33,6 +33,7 @@ import {
 } from '../engine/spatialAudio';
 import type { NoGoZone, PathRoutingAlgorithm } from '../engine/navMesh';
 import type { Room, SpatialAsset } from '../types/twin';
+import { SelectedBadgesBar } from './SelectedBadgesBar';
 
 const DISTANCE_MODELS: Array<{ id: SpatialDistanceModel; label: string; hint: string }> = [
   { id: 'linear', label: 'Linear', hint: 'Constant drop-off to max distance' },
@@ -713,6 +714,22 @@ export const PathFinderConfigPopover: React.FC<PathFinderConfigPopoverProps> = (
               <div className="text-[10.5px] font-semibold text-zinc-300">
                 Block Entire Rooms (No-Go)
               </div>
+              <SelectedBadgesBar
+                items={floorRooms
+                  .filter((rm) => restrictedRoomIds.has(rm.id))
+                  .map((rm) => ({
+                    id: rm.id,
+                    code: rm.code,
+                    label: rm.name,
+                  }))}
+                onRemove={(roomId) => {
+                  const rm = floorRooms.find((r) => r.id === roomId);
+                  if (rm) onToggleRoomNoGo(rm);
+                }}
+                onClearAll={onClearNoGoZones}
+                title="Blocked Rooms"
+                isDark
+              />
               <div className="flex flex-wrap gap-1 max-h-24 overflow-y-auto">
                 {floorRooms.map((rm) => {
                   const blocked = restrictedRoomIds.has(rm.id);

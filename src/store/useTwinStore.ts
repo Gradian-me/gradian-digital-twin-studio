@@ -42,6 +42,7 @@ import type {
 } from '../types/twin';
 import { getEffectiveRoomHvac } from '../utils/hvac';
 import { SMART_ROOM_TEMPLATES } from '../data/smartRoomTemplates';
+import { clampOpeningToWall } from '../utils/openingPlacement';
 import {
   createCinnaGenCampusScene,
   createTemplateScene,
@@ -55,6 +56,13 @@ import { DEFAULT_MATERIALS, OPENING_PRESETS, WALL_PRESETS } from '../data/materi
 import { OBJECT_LIBRARY } from '../data/objectLibrary';
 import { SPACE_TYPE_LIBRARY } from '../data/spaceTypes';
 import { runSpatialValidation, snapValue } from '../utils/spatial';
+import {
+  computePolygonArea,
+  computePolygonBounds,
+  detectEnclosedWallPolygons,
+  type DetectedPolygonSpace,
+  type PolygonPoint,
+} from '../utils/polygonSpaces';
 
 export type SelectedEntity =
   | { type: 'room'; id: string }
@@ -469,6 +477,8 @@ interface TwinState {
   activeLayerFocusId: string | null;
   cursorCoords: { x: number; y: number; z: number };
   measurePoints: { x: number; z: number }[];
+  wallChainAnchor: { x: number; z: number } | null;
+  pendingPolygonSpace: DetectedPolygonSpace | null;
 
   // Calibration state for Reference Images
   calibratingRefId: string | null;
@@ -659,16 +669,23 @@ interface TwinState {
 
   // Spatial CRUD
   addFloor: (input: { buildingId: string; name: string; height: number; width: number; depth: number; duplicateFromFloorId?: string }) => void;
+  updateFloor: (id: string, patch: Partial<Floor>) => void;
+  deleteFloor: (id: string) => void;
   addBuilding: (name: string) => void;
   renameHierarchyEntity: (type: SelectedEntity['type'], id: string, name: string) => void;
   deleteSelected: () => void;
   duplicateSelected: () => void;
 
   addRoom: (x: number, z: number, width: number, depth: number, spaceTypeId?: string, customName?: string) => Room;
+  addPolygonRoom: (polygon: PolygonPoint[], customName: string, spaceTypeId?: string) => Room;
   addSmartRoomFromTemplate: (templateId: string, dropX?: number, dropZ?: number) => Room | null;
   updateRoom: (id: string, patch: Partial<Room>) => void;
   updateRoomHvac: (roomId: string, patch: Partial<RoomHvacConfig>) => void;
   updateRoomLighting: (roomId: string, lighting: RoomLightingConfig) => void;
+
+  setWallChainAnchor: (pt: { x: number; z: number } | null) => void;
+  setPendingPolygonSpace: (sp: DetectedPolygonSpace | null) => void;
+  scanFloorPolygonSpaces: () => DetectedPolygonSpace[];
 
   addWall: (x1: number, z1: number, x2: number, z2: number, presetId?: WallPresetId) => Wall;
   updateWall: (id: string, patch: Partial<Wall>) => void;
@@ -679,9 +696,11 @@ interface TwinState {
 
   addAsset: (templateId: string, x: number, z: number, opts?: Partial<SpatialAsset>) => SpatialAsset;
   updateAsset: (id: string, patch: Partial<SpatialAsset>, recordHistory?: boolean) => void;
+  swapAssetTemplate: (assetId: string, newTemplateId: string) => void;
   alignSelectedAssets: (mode: 'left' | 'right' | 'top' | 'bottom' | 'center-x' | 'center-z' | 'distribute-x' | 'distribute-z') => void;
 
-  paintSurfaceWithMaterial: (targetType: 'room' | 'wall' | 'asset', id: string, materialId: string) => void;
+  paintSurfaceWithMaterial: (targetType: 'room' | 'room-walls' | 'room-ceiling' | 'wall' | 'asset' | 'floor', id: string, materialId: string) => void;
+  updateMaterial: (materialId: string, patch: Partial<MaterialDef>) => void;
   addCustomMaterial: (mat: MaterialDef) => void;
   addCustomSpaceType: (tpl: SpaceTypeTemplate) => void;
   addCustomObjectTemplate: (obj: ObjectLibraryItem) => void;
@@ -956,6 +975,8 @@ export const useTwinStore = create<TwinState>((set, get) => {
     activeLayerFocusId: null,
     cursorCoords: { x: 0, y: 0, z: 0 },
     measurePoints: [],
+    wallChainAnchor: null,
+    pendingPolygonSpace: null,
 
     calibratingRefId: null,
     calibrationPoints: [],
@@ -1096,6 +1117,8 @@ export const useTwinStore = create<TwinState>((set, get) => {
         activeFloorId: floorId,
         activeBuildingId: floor.buildingId,
         selected: [],
+        wallChainAnchor: null,
+        pendingPolygonSpace: null,
       });
     },
 
@@ -1310,9 +1333,20 @@ export const useTwinStore = create<TwinState>((set, get) => {
     setActiveTool: (activeTool) => {
       const isReadOnlyTool = activeTool === 'select' || activeTool === 'measure';
       if (!isReadOnlyTool && !guardEditable()) return;
+      const curSubtype = get().selectedOpeningSubtype;
+      const curPreset = OPENING_PRESETS.find((p) => p.subtype === curSubtype);
+      let nextOpeningSubtype = curSubtype;
+      if (activeTool === 'place-door' && curPreset?.kind !== 'door') {
+        nextOpeningSubtype = 'cleanroom-door';
+      } else if (activeTool === 'place-window' && curPreset?.kind !== 'window') {
+        nextOpeningSubtype = 'cleanroom-window';
+      }
       set({
         activeTool,
+        selectedOpeningSubtype: nextOpeningSubtype,
+        firstPersonMode: activeTool !== 'select' ? false : get().firstPersonMode,
         measurePoints: activeTool === 'measure' ? [] : get().measurePoints,
+        wallChainAnchor: null,
       });
     },
     setTransformMode: (transformMode) => set({ transformMode }),
@@ -2408,7 +2442,7 @@ export const useTwinStore = create<TwinState>((set, get) => {
     setCursorCoords: (cursorCoords) => set({ cursorCoords }),
     addMeasurePoint: (pt) =>
       set((s) => ({
-        measurePoints: s.measurePoints.length >= 2 ? [pt] : [...s.measurePoints, pt],
+        measurePoints: s.measurePoints.length >= 16 ? [pt] : [...s.measurePoints, pt],
       })),
     clearMeasure: () => set({ measurePoints: [] }),
 
@@ -2477,6 +2511,52 @@ export const useTwinStore = create<TwinState>((set, get) => {
         return draft;
       }, `Created floor "${name}"`);
       set({ activeFloorId: newId, activeBuildingId: buildingId });
+    },
+
+    updateFloor: (id, patch) => {
+      const prevFloor = get().scene.floors.find((f) => f.id === id);
+      commit(
+        (draft) => {
+          const fl = draft.floors.find((f) => f.id === id);
+          if (fl) Object.assign(fl, patch);
+          return draft;
+        },
+        undefined,
+        {
+          category: 'floor-building',
+          action: 'Updated Floor Properties',
+          entityType: 'floor',
+          entityId: id,
+          entityName: prevFloor?.name ?? id,
+          summary: `Modified floor "${prevFloor?.name ?? id}": ${Object.keys(patch).join(', ')}`,
+          before: prevFloor
+            ? { width: prevFloor.width, depth: prevFloor.depth, height: prevFloor.height, elevation: prevFloor.elevation }
+            : null,
+          after: patch as Record<string, unknown>,
+        }
+      );
+    },
+
+    deleteFloor: (id) => {
+      const curFloors = get().scene.floors;
+      if (curFloors.length <= 1) {
+        get().showToast('Cannot delete the only remaining floor in the project.', 'warning');
+        return;
+      }
+      const target = curFloors.find((f) => f.id === id);
+      if (!target) return;
+      const fallback = curFloors.find((f) => f.id !== id)!;
+      commit((draft) => {
+        draft.floors = draft.floors.filter((f) => f.id !== id);
+        draft.rooms = draft.rooms.filter((r) => r.floorId !== id);
+        draft.walls = draft.walls.filter((w) => w.floorId !== id);
+        draft.openings = draft.openings.filter((o) => o.floorId !== id);
+        draft.assets = draft.assets.filter((a) => a.floorId !== id);
+        draft.cameras = draft.cameras.filter((c) => c.floorId !== id);
+        draft.flows = draft.flows.filter((fl) => fl.floorId !== id);
+        return draft;
+      }, `Deleted floor "${target.name}"`);
+      set({ activeFloorId: fallback.id, activeBuildingId: fallback.buildingId, selected: [] });
     },
 
     addBuilding: (name) => {
@@ -2701,6 +2781,116 @@ export const useTwinStore = create<TwinState>((set, get) => {
       return newRoom;
     },
 
+    addPolygonRoom: (polygon, customName, spaceTypeId) => {
+      const { activeFloorId, selectedSpaceTypeId, scene } = get();
+      const allSpaceTypes = [...SPACE_TYPE_LIBRARY, ...scene.customSpaceTypes];
+      const tpl =
+        allSpaceTypes.find((s) => s.id === (spaceTypeId ?? selectedSpaceTypeId)) ??
+        allSpaceTypes[0];
+      const id = `rm-poly-${Date.now()}`;
+      const fl = scene.floors.find((f) => f.id === activeFloorId);
+      const flPrefix = (fl?.code || 'RM').replace(/[^A-Z0-9]/gi, '').toUpperCase() || 'RM';
+      const baseNum = (fl?.levelIndex ?? 0) === 0 ? 101 : 201 + ((fl?.levelIndex ?? 1) - 1) * 100;
+      const roomCount = scene.rooms.filter((r) => r.floorId === activeFloorId).length;
+      const usedCodes = new Set(scene.rooms.map((r) => r.code));
+      let seq = baseNum + roomCount;
+      let code = `${flPrefix}-${seq}`;
+      while (usedCodes.has(code)) {
+        seq += 1;
+        code = `${flPrefix}-${seq}`;
+      }
+
+      const bounds = computePolygonBounds(polygon);
+      const areaSqm = Math.max(1, computePolygonArea(polygon));
+      const cleanName = customName.trim() || `${tpl.name} ${roomCount + 1}`;
+
+      const newRoom: Room = {
+        id,
+        floorId: activeFloorId,
+        departmentId: scene.hierarchy.find((h) => h.level === 'department')?.id ?? 'dept-1',
+        name: cleanName,
+        code,
+        spaceTypeId: tpl.id,
+        category: tpl.category,
+        x: bounds.x,
+        z: bounds.z,
+        width: Math.max(0.5, bounds.width),
+        depth: Math.max(0.5, bounds.depth),
+        height: fl?.height ?? tpl.defaultHeight,
+        polygon: polygon.map((p) => ({ x: Number(p.x.toFixed(3)), z: Number(p.z.toFixed(3)) })),
+        color: tpl.color,
+        floorMaterialId: tpl.defaultFloorMaterialId,
+        wallMaterialId: tpl.defaultWallMaterialId,
+        ceilingMaterialId: tpl.defaultCeilingMaterialId,
+        layerId: 'layer-architecture',
+        environmental: { ...tpl.environmental },
+        occupancyMax: Math.max(2, Math.round(areaSqm / 14)),
+        currentOccupancy: 1,
+        utilizationPct: 50,
+        riskLevel: tpl.environmental.cleanroomGrade.includes('Grade A') ? 'critical' : 'medium',
+        complianceStatus: 'compliant',
+        energyKw: Number((areaSqm * 0.25).toFixed(1)),
+        costPerSqm: tpl.costPerSqm,
+        activeFromDate: get().timelineDate,
+        metadata: {
+          code,
+          description: `Polygon space (${polygon.length} vertices, ${areaSqm.toFixed(1)} m²) — ${tpl.name}`,
+          status: 'operational',
+          tags: [tpl.category, 'Polygon Space', tpl.environmental.cleanroomGrade],
+          owner: 'Facility Architect',
+          department: 'Production',
+          accessPermission: 'gmp-authorized',
+          createdAt: new Date().toISOString().slice(0, 10),
+          updatedAt: new Date().toISOString().slice(0, 10),
+          revision: 1,
+          customProperties: { Standard: tpl.complianceStandard, Vertices: String(polygon.length) },
+          linkedDocuments: [],
+          relatedSystems: ['HVAC'],
+          relatedProcesses: [],
+        },
+      };
+
+      commit(
+        (draft) => {
+          draft.rooms.push(newRoom);
+          return draft;
+        },
+        `Named polygon space "${cleanName}" (${areaSqm.toFixed(1)} m²)`,
+        {
+          category: 'spatial',
+          action: 'Created Polygon Space',
+          entityType: 'room',
+          entityId: id,
+          entityName: cleanName,
+          summary: `Detected & named ${polygon.length}-point polygon space "${cleanName}" (${areaSqm.toFixed(1)} m²)`,
+        }
+      );
+      set({
+        selected: [{ type: 'room', id }],
+        pendingPolygonSpace: null,
+      });
+      get().completeOnboardingStep(4);
+      return newRoom;
+    },
+
+    setWallChainAnchor: (wallChainAnchor) => set({ wallChainAnchor }),
+    setPendingPolygonSpace: (pendingPolygonSpace) => set({ pendingPolygonSpace }),
+
+    scanFloorPolygonSpaces: () => {
+      const { scene, activeFloorId, showToast } = get();
+      const detected = detectEnclosedWallPolygons(scene.walls, scene.rooms, activeFloorId);
+      if (detected.length > 0) {
+        set({ pendingPolygonSpace: detected[0] });
+        showToast(
+          `Detected ${detected.length} enclosed wall ${detected.length === 1 ? 'space' : 'spaces'} — name to save as room`,
+          'success'
+        );
+      } else {
+        showToast('No unnamed enclosed wall polygons found on this floor. Close a wall loop to detect a space.', 'info');
+      }
+      return detected;
+    },
+
     addSmartRoomFromTemplate: (templateId, dropX, dropZ) => {
       const tpl = SMART_ROOM_TEMPLATES.find((t) => t.id === templateId);
       if (!tpl) return null;
@@ -2885,7 +3075,7 @@ export const useTwinStore = create<TwinState>((set, get) => {
           serialNumber: `SN-${code}-${1000 + idx}`,
           description: lib.description,
           tags: ['Smart Template', tpl.codePrefix, lib.category],
-          criticality: tpl.riskLevel === 'critical' ? 'critical' : 'high',
+          criticality: tpl.riskLevel === 'critical' ? 'gmp-critical' : 'high',
           owner: 'Process Engineering',
           department: tpl.category,
           responsiblePerson: 'Suite Lead',
@@ -3089,11 +3279,14 @@ export const useTwinStore = create<TwinState>((set, get) => {
     },
 
     addWall: (x1, z1, x2, z2, presetId) => {
-      const { activeFloorId, selectedWallPresetId } = get();
+      const { activeFloorId, selectedWallPresetId, scene: prevScene } = get();
+      const prevDetectedIds = new Set(
+        detectEnclosedWallPolygons(prevScene.walls, prevScene.rooms, activeFloorId).map((p) => p.id)
+      );
       const preset =
         WALL_PRESETS.find((p) => p.id === (presetId ?? selectedWallPresetId)) ?? WALL_PRESETS[0];
       const wall: Wall = {
-        id: `w-${Date.now()}`,
+        id: `w-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
         floorId: activeFloorId,
         name: `${preset.name}`,
         x1: Number(x1.toFixed(2)),
@@ -3118,7 +3311,22 @@ export const useTwinStore = create<TwinState>((set, get) => {
         draft.walls.push(wall);
         return draft;
       }, `Added ${preset.name}`);
-      set({ selected: [{ type: 'wall', id: wall.id }] });
+
+      // Automatically detect if this wall just enclosed a new polygonal space!
+      const nextScene = get().scene;
+      const nextDetected = detectEnclosedWallPolygons(nextScene.walls, nextScene.rooms, activeFloorId);
+      const newlyEnclosed = nextDetected.find((sp) => !prevDetectedIds.has(sp.id));
+
+      set({
+        selected: [{ type: 'wall', id: wall.id }],
+        ...(newlyEnclosed ? { pendingPolygonSpace: newlyEnclosed } : {}),
+      });
+      if (newlyEnclosed) {
+        get().showToast(
+          `Enclosed ${newlyEnclosed.polygon.length}-sided space detected (${newlyEnclosed.areaSqm.toFixed(1)} m²) — name it to save`,
+          'success'
+        );
+      }
       get().completeOnboardingStep(5);
       return wall;
     },
@@ -3169,10 +3377,21 @@ export const useTwinStore = create<TwinState>((set, get) => {
       const { scene, selectedOpeningSubtype } = get();
       const wall = scene.walls.find((w) => w.id === wallId);
       if (!wall) return null;
+      const wallLen = Math.hypot(wall.x2 - wall.x1, wall.z2 - wall.z1);
+      if (wallLen < 0.7) {
+        get().showToast('Wall is too short to host a door or window (min 0.7 m).', 'warning');
+        return null;
+      }
       const preset =
         OPENING_PRESETS.find((p) => p.subtype === (subtype ?? selectedOpeningSubtype)) ??
         OPENING_PRESETS[0];
-      const clampedOffset = Math.max(0.15, Math.min(0.85, offsetRatio));
+      const clamped = clampOpeningToWall(
+        wall,
+        preset.width,
+        preset.height,
+        preset.sillHeight,
+        offsetRatio
+      );
       const opening: Opening = {
         id: `op-${Date.now()}`,
         floorId: wall.floorId,
@@ -3180,10 +3399,10 @@ export const useTwinStore = create<TwinState>((set, get) => {
         kind: preset.kind,
         subtype: preset.subtype,
         name: preset.name,
-        offsetRatio: Number(clampedOffset.toFixed(3)),
-        width: preset.width,
-        height: Math.min(preset.height, wall.height - 0.15),
-        sillHeight: preset.sillHeight,
+        offsetRatio: clamped.offsetRatio,
+        width: clamped.width,
+        height: clamped.height,
+        sillHeight: clamped.sillHeight,
         thickness: wall.thickness + 0.04,
         swingDirection: preset.swingDirection,
         swingAngle: preset.kind === 'door' ? 90 : 0,
@@ -3199,7 +3418,11 @@ export const useTwinStore = create<TwinState>((set, get) => {
         draft.openings.push(opening);
         return draft;
       }, `Placed ${preset.name}`);
-      set({ selected: [{ type: 'opening', id: opening.id }] });
+      set({
+        selected: [{ type: 'opening', id: opening.id }],
+        rightTab: 'properties',
+        rightPanelOpen: true,
+      });
       return opening;
     },
 
@@ -3208,7 +3431,23 @@ export const useTwinStore = create<TwinState>((set, get) => {
       commit(
         (draft) => {
           const op = draft.openings.find((x) => x.id === id);
-          if (op) Object.assign(op, patch);
+          if (op) {
+            Object.assign(op, patch);
+            const hostWall = draft.walls.find((w) => w.id === op.wallId);
+            if (hostWall) {
+              const clamped = clampOpeningToWall(
+                hostWall,
+                op.width,
+                op.height,
+                op.sillHeight,
+                op.offsetRatio
+              );
+              op.width = clamped.width;
+              op.height = clamped.height;
+              op.sillHeight = clamped.sillHeight;
+              op.offsetRatio = clamped.offsetRatio;
+            }
+          }
           return draft;
         },
         undefined,
@@ -3384,6 +3623,30 @@ export const useTwinStore = create<TwinState>((set, get) => {
       );
     },
 
+    swapAssetTemplate: (assetId, newTemplateId) => {
+      const allObjs = [...OBJECT_LIBRARY, ...get().scene.customObjects];
+      const tpl = allObjs.find((o) => o.id === newTemplateId);
+      if (!tpl) return;
+      commit((draft) => {
+        const a = draft.assets.find((x) => x.id === assetId);
+        if (!a) return draft;
+        a.templateId = tpl.id;
+        a.archetype = tpl.archetype;
+        a.category = tpl.category;
+        a.manufacturer = tpl.manufacturer;
+        a.model = tpl.model;
+        a.width = tpl.width;
+        a.depth = tpl.depth;
+        a.height = tpl.height;
+        a.weightKg = tpl.weightKg;
+        a.clearanceM = tpl.clearanceM;
+        a.materialId = tpl.defaultMaterialId;
+        a.color = tpl.defaultColor;
+        a.energyKw = tpl.energyKw;
+        return draft;
+      }, `Swapped equipment model to ${tpl.name}`);
+    },
+
     alignSelectedAssets: (mode) => {
       const assetIds = get()
         .selected.filter((s) => s.type === 'asset')
@@ -3428,13 +3691,31 @@ export const useTwinStore = create<TwinState>((set, get) => {
     },
 
     paintSurfaceWithMaterial: (targetType, id, materialId) => {
-      const allMats = [...DEFAULT_MATERIALS, ...get().scene.customMaterials];
+      const allMats = [...get().scene.customMaterials, ...DEFAULT_MATERIALS];
       const mat = allMats.find((m) => m.id === materialId);
       if (!mat) return;
       commit((draft) => {
         if (targetType === 'room') {
           const rm = draft.rooms.find((r) => r.id === id);
           if (rm) rm.floorMaterialId = materialId;
+        } else if (targetType === 'room-walls') {
+          const rm = draft.rooms.find((r) => r.id === id);
+          if (rm) {
+            rm.wallMaterialId = materialId;
+            draft.walls
+              .filter((w) => w.roomId === id)
+              .forEach((w) => {
+                w.materialId = materialId;
+                w.color = mat.baseColor;
+                w.opacity = mat.opacity;
+              });
+          }
+        } else if (targetType === 'room-ceiling') {
+          const rm = draft.rooms.find((r) => r.id === id);
+          if (rm) rm.ceilingMaterialId = materialId;
+        } else if (targetType === 'floor') {
+          const fl = draft.floors.find((f) => f.id === id);
+          if (fl) fl.slabMaterialId = materialId;
         } else if (targetType === 'wall') {
           const w = draft.walls.find((x) => x.id === id);
           if (w) {
@@ -3452,6 +3733,29 @@ export const useTwinStore = create<TwinState>((set, get) => {
         return draft;
       }, `Applied ${mat.name}`);
       get().completeOnboardingStep(7);
+    },
+
+    updateMaterial: (materialId, patch) => {
+      const allMats = [...get().scene.customMaterials, ...DEFAULT_MATERIALS];
+      const existing = allMats.find((m) => m.id === materialId);
+      if (!existing) return;
+      const updated: MaterialDef = { ...existing, ...patch };
+      commit((draft) => {
+        draft.customMaterials = [
+          updated,
+          ...draft.customMaterials.filter((m) => m.id !== materialId),
+        ];
+        // Also propagate baseColor/opacity to walls using this material so 2D/3D stay synced
+        if (patch.baseColor !== undefined || patch.opacity !== undefined) {
+          draft.walls
+            .filter((w) => w.materialId === materialId)
+            .forEach((w) => {
+              if (patch.baseColor !== undefined) w.color = patch.baseColor;
+              if (patch.opacity !== undefined) w.opacity = patch.opacity;
+            });
+        }
+        return draft;
+      }, `Updated texture "${updated.name}"`);
     },
 
     addCustomMaterial: (mat) =>

@@ -173,8 +173,14 @@ export const BottomTimelineBar: React.FC = () => {
 
   const measureDistance = useMemo(() => {
     if (measurePoints.length < 2) return null;
-    const [a, b] = measurePoints;
-    return Math.hypot(b.x - a.x, b.z - a.z);
+    let total = 0;
+    for (let i = 1; i < measurePoints.length; i++) {
+      total += Math.hypot(
+        measurePoints[i].x - measurePoints[i - 1].x,
+        measurePoints[i].z - measurePoints[i - 1].z
+      );
+    }
+    return total;
   }, [measurePoints]);
 
   const statsAtDate = (dateStr: string) => {

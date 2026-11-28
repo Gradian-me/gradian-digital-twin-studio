@@ -13,6 +13,7 @@ import type {
   SpatialAsset,
   Wall,
 } from '../types/twin';
+import { attachCanvasPinchGuard } from '../utils/preventPinchZoom';
 
 export interface DataCenter3DViewerProps {
   mode: 'single-rack' | 'campus-topology';
@@ -233,6 +234,19 @@ export const DataCenter3DViewer: React.FC<DataCenter3DViewerProps> = ({
     controls.minDistance = mode === 'single-rack' ? 0.9 : 4;
     controls.maxDistance = mode === 'single-rack' ? 7 : 55;
     controlsRef.current = controls;
+
+    // Guard trackpad two-finger pinch-zoom so it zooms only the 3D canvas, never the whole browser page
+    const detachPinch = attachCanvasPinchGuard(container, (zoomFactor) => {
+      const offset = camera.position.clone().sub(controls.target);
+      const nextLen = THREE.MathUtils.clamp(
+        offset.length() * zoomFactor,
+        controls.minDistance,
+        controls.maxDistance
+      );
+      offset.setLength(nextLen);
+      camera.position.copy(controls.target).add(offset);
+      controls.update();
+    });
 
     // Studio Lighting
     const hemi = new THREE.HemisphereLight(0xdbeafe, 0x0f172a, 0.7);
@@ -1281,6 +1295,7 @@ export const DataCenter3DViewer: React.FC<DataCenter3DViewerProps> = ({
       cancelAnimationFrame(rafId);
       if (timerId !== null) window.clearTimeout(timerId);
       ro.disconnect();
+      detachPinch();
       controls.removeEventListener('change', persistCamera);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       renderer.domElement.removeEventListener('pointermove', onPointerMove);

@@ -267,7 +267,7 @@ export const GlobalVoiceCommandListener: React.FC = () => {
 
     if (cmd.action === 'open_screen' && cmd.screen) {
       if (cmd.screen === 'telemetry') {
-        useTelemetryStore.getState().openDashboard({ tab: 'overview' });
+        useTelemetryStore.getState().openDashboard({ tab: 'trends' });
       } else if (['workspace', 'maya-life', 'data-center', 'projects'].includes(cmd.screen)) {
         twin.setScreen(cmd.screen as any);
       }

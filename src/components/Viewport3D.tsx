@@ -81,8 +81,10 @@ import { HEATMAP_SCALES, renderFloorHeatmapCanvas } from '../engine/heatmapGener
 import { METRIC_PRESETS, type HeatmapMetric, type SensorDefinition } from '../types/telemetry';
 import { MiniSparkline } from './TelemetryDashboard';
 import { AssetMini3DViewer } from './AssetMini3DViewer';
-import { DEFAULT_MATERIALS } from '../data/materialsLibrary';
+import { DEFAULT_MATERIALS, OPENING_PRESETS } from '../data/materialsLibrary';
 import { OBJECT_LIBRARY } from '../data/objectLibrary';
+import { findOpeningDropZone } from '../utils/openingPlacement';
+import { OpeningQuickBar } from './OpeningQuickBar';
 import { getProceduralMaterial } from '../engine/proceduralTextures';
 import { buildProceduralEquipmentGroup } from '../engine/equipmentBuilder';
 import {
@@ -112,6 +114,7 @@ import {
 import { getRoomColorForAnalytics, snapValue } from '../utils/spatial';
 import { computeFlowRoomSequence } from '../utils/flowAnalytics';
 import { computeSnappedPlacement } from '../utils/placementSnap';
+import { detectEnclosedWallPolygons } from '../utils/polygonSpaces';
 import {
   computeSwitchLocalTransform,
   getEffectiveRoomLighting,
@@ -924,6 +927,7 @@ export const Viewport3D: React.FC = () => {
   const clearVoiceHighlight = useTwinStore((s) => s.clearVoiceHighlight);
   const focusEntity = useTwinStore((s) => s.focusEntity);
   const setViewMode = useTwinStore((s) => s.setViewMode);
+  const wallChainAnchor = useTwinStore((s) => s.wallChainAnchor);
 
   const aclUsers = useAclStore((s) => s.users);
   const aclRoles = useAclStore((s) => s.roles);
@@ -991,6 +995,100 @@ export const Viewport3D: React.FC = () => {
       setJoySprint(false);
     }
   }, [firstPersonMode]);
+
+  // Immediately clear 3D wall draft preview when Escape or Right-Click stops wall chaining,
+  // and display eligible host wall drop-zones as soon as Place Door / Place Window is activated
+  useEffect(() => {
+    const eng = engineRef.current;
+    if (!eng) return;
+
+    if (!wallChainAnchor && activeTool === 'draw-wall') {
+      disposeObject3D(eng.placeGhostGroup);
+      eng.placeGhostGroup.clear();
+      eng.placeGhostGroup.visible = false;
+      eng.requestRender();
+      setPlaceSnapBadge(null);
+      return;
+    }
+
+    if (
+      (activeTool === 'place-door' || activeTool === 'place-window') &&
+      workspaceMode !== 'view'
+    ) {
+      const st = storeRef.current;
+      const activeFl = st.scene.floors.find((f) => f.id === activeFloorId);
+      const flElev = activeFl?.elevation ?? 0;
+      const isCampus = st.drillLevel === 'campus';
+      const activeBldg = st.scene.buildings.find((b) => b.id === activeFl?.buildingId);
+      const ox = isCampus && activeBldg ? activeBldg.originX : 0;
+      const oz = isCampus && activeBldg ? activeBldg.originZ : 0;
+      const accent = activeTool === 'place-window' ? '#38BDF8' : '#10B981';
+
+      disposeObject3D(eng.placeGhostGroup);
+      eng.placeGhostGroup.clear();
+      eng.placeGhostGroup.visible = true;
+
+      const eligibleWalls = st.scene.walls.filter(
+        (w) => w.floorId === activeFloorId && Math.hypot(w.x2 - w.x1, w.z2 - w.z1) >= 0.7
+      );
+      eligibleWalls.forEach((w) => {
+        const wLen = Math.hypot(w.x2 - w.x1, w.z2 - w.z1);
+        const ang = Math.atan2(w.z2 - w.z1, w.x2 - w.x1);
+        const mx = ox + (w.x1 + w.x2) / 2;
+        const mz = oz + (w.z1 + w.z2) / 2;
+        const strip = new THREE.Mesh(
+          new THREE.BoxGeometry(wLen, 0.12, w.thickness + 0.14),
+          new THREE.MeshBasicMaterial({
+            color: accent,
+            transparent: true,
+            opacity: 0.38,
+            depthWrite: false,
+          })
+        );
+        strip.position.set(mx, flElev + w.height + 0.06, mz);
+        strip.rotation.y = -ang;
+        eng.placeGhostGroup.add(strip);
+
+        const baseStrip = new THREE.Mesh(
+          new THREE.BoxGeometry(wLen, 0.06, w.thickness + 0.18),
+          new THREE.MeshBasicMaterial({
+            color: accent,
+            transparent: true,
+            opacity: 0.28,
+            depthWrite: false,
+          })
+        );
+        baseStrip.position.set(mx, flElev + 0.04, mz);
+        baseStrip.rotation.y = -ang;
+        eng.placeGhostGroup.add(baseStrip);
+      });
+
+      setPlaceSnapBadge({
+        label:
+          eligibleWalls.length > 0
+            ? `${activeTool === 'place-window' ? 'WINDOW' : 'DOOR'} DROP ZONES READY (${eligibleWalls.length} WALLS) — HOVER A WALL`
+            : 'NO WALLS ON THIS FLOOR — DRAW A WALL OR ROOM FIRST',
+        isWall: eligibleWalls.length > 0,
+        isWarning: eligibleWalls.length === 0,
+      });
+      eng.requestRender();
+      return;
+    }
+
+    if (
+      activeTool !== 'place-object' &&
+      activeTool !== 'draw-wall' &&
+      activeTool !== 'draw-room'
+    ) {
+      if (eng.placeGhostGroup.visible) {
+        disposeObject3D(eng.placeGhostGroup);
+        eng.placeGhostGroup.clear();
+        eng.placeGhostGroup.visible = false;
+        eng.requestRender();
+      }
+      setPlaceSnapBadge(null);
+    }
+  }, [wallChainAnchor, activeTool, activeFloorId, workspaceMode, sceneData.walls]);
 
   const updateJoystickFromClient = (clientX: number, clientY: number) => {
     const pad = joyPadRef.current;
@@ -1139,7 +1237,7 @@ export const Viewport3D: React.FC = () => {
   const [nearbyInteractable, setNearbyInteractable] = useState<(WalkInteractable & { screenX: number; screenY: number }) | null>(null);
   const nearbyInteractableRef = useRef<WalkInteractable | null>(null);
   const [walkInspectAssetId, setWalkInspectAssetId] = useState<string | null>(null);
-  const [placeSnapBadge, setPlaceSnapBadge] = useState<{ label: string; isWall: boolean } | null>(null);
+  const [placeSnapBadge, setPlaceSnapBadge] = useState<{ label: string; isWall: boolean; isWarning?: boolean } | null>(null);
   const [fpExpandedPad, setFpExpandedPad] = useState(false);
 
   // 3D HRTF Spatial Audio & Visual Path Finder State
@@ -2493,19 +2591,34 @@ export const Viewport3D: React.FC = () => {
         if (assetId && transform.object.userData?.entityType === 'asset') {
           const st = storeRef.current;
           const obj = transform.object;
-          const nx = snapValue(obj.position.x, st.snap.gridSize, st.snap.enabled && st.snap.snapToGrid);
-          const nz = snapValue(obj.position.z, st.snap.gridSize, st.snap.enabled && st.snap.snapToGrid);
           const asset = st.scene.assets.find((a) => a.id === assetId);
           if (asset) {
+            let nx = snapValue(obj.position.x, st.snap.gridSize, st.snap.enabled && st.snap.snapToGrid);
+            let nz = snapValue(obj.position.z, st.snap.gridSize, st.snap.enabled && st.snap.snapToGrid);
+            let nextRotY = Number(obj.rotation.y.toFixed(3));
+            if (st.transformMode === 'translate' && st.snap.enabled && st.snap.snapToWall) {
+              const flWalls = st.scene.walls.filter((w) => w.floorId === st.activeFloorId);
+              const snappedWall = computeSnappedPlacement(
+                obj.position.x,
+                obj.position.z,
+                asset.width,
+                asset.depth,
+                flWalls,
+                st.snap
+              );
+              nx = snappedWall.x;
+              nz = snappedWall.z;
+              if (snappedWall.snappedWall) nextRotY = snappedWall.rotationY;
+            }
             st.updateAsset(
               assetId,
               {
                 x: nx,
                 z: nz,
-                rotationY: Number(obj.rotation.y.toFixed(3)),
-                width: Math.max(0.3, Number((asset.width * obj.scale.x).toFixed(2))),
-                height: Math.max(0.3, Number((asset.height * obj.scale.y).toFixed(2))),
-                depth: Math.max(0.3, Number((asset.depth * obj.scale.z).toFixed(2))),
+                rotationY: nextRotY,
+                width: Math.max(0.25, Number((asset.width * obj.scale.x).toFixed(2))),
+                height: Math.max(0.25, Number((asset.height * obj.scale.y).toFixed(2))),
+                depth: Math.max(0.25, Number((asset.depth * obj.scale.z).toFixed(2))),
               },
               true
             );
@@ -2517,8 +2630,50 @@ export const Viewport3D: React.FC = () => {
     transform.addEventListener('change', requestRender);
 
     let pointerDownPos = { x: 0, y: 0 };
+    let draft3DStart: { x: number; z: number } | null = null;
     const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
     const hitPoint = new THREE.Vector3();
+
+    const snap3DWallPt = (
+      rawX: number,
+      rawZ: number,
+      anchor: { x: number; z: number } | null
+    ) => {
+      const st = storeRef.current;
+      let x = snapValue(rawX, st.snap.gridSize, st.snap.enabled && st.snap.snapToGrid);
+      let z = snapValue(rawZ, st.snap.gridSize, st.snap.enabled && st.snap.snapToGrid);
+      if (st.snap.enabled && st.snap.snapToWall) {
+        let best = 0.65;
+        for (const w of st.scene.walls) {
+          if (w.floorId !== st.activeFloorId) continue;
+          for (const ep of [
+            { x: w.x1, z: w.z1 },
+            { x: w.x2, z: w.z2 },
+          ]) {
+            const d = Math.hypot(ep.x - x, ep.z - z);
+            if (d < best) {
+              best = d;
+              x = ep.x;
+              z = ep.z;
+            }
+          }
+        }
+        if (best < 0.65) return { x: Number(x.toFixed(3)), z: Number(z.toFixed(3)) };
+      }
+      if (anchor && st.snap.enabled && st.snap.angleStepDeg > 0) {
+        const dx = x - anchor.x;
+        const dz = z - anchor.z;
+        const len = Math.hypot(dx, dz);
+        if (len > 0.15) {
+          const stepRad = (st.snap.angleStepDeg * Math.PI) / 180;
+          const a = Math.round(Math.atan2(dz, dx) / stepRad) * stepRad;
+          const sl = st.snap.snapToGrid ? snapValue(len, st.snap.gridSize, true) : len;
+          x = anchor.x + Math.cos(a) * sl;
+          z = anchor.z + Math.sin(a) * sl;
+        }
+      }
+      return { x: Number(x.toFixed(3)), z: Number(z.toFixed(3)) };
+    };
 
     const getPointerNDC = (e: PointerEvent | MouseEvent) => {
       const rect = renderer.domElement.getBoundingClientRect();
@@ -2542,6 +2697,7 @@ export const Viewport3D: React.FC = () => {
               buildingId: node.userData.buildingId ? String(node.userData.buildingId) : undefined,
               switchId: node.userData.switchId ? String(node.userData.switchId) : undefined,
               switchLabel: node.userData.switchLabel ? String(node.userData.switchLabel) : undefined,
+              point: hit.point.clone(),
             };
           }
           node = node.parent;
@@ -2553,7 +2709,19 @@ export const Viewport3D: React.FC = () => {
     const onPointerDown = (e: PointerEvent) => {
       pointerDownPos = { x: e.clientX, y: e.clientY };
       const eng = engineRef.current;
-      if (eng && storeRef.current.firstPersonMode) {
+      const st = storeRef.current;
+      if (e.button === 2 && st.activeTool === 'draw-wall' && st.wallChainAnchor) {
+        st.setWallChainAnchor(null);
+        if (eng) {
+          disposeObject3D(eng.placeGhostGroup);
+          eng.placeGhostGroup.clear();
+          eng.placeGhostGroup.visible = false;
+          requestRender();
+        }
+        setPlaceSnapBadge(null);
+        return;
+      }
+      if (eng && st.firstPersonMode) {
         eng.fpLookDragging = true;
         eng.fpLookLastX = e.clientX;
         eng.fpLookLastY = e.clientY;
@@ -2667,7 +2835,233 @@ export const Viewport3D: React.FC = () => {
             isWall: Boolean(snapped.snappedWall),
           });
           requestRender();
+        } else if (
+          (st.activeTool === 'place-door' || st.activeTool === 'place-window') &&
+          st.workspaceMode !== 'view'
+        ) {
+          const isCampus = st.drillLevel === 'campus';
+          const activeBldg = st.scene.buildings.find((b) => b.id === activeFl?.buildingId);
+          const ox = isCampus && activeBldg ? activeBldg.originX : 0;
+          const oz = isCampus && activeBldg ? activeBldg.originZ : 0;
+
+          const pickedHover = pickEntityAtEvent(e);
+          const preferredWallId = pickedHover?.entityType === 'wall' ? pickedHover.entityId : null;
+          const refX = (preferredWallId && pickedHover?.point ? pickedHover.point.x : hitPoint.x) - ox;
+          const refZ = (preferredWallId && pickedHover?.point ? pickedHover.point.z : hitPoint.z) - oz;
+
+          const wantKind = st.activeTool === 'place-window' ? 'window' : 'door';
+          const preset =
+            OPENING_PRESETS.find((p) => p.subtype === st.selectedOpeningSubtype && p.kind === wantKind) ??
+            OPENING_PRESETS.find((p) => p.kind === wantKind) ??
+            OPENING_PRESETS[0];
+
+          const drop = findOpeningDropZone(
+            refX,
+            refZ,
+            st.scene.walls,
+            st.activeFloorId,
+            preset,
+            st.snap,
+            2.2,
+            preferredWallId
+          );
+
+          disposeObject3D(eng.placeGhostGroup);
+          eng.placeGhostGroup.clear();
+          eng.placeGhostGroup.visible = true;
+
+          const accent = wantKind === 'window' ? '#38BDF8' : '#10B981';
+          const eligibleWalls = st.scene.walls.filter(
+            (w) => w.floorId === st.activeFloorId && Math.hypot(w.x2 - w.x1, w.z2 - w.z1) >= 0.7
+          );
+          eligibleWalls.forEach((w) => {
+            const wLen = Math.hypot(w.x2 - w.x1, w.z2 - w.z1);
+            const ang = Math.atan2(w.z2 - w.z1, w.x2 - w.x1);
+            const mx = ox + (w.x1 + w.x2) / 2;
+            const mz = oz + (w.z1 + w.z2) / 2;
+            const isTarget = drop?.wall.id === w.id;
+
+            const topStrip = new THREE.Mesh(
+              new THREE.BoxGeometry(wLen, isTarget ? 0.14 : 0.08, w.thickness + (isTarget ? 0.16 : 0.1)),
+              new THREE.MeshBasicMaterial({
+                color: accent,
+                transparent: true,
+                opacity: isTarget ? 0.78 : 0.28,
+                depthWrite: false,
+              })
+            );
+            topStrip.position.set(mx, flElev + w.height + 0.05, mz);
+            topStrip.rotation.y = -ang;
+            eng.placeGhostGroup.add(topStrip);
+
+            const baseStrip = new THREE.Mesh(
+              new THREE.BoxGeometry(wLen, 0.05, w.thickness + (isTarget ? 0.2 : 0.12)),
+              new THREE.MeshBasicMaterial({
+                color: accent,
+                transparent: true,
+                opacity: isTarget ? 0.65 : 0.2,
+                depthWrite: false,
+              })
+            );
+            baseStrip.position.set(mx, flElev + 0.035, mz);
+            baseStrip.rotation.y = -ang;
+            eng.placeGhostGroup.add(baseStrip);
+          });
+
+          if (drop) {
+            const ghostDepth = drop.wall.thickness + 0.16;
+            const ghostGroup = new THREE.Group();
+            ghostGroup.position.set(
+              ox + drop.worldX,
+              flElev + drop.sillHeight + drop.height / 2,
+              oz + drop.worldZ
+            );
+            ghostGroup.rotation.y = -drop.angleRad;
+
+            const ghostFill = new THREE.Mesh(
+              new THREE.BoxGeometry(drop.width, drop.height, ghostDepth),
+              new THREE.MeshBasicMaterial({
+                color: accent,
+                transparent: true,
+                opacity: 0.38,
+                depthWrite: false,
+              })
+            );
+            const ghostEdges = new THREE.LineSegments(
+              new THREE.EdgesGeometry(new THREE.BoxGeometry(drop.width, drop.height, ghostDepth)),
+              new THREE.LineBasicMaterial({ color: '#FFFFFF' })
+            );
+            ghostGroup.add(ghostFill, ghostEdges);
+            eng.placeGhostGroup.add(ghostGroup);
+
+            setPlaceSnapBadge({
+              label:
+                wantKind === 'window'
+                  ? `WINDOW ${drop.width.toFixed(2)}×${drop.height.toFixed(2)}m · SILL ${drop.sillHeight.toFixed(2)}m · CLICK WALL TO PLACE`
+                  : `DOOR ${drop.width.toFixed(2)}×${drop.height.toFixed(2)}m · CLICK WALL TO PLACE`,
+              isWall: true,
+            });
+          } else {
+            const warnRing = new THREE.Mesh(
+              new THREE.RingGeometry(0.28, 0.42, 24),
+              new THREE.MeshBasicMaterial({
+                color: '#EF4444',
+                side: THREE.DoubleSide,
+                transparent: true,
+                opacity: 0.85,
+              })
+            );
+            warnRing.rotation.x = -Math.PI / 2;
+            warnRing.position.set(hitPoint.x, flElev + 0.06, hitPoint.z);
+            eng.placeGhostGroup.add(warnRing);
+
+            setPlaceSnapBadge({
+              label:
+                wantKind === 'window'
+                  ? 'MOVE ONTO A WALL TO PLACE WINDOW — CANNOT PLACE IN AIR'
+                  : 'MOVE ONTO A WALL TO PLACE DOOR — CANNOT PLACE IN AIR',
+              isWall: false,
+              isWarning: true,
+            });
+          }
+          requestRender();
+        } else if (
+          (st.activeTool === 'draw-wall' || st.activeTool === 'draw-room') &&
+          st.workspaceMode !== 'view'
+        ) {
+          const activeAnchor = st.activeTool === 'draw-wall' ? st.wallChainAnchor : draft3DStart;
+          const curPt =
+            st.activeTool === 'draw-wall'
+              ? snap3DWallPt(hitPoint.x, hitPoint.z, activeAnchor)
+              : {
+                  x: snapValue(hitPoint.x, st.snap.gridSize, st.snap.enabled && st.snap.snapToGrid),
+                  z: snapValue(hitPoint.z, st.snap.gridSize, st.snap.enabled && st.snap.snapToGrid),
+                };
+
+          disposeObject3D(eng.placeGhostGroup);
+          eng.placeGhostGroup.clear();
+          eng.placeGhostGroup.visible = true;
+
+          if (!activeAnchor) {
+            const marker = new THREE.Mesh(
+              new THREE.CylinderGeometry(0.18, 0.18, 0.08, 16),
+              new THREE.MeshBasicMaterial({ color: '#8B5CF6' })
+            );
+            marker.position.set(curPt.x, flElev + 0.06, curPt.z);
+            eng.placeGhostGroup.add(marker);
+            setPlaceSnapBadge({
+              label:
+                st.activeTool === 'draw-wall'
+                  ? `CLICK WALL START · ${curPt.x}, ${curPt.z}`
+                  : `CLICK ROOM CORNER · ${curPt.x}, ${curPt.z}`,
+              isWall: false,
+            });
+          } else if (st.activeTool === 'draw-wall') {
+            const anchorDot = new THREE.Mesh(
+              new THREE.CylinderGeometry(0.2, 0.2, 0.1, 16),
+              new THREE.MeshBasicMaterial({ color: '#10B981' })
+            );
+            anchorDot.position.set(activeAnchor.x, flElev + 0.07, activeAnchor.z);
+            eng.placeGhostGroup.add(anchorDot);
+
+            const len = Math.hypot(curPt.x - activeAnchor.x, curPt.z - activeAnchor.z);
+            const wallH = activeFl?.height ? Math.min(3.6, activeFl.height) : 3.4;
+            if (len > 0.1) {
+              const box = new THREE.Mesh(
+                new THREE.BoxGeometry(len, wallH, 0.16),
+                new THREE.MeshBasicMaterial({
+                  color: '#8B5CF6',
+                  transparent: true,
+                  opacity: 0.34,
+                  depthWrite: false,
+                })
+              );
+              box.position.set(
+                (activeAnchor.x + curPt.x) / 2,
+                flElev + wallH / 2,
+                (activeAnchor.z + curPt.z) / 2
+              );
+              box.rotation.y = -Math.atan2(curPt.z - activeAnchor.z, curPt.x - activeAnchor.x);
+              eng.placeGhostGroup.add(box);
+            }
+            const deg = Math.round(
+              ((Math.atan2(curPt.z - activeAnchor.z, curPt.x - activeAnchor.x) * 180) / Math.PI + 360) % 360
+            );
+            setPlaceSnapBadge({
+              label: `WALL ${len.toFixed(2)}m · ${deg}° — CLICK TO CONTINUE · ESC TO STOP`,
+              isWall: true,
+            });
+          } else {
+            const rx = Math.min(activeAnchor.x, curPt.x);
+            const rz = Math.min(activeAnchor.z, curPt.z);
+            const rw = Math.max(0.2, Math.abs(curPt.x - activeAnchor.x));
+            const rd = Math.max(0.2, Math.abs(curPt.z - activeAnchor.z));
+            const rh = activeFl?.height ?? 3.6;
+            const roomGhost = new THREE.Mesh(
+              new THREE.BoxGeometry(rw, rh, rd),
+              new THREE.MeshBasicMaterial({
+                color: '#8B5CF6',
+                transparent: true,
+                opacity: 0.2,
+                depthWrite: false,
+              })
+            );
+            roomGhost.position.set(rx + rw / 2, flElev + rh / 2, rz + rd / 2);
+            eng.placeGhostGroup.add(roomGhost);
+            const edges = new THREE.LineSegments(
+              new THREE.EdgesGeometry(new THREE.BoxGeometry(rw, rh, rd)),
+              new THREE.LineBasicMaterial({ color: '#A78BFA' })
+            );
+            edges.position.copy(roomGhost.position);
+            eng.placeGhostGroup.add(edges);
+            setPlaceSnapBadge({
+              label: `ROOM ${rw.toFixed(1)}×${rd.toFixed(1)}m (${(rw * rd).toFixed(1)}m²) — CLICK TO CREATE`,
+              isWall: false,
+            });
+          }
+          requestRender();
         } else if (eng.placeGhostGroup.visible) {
+          draft3DStart = null;
           eng.placeGhostGroup.visible = false;
           setPlaceSnapBadge(null);
           requestRender();
@@ -2713,7 +3107,10 @@ export const Viewport3D: React.FC = () => {
           spatialAudioRef.current.setEnabled(true);
         }
         const picked = pickEntityAtEvent(e);
-        if (picked?.entityType === 'door-interact') {
+        if (
+          (picked?.entityType === 'door-interact' || picked?.entityType === 'opening') &&
+          eng.animatedDoors.has(picked.entityId)
+        ) {
           const rig = eng.animatedDoors.get(picked.entityId);
           if (rig) {
             executeInteractableRef.current({
@@ -2894,6 +3291,46 @@ export const Viewport3D: React.FC = () => {
         return;
       }
 
+      if ((st.activeTool === 'draw-wall' || st.activeTool === 'draw-room') && st.workspaceMode !== 'view') {
+        if (raycaster.ray.intersectPlane(groundPlane, hitPoint)) {
+          if (st.activeTool === 'draw-wall') {
+            const curAnchor = st.wallChainAnchor;
+            const clickPt = snap3DWallPt(hitPoint.x, hitPoint.z, curAnchor);
+            if (!curAnchor) {
+              st.setWallChainAnchor(clickPt);
+            } else {
+              const len = Math.hypot(clickPt.x - curAnchor.x, clickPt.z - curAnchor.z);
+              if (len >= 0.4) {
+                st.addWall(curAnchor.x, curAnchor.z, clickPt.x, clickPt.z);
+                st.setWallChainAnchor(clickPt);
+              }
+            }
+          } else {
+            const clickPt = {
+              x: snapValue(hitPoint.x, st.snap.gridSize, st.snap.enabled && st.snap.snapToGrid),
+              z: snapValue(hitPoint.z, st.snap.gridSize, st.snap.enabled && st.snap.snapToGrid),
+            };
+            if (!draft3DStart) {
+              draft3DStart = clickPt;
+            } else {
+              const rx = Math.min(draft3DStart.x, clickPt.x);
+              const rz = Math.min(draft3DStart.z, clickPt.z);
+              const rw = Math.abs(clickPt.x - draft3DStart.x);
+              const rd = Math.abs(clickPt.z - draft3DStart.z);
+              if (rw >= 1.5 && rd >= 1.5) {
+                st.addRoom(rx, rz, rw, rd);
+                st.setActiveTool('select');
+              }
+              draft3DStart = null;
+              eng.placeGhostGroup.visible = false;
+              setPlaceSnapBadge(null);
+            }
+          }
+          requestRender();
+        }
+        return;
+      }
+
       if (st.activeTool === 'measure') {
         if (raycaster.ray.intersectPlane(groundPlane, hitPoint)) {
           st.addMeasurePoint({
@@ -2907,16 +3344,69 @@ export const Viewport3D: React.FC = () => {
       const picked = pickEntityAtEvent(e);
 
       if (st.activeTool === 'paint-material' && picked) {
-        if (picked.entityType === 'room' || picked.entityType === 'wall' || picked.entityType === 'asset') {
+        if (
+          picked.entityType === 'room' ||
+          picked.entityType === 'wall' ||
+          picked.entityType === 'asset' ||
+          picked.entityType === 'floor'
+        ) {
           st.paintSurfaceWithMaterial(picked.entityType, picked.entityId, st.selectedMaterialId);
         }
         return;
       }
 
       if (st.activeTool === 'place-door' || st.activeTool === 'place-window') {
-        if (picked?.entityType === 'wall') {
-          st.addOpeningOnWall(picked.entityId, 0.5, st.selectedOpeningSubtype);
+        const isCampus = st.drillLevel === 'campus';
+        const activeBldg = st.scene.buildings.find((b) => b.id === activeFl?.buildingId);
+        const ox = isCampus && activeBldg ? activeBldg.originX : 0;
+        const oz = isCampus && activeBldg ? activeBldg.originZ : 0;
+
+        const wantKind = st.activeTool === 'place-window' ? 'window' : 'door';
+        const preset =
+          OPENING_PRESETS.find((p) => p.subtype === st.selectedOpeningSubtype && p.kind === wantKind) ??
+          OPENING_PRESETS.find((p) => p.kind === wantKind) ??
+          OPENING_PRESETS[0];
+
+        const preferredWallId = picked?.entityType === 'wall' ? picked.entityId : null;
+        let refX: number | null = null;
+        let refZ: number | null = null;
+        if (preferredWallId && picked?.point) {
+          refX = picked.point.x - ox;
+          refZ = picked.point.z - oz;
+        } else if (raycaster.ray.intersectPlane(groundPlane, hitPoint)) {
+          refX = hitPoint.x - ox;
+          refZ = hitPoint.z - oz;
+        }
+
+        const drop =
+          refX !== null && refZ !== null
+            ? findOpeningDropZone(
+                refX,
+                refZ,
+                st.scene.walls,
+                st.activeFloorId,
+                preset,
+                st.snap,
+                2.2,
+                preferredWallId
+              )
+            : null;
+
+        if (drop) {
+          st.addOpeningOnWall(drop.wall.id, drop.offsetRatio, preset.subtype);
+          disposeObject3D(eng.placeGhostGroup);
+          eng.placeGhostGroup.clear();
+          eng.placeGhostGroup.visible = false;
+          setPlaceSnapBadge(null);
           st.setActiveTool('select');
+          requestRender();
+        } else {
+          st.showToast(
+            wantKind === 'window'
+              ? 'Windows must be placed on a wall or room perimeter — click a highlighted wall.'
+              : 'Doors must be placed on a wall or room perimeter — click a highlighted wall.',
+            'warning'
+          );
         }
         return;
       }
@@ -2945,8 +3435,27 @@ export const Viewport3D: React.FC = () => {
         }
       }
 
+      if (picked?.entityType === 'detected-space') {
+        if (st.workspaceMode !== 'view') {
+          const floorWalls = st.scene.walls.filter((w) => w.floorId === st.activeFloorId);
+          const floorRooms = st.scene.rooms.filter((r) => r.floorId === st.activeFloorId);
+          const found = detectEnclosedWallPolygons(floorWalls, floorRooms, st.activeFloorId).find(
+            (sp) => sp.id === picked.entityId
+          );
+          if (found) {
+            st.setPendingPolygonSpace(found);
+          }
+        }
+        return;
+      }
+
       if (picked) {
-        st.selectEntity({ type: picked.entityType as any, id: picked.entityId }, e.shiftKey);
+        const normalizedType = picked.entityType === 'door-interact' ? 'opening' : picked.entityType;
+        st.selectEntity({ type: normalizedType as any, id: picked.entityId }, e.shiftKey);
+        if (normalizedType === 'opening' && st.workspaceMode === 'design') {
+          st.setRightTab('properties');
+          st.setRightPanelOpen(true);
+        }
       } else if (!e.shiftKey) {
         st.clearSelection();
       }
@@ -3840,15 +4349,20 @@ export const Viewport3D: React.FC = () => {
     engineRef.current?.requestRender();
   }, [vrStereoSplit]);
 
-  // Update TransformControls mode
+  // Update TransformControls mode & live Snap-to-Grid / Angle increments
   useEffect(() => {
     const eng = engineRef.current;
     if (!eng) return;
     eng.transform.setMode(transformMode);
+    eng.transform.setTranslationSnap(snap.enabled && snap.snapToGrid ? snap.gridSize : null);
+    eng.transform.setRotationSnap(
+      snap.enabled && snap.angleStepDeg > 0 ? (snap.angleStepDeg * Math.PI) / 180 : null
+    );
+    eng.transform.setScaleSnap(snap.enabled ? 0.05 : null);
     eng.requestRender();
-  }, [transformMode]);
+  }, [transformMode, snap.enabled, snap.snapToGrid, snap.gridSize, snap.angleStepDeg]);
 
-  // Rebuild architectural floor grid
+  // Rebuild architectural floor grid matching exact snap.gridSize
   useEffect(() => {
     const eng = engineRef.current;
     if (!eng) return;
@@ -3858,28 +4372,54 @@ export const Viewport3D: React.FC = () => {
     if (snap.showGrid) {
       const isCampusOrOrgIso = drillLevel === 'campus' || isolatedAssetType !== null;
       const activeFl = sceneData.floors.find((f) => f.id === activeFloorId);
-      const campusSpan = isCampusOrOrgIso
+      const cellSize = isCampusOrOrgIso
+        ? Math.max(1, snap.gridSize * 2)
+        : Math.max(0.25, snap.gridSize);
+      const rawSpan = isCampusOrOrgIso
         ? Math.max(90, ...sceneData.buildings.map((b) => b.originX + b.width + 24))
-        : Math.max(activeFl?.width ?? 40, activeFl?.depth ?? 40) + 20;
-      const divisions = Math.max(16, Math.min(120, Math.round(campusSpan / Math.max(1, snap.gridSize * (isCampusOrOrgIso ? 2 : 1)))));
+        : Math.max(activeFl?.width ?? 40, activeFl?.depth ?? 40) + 12;
+      const divisions = Math.max(12, Math.min(240, Math.round(rawSpan / cellSize)));
+      const alignedSpan = divisions * cellSize;
+      const isDesign = workspaceMode === 'design';
       const grid = new THREE.GridHelper(
-        campusSpan,
+        alignedSpan,
         divisions,
-        renderStyle === 'wireframe' ? 0x0ea5e9 : canvasBackdrop === 'dark' ? 0x27272a : 0xa1a1aa,
-        renderStyle === 'wireframe' ? 0x0c4a6e : canvasBackdrop === 'dark' ? 0x18181b : 0xd4d4d8
+        renderStyle === 'wireframe'
+          ? 0x0ea5e9
+          : isDesign
+            ? canvasBackdrop === 'dark'
+              ? 0x52525b
+              : 0x71717a
+            : canvasBackdrop === 'dark'
+              ? 0x27272a
+              : 0xa1a1aa,
+        renderStyle === 'wireframe'
+          ? 0x0c4a6e
+          : isDesign
+            ? canvasBackdrop === 'dark'
+              ? 0x27272f
+              : 0xcbd5e1
+            : canvasBackdrop === 'dark'
+              ? 0x18181b
+              : 0xd4d4d8
       );
       grid.position.set(
-        isCampusOrOrgIso ? campusSpan * 0.35 : (activeFl?.width ?? 36) / 2,
-        isCampusOrOrgIso ? -0.06 : (activeFl?.elevation ?? 0) - 0.04,
+        isCampusOrOrgIso ? alignedSpan * 0.35 : (activeFl?.width ?? 36) / 2,
+        isCampusOrOrgIso
+          ? -0.06
+          : isDesign
+            ? (activeFl?.elevation ?? 0) + 0.018
+            : (activeFl?.elevation ?? 0) - 0.04,
         (activeFl?.depth ?? 22) / 2
       );
       const mat = grid.material as THREE.Material;
       mat.transparent = true;
-      mat.opacity = Math.min(0.65, snap.gridOpacity + 0.1);
+      mat.depthWrite = false;
+      mat.opacity = Math.min(0.75, snap.gridOpacity + (isDesign ? 0.16 : 0.08));
       eng.gridHelper.add(grid);
     }
     eng.requestRender();
-  }, [snap.showGrid, snap.gridSize, snap.gridOpacity, activeFloorId, canvasBackdrop, drillLevel, isolatedAssetType, renderStyle, sceneData.buildings]);
+  }, [snap.showGrid, snap.gridSize, snap.gridOpacity, activeFloorId, canvasBackdrop, drillLevel, isolatedAssetType, renderStyle, sceneData.buildings, workspaceMode]);
 
   // Rebuild 3D Spatial Scene Graph cleanly whenever geometry/drill/isolation/renderStyle changes
   useEffect(() => {
@@ -3894,7 +4434,7 @@ export const Viewport3D: React.FC = () => {
     eng.roomLightRigs.clear();
 
     const maxAniso = eng.renderer.capabilities.getMaxAnisotropy();
-    const allMats: MaterialDef[] = [...DEFAULT_MATERIALS, ...sceneData.customMaterials];
+    const allMats: MaterialDef[] = [...sceneData.customMaterials, ...DEFAULT_MATERIALS];
     const getMat = (id: string, tint?: string) => {
       const def = allMats.find((m) => m.id === id) ?? DEFAULT_MATERIALS[0];
       return getProceduralMaterial(def, tint, maxAniso, isSoftwareGl);
@@ -4146,8 +4686,26 @@ export const Viewport3D: React.FC = () => {
             });
         }
 
-        // 3. Rooms (Floor Finish Surfaces + Drill Focus Highlight + Blueprint Wireframe)
+        // 3. Rooms (Floor Finish Surfaces — Rectangular & Enclosed Polygon — + Drill Focus Highlight + Blueprint Wireframe)
         if (isLayerVisible('layer-architecture')) {
+          const buildRoomFloorGeo = (rm: Room, thickness = 0.04): THREE.BufferGeometry => {
+            if (rm.polygon && rm.polygon.length >= 3) {
+              const shape = new THREE.Shape();
+              rm.polygon.forEach((p, idx) => {
+                if (idx === 0) shape.moveTo(p.x, p.z);
+                else shape.lineTo(p.x, p.z);
+              });
+              shape.closePath();
+              const geo = new THREE.ExtrudeGeometry(shape, { depth: thickness, bevelEnabled: false });
+              geo.rotateX(Math.PI / 2);
+              geo.translate(0, thickness, 0);
+              return geo;
+            }
+            const geo = new THREE.BoxGeometry(rm.width, thickness, rm.depth);
+            geo.translate(rm.x + rm.width / 2, thickness / 2, rm.z + rm.depth / 2);
+            return geo;
+          };
+
           sceneData.rooms
             .filter((r) => r.floorId === floor.id && r.activeFromDate <= timelineDate)
             .forEach((room: Room) => {
@@ -4160,7 +4718,7 @@ export const Viewport3D: React.FC = () => {
               const matchesCat = !isCategoryXray || doesRoomMatchCategory(room, categoryFilter);
 
               if (isOrgIsolation || wireMode || !matchesCat) {
-                const rmGeo = new THREE.BoxGeometry(room.width, 0.04, room.depth);
+                const rmGeo = buildRoomFloorGeo(room, 0.04);
                 const rmMesh = new THREE.Mesh(
                   rmGeo,
                   new THREE.MeshBasicMaterial({
@@ -4168,9 +4726,9 @@ export const Viewport3D: React.FC = () => {
                     transparent: true,
                     opacity: isOrgIsolation || !matchesCat ? 0.06 : 0.14,
                     depthWrite: false,
+                    side: THREE.DoubleSide,
                   })
                 );
-                rmMesh.position.set(roomCenterX, 0.02, room.z + room.depth / 2);
                 rmMesh.userData = { entityType: 'room', entityId: room.id, buildingId: bldg.id };
                 floorGroup.add(rmMesh);
 
@@ -4182,7 +4740,6 @@ export const Viewport3D: React.FC = () => {
                     opacity: isOrgIsolation || !matchesCat ? 0.24 : 0.72,
                   })
                 );
-                rmEdge.position.copy(rmMesh.position);
                 floorGroup.add(rmEdge);
               } else {
                 const isLineFailRoom = activeLineHighlight?.failingRoomIds.includes(room.id) ?? false;
@@ -4201,13 +4758,15 @@ export const Viewport3D: React.FC = () => {
                 floorMat.polygonOffsetFactor = -1;
                 floorMat.polygonOffsetUnits = -1;
                 floorMat.clippingPlanes = clipPlanes;
+                if (room.polygon && room.polygon.length >= 3) {
+                  floorMat.side = THREE.DoubleSide;
+                }
                 if (isDimmedByRoomDrill) {
                   floorMat.transparent = true;
                   floorMat.opacity = 0.25;
                 }
 
-                const rmMesh = new THREE.Mesh(new THREE.BoxGeometry(room.width, 0.04, room.depth), floorMat);
-                rmMesh.position.set(roomCenterX, 0.02, room.z + room.depth / 2);
+                const rmMesh = new THREE.Mesh(buildRoomFloorGeo(room, 0.04), floorMat);
                 rmMesh.receiveShadow = true;
                 rmMesh.userData = { entityType: 'room', entityId: room.id, buildingId: bldg.id };
                 floorGroup.add(rmMesh);
@@ -4293,7 +4852,7 @@ export const Viewport3D: React.FC = () => {
                     if (fxOn) initPrimaryOn++;
                   }
 
-                  const fxColor = kelvinToHex(fx.colorTempK, fx.type);
+                  const fxColor = kelvinToHex(fx.kelvin, cat.emissiveHex);
                   const maxEmissive =
                     fx.type === 'uv-c-sterilizer'
                       ? 1.5
@@ -4312,8 +4871,8 @@ export const Viewport3D: React.FC = () => {
                   });
 
                   const fxGroup = new THREE.Group();
-                  const fxWorldX = room.x + Math.max(0.25, Math.min(room.width - 0.25, fx.x));
-                  const fxWorldZ = room.z + Math.max(0.25, Math.min(room.depth - 0.25, fx.z));
+                  const fxWorldX = room.x + Math.max(0.25, Math.min(room.width - 0.25, fx.relX * room.width));
+                  const fxWorldZ = room.z + Math.max(0.25, Math.min(room.depth - 0.25, fx.relZ * room.depth));
                   fxGroup.position.set(fxWorldX, ceilingY, fxWorldZ);
 
                   const housingMat = new THREE.MeshStandardMaterial({
@@ -4336,8 +4895,24 @@ export const Viewport3D: React.FC = () => {
                     lens.position.y = -hgt / 2 - 0.01;
                     fxGroup.add(housing, lens);
                   } else {
-                    const fw = Math.min(room.width * 0.45, cat.width);
-                    const fd = Math.min(room.depth * 0.45, cat.depth);
+                    const baseW =
+                      fx.type === 'led-troffer'
+                        ? 1.2
+                        : fx.type === 'linear-vapor'
+                          ? 1.35
+                          : fx.type === 'uv-c-sterilizer'
+                            ? 1.15
+                            : 0.38;
+                    const baseD =
+                      fx.type === 'led-troffer'
+                        ? 0.6
+                        : fx.type === 'linear-vapor'
+                          ? 0.2
+                          : fx.type === 'uv-c-sterilizer'
+                            ? 0.16
+                            : 0.14;
+                    const fw = Math.min(room.width * 0.45, baseW);
+                    const fd = Math.min(room.depth * 0.45, baseD);
                     const housing = new THREE.Mesh(new THREE.BoxGeometry(fw + 0.06, 0.055, fd + 0.06), housingMat);
                     const lens = new THREE.Mesh(new THREE.BoxGeometry(fw, 0.024, fd), fxLensMat);
                     lens.position.y = -0.032;
@@ -4430,23 +5005,76 @@ export const Viewport3D: React.FC = () => {
 
                 const isVoiceHighlightedRoom = voiceHighlightIds.includes(room.id);
                 if (isSel || isRoomDrilled || isCategoryXray || isVoiceHighlightedRoom) {
-                  const selOutline = new THREE.LineSegments(
-                    new THREE.EdgesGeometry(new THREE.BoxGeometry(room.width, isVoiceHighlightedRoom ? 0.35 : 0.09, room.depth)),
-                    new THREE.LineBasicMaterial({
-                      color: isVoiceHighlightedRoom
-                        ? '#F59E0B'
-                        : isRoomDrilled
-                          ? '#10B981'
-                          : isCategoryXray
-                            ? categoryMeta.color
-                            : '#3B82F6',
-                    })
-                  );
-                  selOutline.position.set(roomCenterX, isVoiceHighlightedRoom ? 0.2 : 0.06, room.z + room.depth / 2);
-                  floorGroup.add(selOutline);
+                  const outlineColor = isVoiceHighlightedRoom
+                    ? '#F59E0B'
+                    : isRoomDrilled
+                      ? '#10B981'
+                      : isCategoryXray
+                        ? categoryMeta.color
+                        : '#3B82F6';
+                  if (room.polygon && room.polygon.length >= 3) {
+                    const loopPts = room.polygon.map((p) => new THREE.Vector3(p.x, 0.08, p.z));
+                    const selLoop = new THREE.LineLoop(
+                      new THREE.BufferGeometry().setFromPoints(loopPts),
+                      new THREE.LineBasicMaterial({ color: outlineColor })
+                    );
+                    floorGroup.add(selLoop);
+                  } else {
+                    const selOutline = new THREE.LineSegments(
+                      new THREE.EdgesGeometry(new THREE.BoxGeometry(room.width, isVoiceHighlightedRoom ? 0.35 : 0.09, room.depth)),
+                      new THREE.LineBasicMaterial({ color: outlineColor })
+                    );
+                    selOutline.position.set(roomCenterX, isVoiceHighlightedRoom ? 0.2 : 0.06, room.z + room.depth / 2);
+                    floorGroup.add(selOutline);
+                  }
                 }
               }
             });
+
+          // Auto-Detected Unnamed Enclosed Polygon Spaces (Clickable 3D Highlight Pads on Active Floor)
+          if (floor.id === activeFloorId) {
+            const flWallsForPoly = sceneData.walls.filter(
+              (w) => w.floorId === floor.id && w.activeFromDate <= timelineDate
+            );
+            const flRoomsForPoly = sceneData.rooms.filter(
+              (r) => r.floorId === floor.id && r.activeFromDate <= timelineDate
+            );
+            const detected3DSpaces = detectEnclosedWallPolygons(flWallsForPoly, flRoomsForPoly, floor.id);
+            detected3DSpaces.forEach((sp) => {
+              const shape = new THREE.Shape();
+              sp.polygon.forEach((p, idx) => {
+                if (idx === 0) shape.moveTo(p.x, p.z);
+                else shape.lineTo(p.x, p.z);
+              });
+              shape.closePath();
+              const padGeo = new THREE.ShapeGeometry(shape);
+              padGeo.rotateX(Math.PI / 2);
+              const padMesh = new THREE.Mesh(
+                padGeo,
+                new THREE.MeshBasicMaterial({
+                  color: '#10B981',
+                  transparent: true,
+                  opacity: 0.16,
+                  depthWrite: false,
+                  side: THREE.DoubleSide,
+                })
+              );
+              padMesh.position.y = 0.032;
+              padMesh.userData = { entityType: 'detected-space', entityId: sp.id, buildingId: bldg.id };
+              floorGroup.add(padMesh);
+
+              const borderPts = sp.polygon.map((p) => new THREE.Vector3(p.x, 0.048, p.z));
+              const borderLoop = new THREE.LineLoop(
+                new THREE.BufferGeometry().setFromPoints(borderPts),
+                new THREE.LineBasicMaterial({
+                  color: '#10B981',
+                  transparent: true,
+                  opacity: 0.85,
+                })
+              );
+              floorGroup.add(borderLoop);
+            });
+          }
         }
 
         // 4. Walls with Automatic Door & Window Opening Cuts + Wireframe/Ghost Support
@@ -4746,11 +5374,14 @@ export const Viewport3D: React.FC = () => {
                 const opW = Math.max(0.2, end - start);
                 const opCenter = start + opW / 2;
 
-                if (op.sillHeight > 0.04) {
-                  addWallSeg(opW, op.sillHeight, opCenter, op.sillHeight / 2);
+                const effSill = Math.max(0, Math.min(op.sillHeight, Math.max(0, wall.height - 0.45)));
+                const effH = Math.max(0.35, Math.min(op.height, Math.max(0.35, wall.height - effSill - 0.04)));
+
+                if (effSill > 0.04) {
+                  addWallSeg(opW, effSill, opCenter, effSill / 2);
                 }
 
-                const topY = op.sillHeight + op.height;
+                const topY = effSill + effH;
                 if (wall.height - topY > 0.04) {
                   const hdrH = wall.height - topY;
                   addWallSeg(opW, hdrH, opCenter, topY + hdrH / 2);
@@ -4758,7 +5389,7 @@ export const Viewport3D: React.FC = () => {
 
                 if (!wireMode && renderFrame) {
                   const opGroup = new THREE.Group();
-                  opGroup.position.set(opCenter, op.sillHeight, 0);
+                  opGroup.position.set(opCenter, effSill, 0);
                   opGroup.userData = { entityType: 'opening', entityId: op.id, buildingId: bldg.id };
                   const opSelected = selectedSet.has(`opening:${op.id}`);
                   const frameDepth = wall.thickness + 0.05;
@@ -4793,19 +5424,28 @@ export const Viewport3D: React.FC = () => {
 
                   const jambT = 0.065;
                   // Outer rebated perimeter jambs + header
-                  const leftJ = new THREE.Mesh(new THREE.BoxGeometry(jambT, op.height, frameDepth), frameMat);
-                  leftJ.position.set(-opW / 2 + jambT / 2, op.height / 2, 0);
+                  const leftJ = new THREE.Mesh(new THREE.BoxGeometry(jambT, effH, frameDepth), frameMat);
+                  leftJ.position.set(-opW / 2 + jambT / 2, effH / 2, 0);
                   leftJ.castShadow = true;
                   opGroup.add(leftJ);
 
-                  const rightJ = new THREE.Mesh(new THREE.BoxGeometry(jambT, op.height, frameDepth), frameMat);
-                  rightJ.position.set(opW / 2 - jambT / 2, op.height / 2, 0);
+                  const rightJ = new THREE.Mesh(new THREE.BoxGeometry(jambT, effH, frameDepth), frameMat);
+                  rightJ.position.set(opW / 2 - jambT / 2, effH / 2, 0);
                   rightJ.castShadow = true;
                   opGroup.add(rightJ);
 
                   const topJ = new THREE.Mesh(new THREE.BoxGeometry(opW, jambT, frameDepth), frameMat);
-                  topJ.position.set(0, op.height - jambT / 2, 0);
+                  topJ.position.set(0, effH - jambT / 2, 0);
                   opGroup.add(topJ);
+
+                  if (opSelected) {
+                    const selOutline = new THREE.LineSegments(
+                      new THREE.EdgesGeometry(new THREE.BoxGeometry(opW + 0.08, effH + 0.08, frameDepth + 0.1)),
+                      new THREE.LineBasicMaterial({ color: '#A78BFA' })
+                    );
+                    selOutline.position.set(0, effH / 2, 0);
+                    opGroup.add(selOutline);
+                  }
 
                   if (op.kind === 'window') {
                     // Protruding architectural window sill ledge + bottom gasket
@@ -4820,7 +5460,7 @@ export const Viewport3D: React.FC = () => {
 
                     // Double-glazed architectural pane
                     const paneW = Math.max(0.12, opW - jambT * 2);
-                    const paneH = Math.max(0.12, op.height - jambT - 0.055);
+                    const paneH = Math.max(0.12, effH - jambT - 0.055);
                     const pane = new THREE.Mesh(new THREE.BoxGeometry(paneW, paneH, 0.028), glassPaneMat);
                     pane.position.set(0, 0.055 + paneH / 2, 0);
                     pane.renderOrder = 4;
@@ -4839,18 +5479,18 @@ export const Viewport3D: React.FC = () => {
                         opGroup.add(mullion);
                       }
                     }
-                    if (op.height > 1.45) {
+                    if (effH > 1.45) {
                       const trans = new THREE.Mesh(
                         new THREE.BoxGeometry(paneW, 0.032, frameDepth * 0.65),
                         frameMat
                       );
-                      trans.position.set(0, op.height * 0.72, 0);
+                      trans.position.set(0, effH * 0.72, 0);
                       opGroup.add(trans);
                     }
                   } else {
                     // Realistic Interactive Animated Architectural Door Assembly (Per Type)
                     const leafW = Math.max(0.35, opW - jambT * 2);
-                    const leafH = Math.max(1.2, op.height - jambT);
+                    const leafH = Math.max(1.2, effH - jambT);
                     const isInitiallyOpen = Boolean(
                       useMayaStore.getState().openDoors[op.id] ?? op.status === 'open'
                     );
@@ -4875,14 +5515,14 @@ export const Viewport3D: React.FC = () => {
                                     ? 'Fire Rated Egress Door'
                                     : 'Facility Door';
 
-                    opGroup.userData = { entityType: 'door-interact', entityId: op.id, buildingId: bldg.id };
+                    opGroup.userData = { entityType: 'opening', entityId: op.id, buildingId: bldg.id, isDoor: true };
 
                     const closer = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.055, 0.06), hardwareMat);
-                    closer.position.set(-leafW * 0.22, op.height - jambT - 0.04, frameDepth / 2 + 0.02);
+                    closer.position.set(-leafW * 0.22, effH - jambT - 0.04, frameDepth / 2 + 0.02);
                     opGroup.add(closer);
 
                     const closerArm = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.022, 0.024), hardwareMat);
-                    closerArm.position.set(-leafW * 0.22, op.height - jambT - 0.015, frameDepth / 2 + 0.055);
+                    closerArm.position.set(-leafW * 0.22, effH - jambT - 0.015, frameDepth / 2 + 0.055);
                     closerArm.rotation.y = swingSign * initProg * (Math.PI * 0.36);
                     opGroup.add(closerArm);
 
@@ -4917,7 +5557,7 @@ export const Viewport3D: React.FC = () => {
                         frameMat
                       );
                       drum.rotation.z = Math.PI / 2;
-                      drum.position.set(0, op.height + 0.12, 0);
+                      drum.position.set(0, effH + 0.12, 0);
                       opGroup.add(drum);
 
                       const curtainMat = new THREE.MeshStandardMaterial({
@@ -4959,7 +5599,7 @@ export const Viewport3D: React.FC = () => {
                         new THREE.BoxGeometry(opW + 0.7, 0.095, frameDepth + 0.05),
                         frameMat
                       );
-                      rail.position.set(0, op.height + 0.035, 0);
+                      rail.position.set(0, effH + 0.035, 0);
                       opGroup.add(rail);
 
                       const slideTravel = halfW * 0.88;
@@ -4988,7 +5628,7 @@ export const Viewport3D: React.FC = () => {
 
                       doorLedMat = new THREE.MeshBasicMaterial({ color: isInitiallyOpen ? '#22D3EE' : '#10B981' });
                       const sensorBar = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.04, 0.04), doorLedMat);
-                      sensorBar.position.set(0, op.height + 0.09, frameDepth / 2 + 0.015);
+                      sensorBar.position.set(0, effH + 0.09, frameDepth / 2 + 0.015);
                       opGroup.add(sensorBar);
 
                       eng.animatedDoors.set(op.id, {
@@ -5123,7 +5763,7 @@ export const Viewport3D: React.FC = () => {
                                   : '#10B981';
                           doorLedMat = new THREE.MeshBasicMaterial({ color: ledColor });
                           const led = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.042, 0.03), doorLedMat);
-                          led.position.set(0, op.height + 0.055, frameDepth / 2 + 0.01);
+                          led.position.set(0, effH + 0.055, frameDepth / 2 + 0.01);
                           opGroup.add(led);
                         }
 
@@ -5501,13 +6141,27 @@ export const Viewport3D: React.FC = () => {
 
         // (Flows, HVAC, and Network Trace are built in dedicated lightweight layer effects below so toggling them never rebuilds building geometry)
 
-        // 8. Measurement Tape Line in 3D
-        if (measurePoints.length === 2 && floor.id === activeFloorId) {
-          const p1 = new THREE.Vector3(measurePoints[0].x, 0.2, measurePoints[0].z);
-          const p2 = new THREE.Vector3(measurePoints[1].x, 0.2, measurePoints[1].z);
-          const lineGeo = new THREE.BufferGeometry().setFromPoints([p1, p2]);
-          const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: '#F59E0B' }));
-          floorGroup.add(line);
+        // 8. Multi-Point Measurement Tape & Area Markers in 3D
+        if (measurePoints.length > 0 && floor.id === activeFloorId) {
+          const pts3 = measurePoints.map((p) => new THREE.Vector3(p.x, 0.18, p.z));
+          const pinGeo = new THREE.CylinderGeometry(0.14, 0.14, 0.32, 12);
+          const pinMat = new THREE.MeshBasicMaterial({ color: '#F59E0B' });
+          pts3.forEach((pt) => {
+            const pin = new THREE.Mesh(pinGeo, pinMat);
+            pin.position.copy(pt);
+            floorGroup.add(pin);
+          });
+          if (pts3.length >= 2) {
+            const lineGeo = new THREE.BufferGeometry().setFromPoints(pts3);
+            const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: '#F59E0B' }));
+            floorGroup.add(line);
+          }
+          if (pts3.length >= 3) {
+            const closeGeo = new THREE.BufferGeometry().setFromPoints([pts3[pts3.length - 1], pts3[0]]);
+            floorGroup.add(
+              new THREE.Line(closeGeo, new THREE.LineBasicMaterial({ color: '#F59E0B', transparent: true, opacity: 0.55 }))
+            );
+          }
         }
 
         // 9. AI Copilot Proposed Action Ghost Previews
@@ -6740,18 +7394,26 @@ export const Viewport3D: React.FC = () => {
     <div className="relative w-full h-full overflow-hidden select-none touch-none">
       <div ref={mountRef} className="w-full h-full touch-none" />
 
-      {/* Live 3D Snap-to-Grid / Snap-to-Wall Placement Indicator */}
-      {!firstPersonMode && activeTool === 'place-object' && placeSnapBadge && (
-        <div
-          className={`pointer-events-none absolute top-14 left-1/2 -translate-x-1/2 z-30 px-3 py-1 rounded-xl border text-[11px] font-mono font-bold shadow-xl ${
-            placeSnapBadge.isWall
-              ? 'bg-cyan-950/95 border-cyan-400 text-cyan-200'
-              : 'bg-violet-950/95 border-violet-400 text-violet-200'
-          }`}
-        >
-          {placeSnapBadge.label}
-        </div>
-      )}
+      {/* Live 3D Snap-to-Grid / Snap-to-Wall / Door & Window Drop-Zone Placement Indicator */}
+      {!firstPersonMode &&
+        (activeTool === 'place-object' ||
+          activeTool === 'place-door' ||
+          activeTool === 'place-window' ||
+          activeTool === 'draw-wall' ||
+          activeTool === 'draw-room') &&
+        placeSnapBadge && (
+          <div
+            className={`pointer-events-none absolute top-14 left-1/2 -translate-x-1/2 z-30 px-3 py-1 rounded-xl border text-[11px] font-mono font-bold shadow-xl ${
+              placeSnapBadge.isWarning
+                ? 'bg-rose-950/95 border-rose-400 text-rose-200'
+                : placeSnapBadge.isWall
+                  ? 'bg-cyan-950/95 border-cyan-400 text-cyan-200'
+                  : 'bg-violet-950/95 border-violet-400 text-violet-200'
+            }`}
+          >
+            {placeSnapBadge.label}
+          </div>
+        )}
 
       {/* Physical QR Scan Instant Highlight HUD */}
       {qrHighlight && !firstPersonMode && (
@@ -7845,17 +8507,29 @@ export const Viewport3D: React.FC = () => {
 
         return (
           <div className="absolute bottom-2.5 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-1.5 w-[min(96%,560px)] pointer-events-none">
+            {/* Selected Door / Window Inline Quick Editor (Change Type, Size, Sill, Position, Delete) */}
+            {!spotlightRoomId && (
+              <div className="pointer-events-auto">
+                <OpeningQuickBar isDark={canvasBackdrop === 'dark'} />
+              </div>
+            )}
+
             {/* Contextual Action Bar (always stacked cleanly ABOVE the dock — never overlaps) */}
             {!spotlightRoomId && activeTool !== 'select' && (
               <div className="pointer-events-none px-3 py-1.5 rounded-xl bg-violet-600 text-white text-[11px] font-medium shadow-lg text-center">
                 {activeTool === 'place-object' && 'Click floor in 3D to place selected equipment'}
                 {activeTool === 'paint-material' && 'Click any room floor, wall, or equipment to paint material'}
                 {activeTool === 'place-camera' && 'Click floor to place new camera'}
-                {activeTool === 'place-door' && 'Click any wall to insert door opening'}
-                {activeTool === 'place-window' && 'Click any wall to insert observation window'}
+                {activeTool === 'place-door' && 'Hover & click any highlighted wall drop zone to place door'}
+                {activeTool === 'place-window' && 'Hover & click any highlighted wall drop zone to place window'}
                 {activeTool === 'measure' && 'Click two points on the floor to measure distance'}
-                {(activeTool === 'draw-room' || activeTool === 'draw-wall' || activeTool === 'draw-flow') &&
-                  'Switch to 2D or Split View to draft rooms, walls, and routes with precision'}
+                {activeTool === 'draw-wall' &&
+                  (wallChainAnchor
+                    ? 'Wall chain active — click next point to continue · Press Esc or Right-Click to stop'
+                    : 'Click floor to start drawing continuous 3D walls · Press Esc to stop')}
+                {activeTool === 'draw-room' && 'Click two corners on the 3D floor to create a room with automatic walls'}
+                {activeTool === 'draw-flow' &&
+                  'Switch to 2D or Split View to draft multi-point flow routes with precision'}
               </div>
             )}
 

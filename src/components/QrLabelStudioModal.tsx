@@ -39,6 +39,7 @@ import {
 } from '../utils/barcodeSvg';
 import type { Room, SpatialAsset } from '../types/twin';
 import type { SensorDefinition } from '../types/telemetry';
+import { SelectedBadgesBar } from './SelectedBadgesBar';
 
 type LabelEntityKind = 'equipment' | 'room' | 'sensor';
 type LabelSymbology = 'qr+barcode' | 'qr-only' | 'datamatrix' | 'barcode-only';
@@ -1575,6 +1576,20 @@ export const QrLabelStudioModal: React.FC = () => {
                       </button>
                     </div>
                   </div>
+                  <SelectedBadgesBar
+                    items={selectedLabelItems.map((i) => ({
+                      id: i.key,
+                      code: i.code,
+                      label: i.name,
+                    }))}
+                    onRemove={toggleSelectKey}
+                    onClearAll={() => {
+                      setSelectedKeys([]);
+                      showToast('Cleared label selection', 'info');
+                    }}
+                    title="Selected Labels"
+                    isDark={isDark}
+                  />
                 </div>
 
                 <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y p-2.5 space-y-1.5">

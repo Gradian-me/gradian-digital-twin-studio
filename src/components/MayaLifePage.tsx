@@ -931,7 +931,7 @@ export const MayaLifePage: React.FC = () => {
               {isReadingSop && (
                 <button
                   type="button"
-                  onClick={stopReadingSop}
+                  onClick={() => stopReadingSop()}
                   className="text-[10px] font-semibold text-violet-500 hover:underline cursor-pointer"
                 >
                   Stop SOP Mode

@@ -57,21 +57,26 @@ import {
   getAhuColor,
   getEffectiveRoomHvac,
 } from '../utils/hvac';
-import { DEFAULT_MATERIALS, WALL_PRESETS } from '../data/materialsLibrary';
+import { DEFAULT_MATERIALS, OPENING_PRESETS, WALL_PRESETS } from '../data/materialsLibrary';
 import { OBJECT_LIBRARY } from '../data/objectLibrary';
+import { computeSnappedPlacement } from '../utils/placementSnap';
 import {
   formatArea,
   formatCurrency,
   formatLength,
   formatVolume,
   getAnalyticsLegend,
+  snapValue,
 } from '../utils/spatial';
 import { fetchApiJson } from '../utils/safeJson';
 import { computeFlowRoomSequence } from '../utils/flowAnalytics';
+import { getRoomAreaSqm } from '../utils/polygonSpaces';
 import type {
   AnalyticsMetric,
   CleanroomGrade,
   FlowType,
+  MaterialDef,
+  OpeningSubtype,
   ProposedAIAction,
   WallPresetId,
 } from '../types/twin';
@@ -124,13 +129,20 @@ export const RightInspector: React.FC = () => {
   const updateRoom = useTwinStore((s) => s.updateRoom);
   const updateWall = useTwinStore((s) => s.updateWall);
   const splitWall = useTwinStore((s) => s.splitWall);
+  const addOpeningOnWall = useTwinStore((s) => s.addOpeningOnWall);
   const updateOpening = useTwinStore((s) => s.updateOpening);
   const updateAsset = useTwinStore((s) => s.updateAsset);
+  const swapAssetTemplate = useTwinStore((s) => s.swapAssetTemplate);
+  const addFloor = useTwinStore((s) => s.addFloor);
+  const updateFloor = useTwinStore((s) => s.updateFloor);
+  const deleteFloor = useTwinStore((s) => s.deleteFloor);
   const alignSelectedAssets = useTwinStore((s) => s.alignSelectedAssets);
   const deleteSelected = useTwinStore((s) => s.deleteSelected);
   const duplicateSelected = useTwinStore((s) => s.duplicateSelected);
   const paintSurfaceWithMaterial = useTwinStore((s) => s.paintSurfaceWithMaterial);
+  const updateMaterial = useTwinStore((s) => s.updateMaterial);
   const addCustomMaterial = useTwinStore((s) => s.addCustomMaterial);
+  const snap = useTwinStore((s) => s.snap);
   const addCamera = useTwinStore((s) => s.addCamera);
   const updateCamera = useTwinStore((s) => s.updateCamera);
   const deleteCamera = useTwinStore((s) => s.deleteCamera);
@@ -215,6 +227,7 @@ export const RightInspector: React.FC = () => {
     },
   ]);
 
+  const [matCategoryFilter, setMatCategoryFilter] = useState<string>('All');
   const texInputRef = useRef<HTMLInputElement | null>(null);
 
   const primarySel = selected[0] ?? null;
@@ -226,16 +239,26 @@ export const RightInspector: React.FC = () => {
   const selFlow = primarySel?.type === 'flow' ? scene.flows.find((f) => f.id === primarySel.id) : null;
   const selFloor = scene.floors.find((f) => f.id === activeFloorId);
 
-  const allMaterials = useMemo(
-    () => [...scene.customMaterials, ...DEFAULT_MATERIALS],
-    [scene.customMaterials]
+  const allMaterials = useMemo(() => {
+    const map = new Map<string, MaterialDef>();
+    for (const m of DEFAULT_MATERIALS) map.set(m.id, m);
+    for (const m of scene.customMaterials) map.set(m.id, m);
+    return Array.from(map.values());
+  }, [scene.customMaterials]);
+  const selectedMatDef = useMemo(
+    () => allMaterials.find((m) => m.id === selectedMaterialId) ?? allMaterials[0],
+    [allMaterials, selectedMaterialId]
+  );
+  const allObjectTemplates = useMemo(
+    () => [...OBJECT_LIBRARY, ...scene.customObjects],
+    [scene.customObjects]
   );
 
   // Analytics KPI Rollups
   const kpis = useMemo(() => {
     const flRooms = scene.rooms.filter((r) => r.floorId === activeFloorId);
     const flAssets = scene.assets.filter((a) => a.floorId === activeFloorId);
-    const totalRoomArea = flRooms.reduce((sum, r) => sum + r.width * r.depth, 0);
+    const totalRoomArea = flRooms.reduce((sum, r) => sum + getRoomAreaSqm(r), 0);
     const slabArea = selFloor ? selFloor.width * selFloor.depth : 1;
     const totalCapex = flAssets.reduce((sum, a) => sum + a.capexUsd, 0);
     const totalEnergy = flAssets.reduce((sum, a) => sum + a.energyKw, 0);
@@ -562,19 +585,42 @@ export const RightInspector: React.FC = () => {
                         Dimensions &amp; GMP Specs
                       </span>
                       <span className="font-mono text-[10px] text-zinc-400 tabular-nums">
-                        {formatArea(selRoom.width * selRoom.depth, scene.unitSystem)}
+                        {formatArea(getRoomAreaSqm(selRoom), scene.unitSystem)}
                       </span>
                     </button>
                     {openRoomSection === 'specs' && (
                       <fieldset disabled={isReadOnly} className="px-3 pb-3 pt-1 space-y-3 min-w-0 border-t border-zinc-200/70 dark:border-zinc-800 disabled:opacity-80">
+                        <div className="grid grid-cols-2 gap-2 font-mono tabular-nums">
+                          <label className="space-y-1">
+                            <span className="text-[10px] text-slate-400">Pos X (m)</span>
+                            <input
+                              type="number"
+                              step={snap.gridSize}
+                              value={Number(selRoom.x.toFixed(2))}
+                              onChange={(e) => updateRoom(selRoom.id, { x: Number(e.target.value) })}
+                              className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                            />
+                          </label>
+                          <label className="space-y-1">
+                            <span className="text-[10px] text-slate-400">Pos Z (m)</span>
+                            <input
+                              type="number"
+                              step={snap.gridSize}
+                              value={Number(selRoom.z.toFixed(2))}
+                              onChange={(e) => updateRoom(selRoom.id, { z: Number(e.target.value) })}
+                              className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
+                            />
+                          </label>
+                        </div>
+
                         <div className="grid grid-cols-3 gap-2 font-mono tabular-nums">
                           <label className="space-y-1">
                             <span className="text-[10px] text-slate-400">Width (m)</span>
                             <input
                               type="number"
-                              step={0.5}
-                              value={selRoom.width}
-                              onChange={(e) => updateRoom(selRoom.id, { width: Math.max(2, Number(e.target.value)) })}
+                              step={snap.gridSize}
+                              value={Number(selRoom.width.toFixed(2))}
+                              onChange={(e) => updateRoom(selRoom.id, { width: Math.max(1.5, Number(e.target.value)) })}
                               className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
                             />
                           </label>
@@ -582,9 +628,9 @@ export const RightInspector: React.FC = () => {
                             <span className="text-[10px] text-slate-400">Depth (m)</span>
                             <input
                               type="number"
-                              step={0.5}
-                              value={selRoom.depth}
-                              onChange={(e) => updateRoom(selRoom.id, { depth: Math.max(2, Number(e.target.value)) })}
+                              step={snap.gridSize}
+                              value={Number(selRoom.depth.toFixed(2))}
+                              onChange={(e) => updateRoom(selRoom.id, { depth: Math.max(1.5, Number(e.target.value)) })}
                               className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
                             />
                           </label>
@@ -592,17 +638,99 @@ export const RightInspector: React.FC = () => {
                             <span className="text-[10px] text-slate-400">Height (m)</span>
                             <input
                               type="number"
-                              step={0.2}
-                              value={selRoom.height}
+                              step={0.1}
+                              value={Number(selRoom.height.toFixed(2))}
                               onChange={(e) => updateRoom(selRoom.id, { height: Math.max(2.4, Number(e.target.value)) })}
                               className="w-full px-2 py-1 rounded bg-white dark:bg-[#101015] border border-slate-200 dark:border-zinc-700"
                             />
                           </label>
                         </div>
 
-                        <div className="flex justify-between py-1.5 border-y border-slate-200 dark:border-zinc-800 font-mono text-[10.5px] text-slate-500 tabular-nums">
-                          <span>Area: {formatArea(selRoom.width * selRoom.depth, scene.unitSystem)}</span>
-                          <span>Vol: {formatVolume(selRoom.width * selRoom.depth * selRoom.height, scene.unitSystem)}</span>
+                        {/* Uniform Room Scale & Grid Snap */}
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[10px] text-slate-400 mr-auto">Scale:</span>
+                          {[0.85, 0.9, 1.1, 1.25].map((factor) => (
+                            <button
+                              key={factor}
+                              type="button"
+                              onClick={() =>
+                                updateRoom(selRoom.id, {
+                                  width: Math.max(2, Number((selRoom.width * factor).toFixed(2))),
+                                  depth: Math.max(2, Number((selRoom.depth * factor).toFixed(2))),
+                                })
+                              }
+                              className="px-1.5 py-0.5 rounded bg-zinc-200/70 dark:bg-zinc-800 hover:bg-violet-600 hover:text-white text-[10px] font-mono tabular-nums cursor-pointer"
+                            >
+                              {factor < 1 ? `${Math.round((factor - 1) * 100)}%` : `+${Math.round((factor - 1) * 100)}%`}
+                            </button>
+                          ))}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateRoom(selRoom.id, {
+                                x: snapValue(selRoom.x, snap.gridSize, true),
+                                z: snapValue(selRoom.z, snap.gridSize, true),
+                                width: Math.max(2, snapValue(selRoom.width, snap.gridSize, true)),
+                                depth: Math.max(2, snapValue(selRoom.depth, snap.gridSize, true)),
+                              })
+                            }
+                            className="px-1.5 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-[10px] font-medium cursor-pointer"
+                          >
+                            Snap
+                          </button>
+                        </div>
+
+                        {/* Quick Floor / Wall Surface Textures */}
+                        <div className="space-y-1.5 pt-1 border-t border-slate-200 dark:border-zinc-800">
+                          <div className="flex items-center justify-between text-[10px] text-slate-400">
+                            <span>Floor Finish</span>
+                            <button
+                              type="button"
+                              onClick={() => setRightTab('materials')}
+                              className="text-violet-500 hover:underline cursor-pointer"
+                            >
+                              All Textures →
+                            </button>
+                          </div>
+                          <div className="flex items-center gap-1 flex-wrap">
+                            {allMaterials.filter((m) => m.category === 'Flooring' || m.category === 'Wood & Interior' || m.category === 'Masonry & Stone').slice(0, 8).map((mat) => (
+                              <button
+                                key={mat.id}
+                                type="button"
+                                title={`Floor: ${mat.name}`}
+                                onClick={() => paintSurfaceWithMaterial('room', selRoom.id, mat.id)}
+                                className={`w-5 h-5 rounded border cursor-pointer transition-transform hover:scale-110 ${
+                                  selRoom.floorMaterialId === mat.id ? 'border-violet-500 ring-1 ring-violet-500' : 'border-zinc-300 dark:border-zinc-700'
+                                }`}
+                                style={{ backgroundColor: mat.baseColor }}
+                              />
+                            ))}
+                          </div>
+                          <div className="text-[10px] text-slate-400 pt-0.5">Room Walls Finish</div>
+                          <div className="flex items-center gap-1 flex-wrap">
+                            {allMaterials.filter((m) => m.category === 'Walls & Partitions' || m.category === 'Glass' || m.category === 'Metals').slice(0, 8).map((mat) => (
+                              <button
+                                key={mat.id}
+                                type="button"
+                                title={`Room Walls: ${mat.name}`}
+                                onClick={() => paintSurfaceWithMaterial('room-walls', selRoom.id, mat.id)}
+                                className="w-5 h-5 rounded border border-zinc-300 dark:border-zinc-700 cursor-pointer transition-transform hover:scale-110"
+                                style={{ backgroundColor: mat.baseColor, opacity: Math.max(0.45, mat.opacity) }}
+                              />
+                            ))}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between gap-2 py-1.5 border-y border-slate-200 dark:border-zinc-800 font-mono text-[10.5px] text-slate-500 tabular-nums">
+                          <span>
+                            Area: {formatArea(getRoomAreaSqm(selRoom), scene.unitSystem)}
+                            {selRoom.polygon && selRoom.polygon.length >= 3 && (
+                              <span className="ml-1.5 px-1 py-0.5 rounded bg-emerald-500/15 text-emerald-500 text-[9px] font-semibold">
+                                {selRoom.polygon.length}-pt Poly
+                              </span>
+                            )}
+                          </span>
+                          <span>Vol: {formatVolume(getRoomAreaSqm(selRoom) * selRoom.height, scene.unitSystem)}</span>
                         </div>
 
                         <label className="block space-y-1">
@@ -982,107 +1110,268 @@ export const RightInspector: React.FC = () => {
           })()}
 
           {/* Selected WALL Properties */}
-          {selWall && (
-            <fieldset disabled={isReadOnly} className="space-y-3 min-w-0 disabled:opacity-80">
-              <div className="flex items-center justify-between pb-2 border-b border-slate-200 dark:border-zinc-800">
-                <div>
-                  <div className="text-[10px] text-violet-500 font-medium">Architectural Wall</div>
-                  <div className="font-semibold text-sm">{selWall.name}</div>
+          {selWall && (() => {
+            const wallLen = Math.hypot(selWall.x2 - selWall.x1, selWall.z2 - selWall.z1);
+            const wallAngleDeg = Math.round(((Math.atan2(selWall.z2 - selWall.z1, selWall.x2 - selWall.x1) * 180) / Math.PI + 360) % 360);
+            const setWallLength = (newLen: number) => {
+              const clamped = Math.max(0.4, newLen);
+              const rad = Math.atan2(selWall.z2 - selWall.z1, selWall.x2 - selWall.x1);
+              updateWall(selWall.id, {
+                x2: Number((selWall.x1 + Math.cos(rad) * clamped).toFixed(3)),
+                z2: Number((selWall.z1 + Math.sin(rad) * clamped).toFixed(3)),
+              });
+            };
+            return (
+              <fieldset disabled={isReadOnly} className="space-y-3 min-w-0 disabled:opacity-80">
+                <div className="flex items-center justify-between pb-2 border-b border-slate-200 dark:border-zinc-800">
+                  <div className="min-w-0 flex-1 pr-2">
+                    <div className="text-[10px] text-violet-500 font-medium">Architectural Wall</div>
+                    <input
+                      value={selWall.name}
+                      onChange={(e) => updateWall(selWall.id, { name: e.target.value })}
+                      className="font-semibold text-sm bg-transparent w-full focus:outline-none focus:bg-zinc-100 dark:focus:bg-zinc-900 rounded px-1 -ml-1"
+                    />
+                  </div>
+                  {!isReadOnly && (
+                    <button onClick={deleteSelected} className="p-1.5 rounded text-red-500 hover:bg-red-500/10 cursor-pointer">
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                 </div>
-                {!isReadOnly && (
-                  <button onClick={deleteSelected} className="p-1.5 rounded text-red-500 hover:bg-red-500/10">
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                )}
-              </div>
 
-              <label className="block space-y-1">
-                <span className="text-[10px] text-slate-400">Wall Construction Preset</span>
-                <select
-                  value={selWall.presetId}
-                  onChange={(e) => {
-                    const preset = WALL_PRESETS.find((p) => p.id === (e.target.value as WallPresetId));
-                    if (preset) {
-                      updateWall(selWall.id, {
-                        presetId: preset.id,
-                        thickness: preset.thickness,
-                        height: preset.height,
-                        materialId: preset.materialId,
-                        color: preset.color,
-                        opacity: preset.opacity,
-                        fireRating: preset.fireRating,
-                        acousticRatingDb: preset.acousticRatingDb,
-                      });
-                    }
-                  }}
-                  className="w-full px-2 py-1.5 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                >
-                  {WALL_PRESETS.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name}</option>
+                <label className="block space-y-1">
+                  <span className="text-[10px] text-slate-400">Wall Construction Preset</span>
+                  <select
+                    value={selWall.presetId}
+                    onChange={(e) => {
+                      const preset = WALL_PRESETS.find((p) => p.id === (e.target.value as WallPresetId));
+                      if (preset) {
+                        updateWall(selWall.id, {
+                          presetId: preset.id,
+                          thickness: preset.thickness,
+                          height: preset.height,
+                          materialId: preset.materialId,
+                          color: preset.color,
+                          opacity: preset.opacity,
+                          fireRating: preset.fireRating,
+                          acousticRatingDb: preset.acousticRatingDb,
+                        });
+                      }
+                    }}
+                    className="w-full px-2 py-1.5 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                  >
+                    {WALL_PRESETS.map((p) => (
+                      <option key={p.id} value={p.id}>{p.name}</option>
+                    ))}
+                  </select>
+                </label>
+
+                {/* Direct Wall Length & Angle */}
+                <div className="grid grid-cols-2 gap-2 font-mono tabular-nums">
+                  <label className="space-y-1">
+                    <span className="text-[10px] text-slate-400">Length (m)</span>
+                    <input
+                      type="number"
+                      min={0.4}
+                      step={snap.gridSize}
+                      value={Number(wallLen.toFixed(2))}
+                      onChange={(e) => setWallLength(Number(e.target.value) || 1)}
+                      className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                    />
+                  </label>
+                  <div className="space-y-1">
+                    <span className="text-[10px] text-slate-400">Bearing</span>
+                    <div className="h-[26px] px-2 flex items-center rounded bg-zinc-100/70 dark:bg-[#14141A] border border-slate-200/70 dark:border-zinc-800 text-xs text-zinc-500">
+                      {wallAngleDeg}° ({formatLength(wallLen, scene.unitSystem)})
+                    </div>
+                  </div>
+                </div>
+
+                {/* Start & End Coordinates */}
+                <div className="grid grid-cols-4 gap-1.5 font-mono tabular-nums">
+                  {(
+                    [
+                      ['x1', 'X1'],
+                      ['z1', 'Z1'],
+                      ['x2', 'X2'],
+                      ['z2', 'Z2'],
+                    ] as const
+                  ).map(([field, label]) => (
+                    <label key={field} className="space-y-0.5">
+                      <span className="text-[9.5px] text-slate-400">{label}</span>
+                      <input
+                        type="number"
+                        step={snap.gridSize}
+                        value={Number(selWall[field].toFixed(2))}
+                        onChange={(e) => updateWall(selWall.id, { [field]: Number(e.target.value) })}
+                        className="w-full px-1.5 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700 text-[11px]"
+                      />
+                    </label>
                   ))}
-                </select>
-              </label>
-
-              <div className="space-y-2">
-                <div className="flex justify-between text-[11px]">
-                  <span>Wall Height</span>
-                  <span className="font-mono">{selWall.height.toFixed(2)} m</span>
                 </div>
-                <input
-                  type="range"
-                  min={2.2}
-                  max={6.5}
-                  step={0.1}
-                  value={selWall.height}
-                  onChange={(e) => updateWall(selWall.id, { height: Number(e.target.value) })}
-                  className="w-full"
-                />
-                <div className="flex justify-between text-[11px]">
-                  <span>Thickness</span>
-                  <span className="font-mono">{Math.round(selWall.thickness * 1000)} mm</span>
+
+                <div className="space-y-2">
+                  <div className="flex justify-between text-[11px]">
+                    <span>Wall Height</span>
+                    <span className="font-mono tabular-nums">{selWall.height.toFixed(2)} m</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={2.2}
+                    max={6.5}
+                    step={0.1}
+                    value={selWall.height}
+                    onChange={(e) => updateWall(selWall.id, { height: Number(e.target.value) })}
+                    className="w-full accent-violet-600"
+                  />
+                  <div className="flex justify-between text-[11px]">
+                    <span>Thickness</span>
+                    <span className="font-mono tabular-nums">{Math.round(selWall.thickness * 1000)} mm</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.06}
+                    max={0.45}
+                    step={0.02}
+                    value={selWall.thickness}
+                    onChange={(e) => updateWall(selWall.id, { thickness: Number(e.target.value) })}
+                    className="w-full accent-violet-600"
+                  />
+                  <div className="flex justify-between text-[11px]">
+                    <span>Opacity</span>
+                    <span className="font-mono tabular-nums">{Math.round(selWall.opacity * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.15}
+                    max={1}
+                    step={0.05}
+                    value={selWall.opacity}
+                    onChange={(e) => updateWall(selWall.id, { opacity: Number(e.target.value) })}
+                    className="w-full accent-violet-600"
+                  />
                 </div>
-                <input
-                  type="range"
-                  min={0.08}
-                  max={0.4}
-                  step={0.02}
-                  value={selWall.thickness}
-                  onChange={(e) => updateWall(selWall.id, { thickness: Number(e.target.value) })}
-                  className="w-full"
-                />
-              </div>
 
-              <div className="grid grid-cols-2 gap-2 text-[11px] font-mono text-slate-500">
-                <div>Fire: {selWall.fireRating}</div>
-                <div>Acoustic: {selWall.acousticRatingDb} dB</div>
-              </div>
+                {/* Surface Material & Tint */}
+                <div className="space-y-1.5 pt-2 border-t border-slate-200 dark:border-zinc-800">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] text-slate-400">Wall Texture &amp; Color</span>
+                    <input
+                      type="color"
+                      value={selWall.color}
+                      onChange={(e) => updateWall(selWall.id, { color: e.target.value })}
+                      className="w-6 h-5 rounded cursor-pointer border-0 bg-transparent"
+                    />
+                  </div>
+                  <div className="flex items-center gap-1 flex-wrap">
+                    {allMaterials
+                      .filter((m) => m.category === 'Walls & Partitions' || m.category === 'Glass' || m.category === 'Masonry & Stone' || m.category === 'Metals')
+                      .slice(0, 10)
+                      .map((mat) => (
+                        <button
+                          key={mat.id}
+                          type="button"
+                          title={mat.name}
+                          onClick={() => paintSurfaceWithMaterial('wall', selWall.id, mat.id)}
+                          className={`w-5 h-5 rounded border cursor-pointer transition-transform hover:scale-110 ${
+                            selWall.materialId === mat.id ? 'border-violet-500 ring-1 ring-violet-500' : 'border-zinc-300 dark:border-zinc-700'
+                          }`}
+                          style={{ backgroundColor: mat.baseColor, opacity: Math.max(0.45, mat.opacity) }}
+                        />
+                      ))}
+                  </div>
+                </div>
 
-              {!isReadOnly && (
-                <button
-                  onClick={() => splitWall(selWall.id)}
-                  className="w-full py-1.5 rounded border border-slate-300 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-[#22222C] font-medium"
-                >
-                  Split Wall at Midpoint
-                </button>
-              )}
-            </fieldset>
-          )}
+                <div className="grid grid-cols-2 gap-2 text-[11px] font-mono text-slate-500">
+                  <div>Fire: {selWall.fireRating}</div>
+                  <div>Acoustic: {selWall.acousticRatingDb} dB</div>
+                </div>
+
+                {!isReadOnly && (
+                  <div className="space-y-1.5 pt-1">
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => addOpeningOnWall(selWall.id, 0.5, 'cleanroom-door')}
+                        className="py-1.5 rounded bg-violet-600 hover:bg-violet-500 text-white font-medium text-[11px] cursor-pointer"
+                      >
+                        + Add Door
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => addOpeningOnWall(selWall.id, 0.5, 'cleanroom-window')}
+                        className="py-1.5 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium text-[11px] cursor-pointer"
+                      >
+                        + Add Window
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => splitWall(selWall.id)}
+                      className="w-full py-1.5 rounded border border-slate-300 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-[#22222C] font-medium cursor-pointer"
+                    >
+                      Split Wall at Midpoint
+                    </button>
+                  </div>
+                )}
+              </fieldset>
+            );
+          })()}
 
           {/* Selected OPENING (Door/Window) Properties */}
           {selOpening && (
             <fieldset disabled={isReadOnly} className="space-y-3 min-w-0 disabled:opacity-80">
               <div className="flex items-center justify-between pb-2 border-b border-slate-200 dark:border-zinc-800">
-                <div>
+                <div className="min-w-0 flex-1 pr-2">
                   <div className="text-[10px] text-violet-500 font-medium capitalize">{selOpening.kind} Opening</div>
-                  <div className="font-semibold text-sm">{selOpening.name}</div>
+                  <input
+                    value={selOpening.name}
+                    onChange={(e) => updateOpening(selOpening.id, { name: e.target.value })}
+                    className="font-semibold text-sm bg-transparent w-full focus:outline-none focus:bg-zinc-100 dark:focus:bg-zinc-900 rounded px-1 -ml-1"
+                  />
                 </div>
                 {!isReadOnly && (
-                  <button onClick={deleteSelected} className="p-1.5 rounded text-red-500 hover:bg-red-500/10">
+                  <button onClick={deleteSelected} className="p-1.5 rounded text-red-500 hover:bg-red-500/10 cursor-pointer">
                     <Trash2 className="w-3.5 h-3.5" />
                   </button>
                 )}
               </div>
-              <div className="grid grid-cols-2 gap-2 font-mono">
+
+              {/* Opening Subtype Switcher */}
+              <label className="block space-y-1">
+                <span className="text-[10px] text-slate-400">
+                  {selOpening.kind === 'door' ? 'Door Type & Mechanism' : 'Window Type'}
+                </span>
+                <select
+                  value={selOpening.subtype}
+                  onChange={(e) => {
+                    const preset = OPENING_PRESETS.find((p) => p.subtype === (e.target.value as OpeningSubtype));
+                    if (preset) {
+                      updateOpening(selOpening.id, {
+                        subtype: preset.subtype,
+                        kind: preset.kind,
+                        name: preset.name,
+                        width: preset.width,
+                        height: preset.height,
+                        sillHeight: preset.sillHeight,
+                        swingDirection: preset.swingDirection,
+                        accessControl: preset.accessControl,
+                        fireRating: preset.fireRating,
+                        frameColor: preset.frameColor,
+                      });
+                    }
+                  }}
+                  className="w-full px-2 py-1.5 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                >
+                  {OPENING_PRESETS.map((p) => (
+                    <option key={p.subtype} value={p.subtype}>
+                      [{p.kind === 'door' ? 'Door' : 'Window'}] {p.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <div className="grid grid-cols-3 gap-2 font-mono tabular-nums">
                 <label className="space-y-1">
                   <span className="text-[10px] text-slate-400">Width (m)</span>
                   <input
@@ -1099,36 +1388,92 @@ export const RightInspector: React.FC = () => {
                     type="number"
                     step={0.1}
                     value={selOpening.height}
-                    onChange={(e) => updateOpening(selOpening.id, { height: Math.max(0.6, Number(e.target.value)) })}
+                    onChange={(e) => updateOpening(selOpening.id, { height: Math.max(0.5, Number(e.target.value)) })}
+                    className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                  />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-[10px] text-slate-400">Sill (m)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.1}
+                    value={selOpening.sillHeight}
+                    onChange={(e) => updateOpening(selOpening.id, { sillHeight: Math.max(0, Number(e.target.value)) })}
                     className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
                   />
                 </label>
               </div>
+
               <label className="block space-y-1">
                 <span className="text-[10px] text-slate-400">Position Along Wall ({Math.round(selOpening.offsetRatio * 100)}%)</span>
                 <input
                   type="range"
-                  min={0.15}
-                  max={0.85}
-                  step={0.02}
+                  min={0.08}
+                  max={0.92}
+                  step={0.01}
                   value={selOpening.offsetRatio}
                   onChange={(e) => updateOpening(selOpening.id, { offsetRatio: Number(e.target.value) })}
-                  className="w-full"
+                  className="w-full accent-violet-600"
                 />
               </label>
-              <label className="block space-y-1">
-                <span className="text-[10px] text-slate-400">Operational State</span>
-                <select
-                  value={selOpening.status}
-                  onChange={(e) => updateOpening(selOpening.id, { status: e.target.value as any })}
-                  className="w-full px-2 py-1.5 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                >
-                  <option value="closed">Closed</option>
-                  <option value="open">Open</option>
-                  <option value="interlocked">GMP Interlocked</option>
-                  <option value="alarm">Door Held Open Alarm</option>
-                </select>
-              </label>
+
+              <div className="grid grid-cols-2 gap-2">
+                <label className="space-y-1">
+                  <span className="text-[10px] text-slate-400">Swing / Action</span>
+                  <select
+                    value={selOpening.swingDirection}
+                    onChange={(e) => updateOpening(selOpening.id, { swingDirection: e.target.value as any })}
+                    className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                  >
+                    <option value="left">Swing Left</option>
+                    <option value="right">Swing Right</option>
+                    <option value="both">Double Swing</option>
+                    <option value="slide">Slide / Roll</option>
+                  </select>
+                </label>
+                <label className="space-y-1">
+                  <span className="text-[10px] text-slate-400">Access Control</span>
+                  <select
+                    value={selOpening.accessControl}
+                    onChange={(e) => updateOpening(selOpening.id, { accessControl: e.target.value as any })}
+                    className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                  >
+                    <option value="none">Open Access</option>
+                    <option value="badge">RFID Badge</option>
+                    <option value="biometric">Biometric</option>
+                    <option value="interlock">GMP Interlock</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 items-center">
+                <label className="space-y-1">
+                  <span className="text-[10px] text-slate-400">Frame Color</span>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      type="color"
+                      value={selOpening.frameColor}
+                      onChange={(e) => updateOpening(selOpening.id, { frameColor: e.target.value })}
+                      className="w-7 h-7 rounded cursor-pointer border-0 bg-transparent"
+                    />
+                    <span className="font-mono text-[10px] text-zinc-400">{selOpening.frameColor}</span>
+                  </div>
+                </label>
+                <label className="space-y-1">
+                  <span className="text-[10px] text-slate-400">Operational State</span>
+                  <select
+                    value={selOpening.status}
+                    onChange={(e) => updateOpening(selOpening.id, { status: e.target.value as any })}
+                    className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                  >
+                    <option value="closed">Closed</option>
+                    <option value="open">Open</option>
+                    <option value="interlocked">GMP Interlocked</option>
+                    <option value="alarm">Door Held Alarm</option>
+                  </select>
+                </label>
+              </div>
             </fieldset>
           )}
 
@@ -1426,7 +1771,23 @@ export const RightInspector: React.FC = () => {
                         </div>
 
               {assetSubTab === 'general' && (
-                <fieldset disabled={isReadOnly} className="space-y-2 min-w-0 disabled:opacity-80">
+                <fieldset disabled={isReadOnly} className="space-y-2.5 min-w-0 disabled:opacity-80">
+                  {/* Live Equipment Type / 3D Model Swapper */}
+                  <label className="block space-y-1">
+                    <span className="text-[10px] text-slate-400">Equipment Type / 3D Model</span>
+                    <select
+                      value={selAsset.templateId}
+                      onChange={(e) => swapAssetTemplate(selAsset.id, e.target.value)}
+                      className="w-full px-2 py-1.5 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700 text-xs"
+                    >
+                      {allObjectTemplates.map((tpl) => (
+                        <option key={tpl.id} value={tpl.id}>
+                          [{tpl.category}] {tpl.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
                   <div className="grid grid-cols-2 gap-2">
                     <label className="space-y-1">
                       <span className="text-[10px] text-slate-400">Asset Tag</span>
@@ -1462,91 +1823,210 @@ export const RightInspector: React.FC = () => {
                 </fieldset>
               )}
 
-              {assetSubTab === 'spatial' && (
-                <fieldset disabled={isReadOnly} className="space-y-3 font-mono tabular-nums min-w-0 disabled:opacity-80">
-                  <div className="grid grid-cols-3 gap-2">
-                    <label className="space-y-1">
-                      <span className="text-[10px] text-slate-400">Pos X (m)</span>
-                      <input
-                        type="number"
-                        step={0.25}
-                        value={selAsset.x}
-                        onChange={(e) => updateAsset(selAsset.id, { x: Number(e.target.value) })}
-                        className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                      />
-                    </label>
-                    <label className="space-y-1">
-                      <span className="text-[10px] text-slate-400">Elev Y (m)</span>
-                      <input
-                        type="number"
-                        step={0.1}
-                        value={selAsset.y}
-                        onChange={(e) => updateAsset(selAsset.id, { y: Number(e.target.value) })}
-                        className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                      />
-                    </label>
-                    <label className="space-y-1">
-                      <span className="text-[10px] text-slate-400">Pos Z (m)</span>
-                      <input
-                        type="number"
-                        step={0.25}
-                        value={selAsset.z}
-                        onChange={(e) => updateAsset(selAsset.id, { z: Number(e.target.value) })}
-                        className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                      />
-                    </label>
-                  </div>
-                  <div className="space-y-1">
-                    <div className="flex justify-between text-[10px] text-slate-400">
-                      <span>Rotation Y</span>
-                      <span>{Math.round((selAsset.rotationY * 180) / Math.PI)}°</span>
+              {assetSubTab === 'spatial' && (() => {
+                const baseTpl = allObjectTemplates.find((t) => t.id === selAsset.templateId);
+                const baseW = baseTpl?.width ?? selAsset.width;
+                const baseD = baseTpl?.depth ?? selAsset.depth;
+                const baseH = baseTpl?.height ?? selAsset.height;
+                const currentScalePct = Math.round((selAsset.width / Math.max(0.1, baseW)) * 100);
+                const floorWalls = scene.walls.filter((w) => w.floorId === selAsset.floorId);
+                return (
+                  <fieldset disabled={isReadOnly} className="space-y-3 font-mono tabular-nums min-w-0 disabled:opacity-80">
+                    <div className="grid grid-cols-3 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-[10px] text-slate-400">Pos X (m)</span>
+                        <input
+                          type="number"
+                          step={snap.gridSize}
+                          value={Number(selAsset.x.toFixed(2))}
+                          onChange={(e) => updateAsset(selAsset.id, { x: Number(e.target.value) })}
+                          className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-[10px] text-slate-400">Elev Y (m)</span>
+                        <input
+                          type="number"
+                          step={0.1}
+                          value={Number(selAsset.y.toFixed(2))}
+                          onChange={(e) => updateAsset(selAsset.id, { y: Number(e.target.value) })}
+                          className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-[10px] text-slate-400">Pos Z (m)</span>
+                        <input
+                          type="number"
+                          step={snap.gridSize}
+                          value={Number(selAsset.z.toFixed(2))}
+                          onChange={(e) => updateAsset(selAsset.id, { z: Number(e.target.value) })}
+                          className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                        />
+                      </label>
                     </div>
-                    <div className="flex gap-1">
-                      {[0, 45, 90, 180, 270].map((deg) => (
-                        <button
-                          key={deg}
-                          onClick={() => updateAsset(selAsset.id, { rotationY: (deg * Math.PI) / 180 })}
-                          className="flex-1 py-1 rounded bg-slate-100 dark:bg-[#1C1C24] hover:bg-violet-600 hover:text-white text-[10px]"
-                        >
-                          {deg}°
-                        </button>
-                      ))}
+
+                    {/* Quick Nudge & Snap Actions */}
+                    <div className="grid grid-cols-2 gap-1.5 font-sans">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          updateAsset(selAsset.id, {
+                            x: snapValue(selAsset.x, snap.gridSize, true),
+                            z: snapValue(selAsset.z, snap.gridSize, true),
+                          })
+                        }
+                        className="py-1 px-2 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-[10.5px] font-medium cursor-pointer"
+                      >
+                        Snap to Grid ({snap.gridSize}m)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const res = computeSnappedPlacement(
+                            selAsset.x,
+                            selAsset.z,
+                            selAsset.width,
+                            selAsset.depth,
+                            floorWalls,
+                            { ...snap, enabled: true, snapToWall: true }
+                          );
+                          updateAsset(selAsset.id, {
+                            x: res.x,
+                            z: res.z,
+                            rotationY: res.snappedWall ? res.rotationY : selAsset.rotationY,
+                          });
+                        }}
+                        className="py-1 px-2 rounded border border-violet-500/40 bg-violet-500/10 text-violet-700 dark:text-violet-300 text-[10.5px] font-medium cursor-pointer"
+                      >
+                        Snap to Nearest Wall
+                      </button>
                     </div>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2">
-                    <label className="space-y-1">
-                      <span className="text-[10px] text-slate-400">Width</span>
+
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[10px] text-slate-400">
+                        <span>Rotation Y</span>
+                        <span>{Math.round(((selAsset.rotationY * 180) / Math.PI + 360) % 360)}°</span>
+                      </div>
+                      <div className="flex gap-1">
+                        {[0, 45, 90, 180, 270].map((deg) => (
+                          <button
+                            key={deg}
+                            type="button"
+                            onClick={() => updateAsset(selAsset.id, { rotationY: (deg * Math.PI) / 180 })}
+                            className="flex-1 py-1 rounded bg-slate-100 dark:bg-[#1C1C24] hover:bg-violet-600 hover:text-white text-[10px] cursor-pointer"
+                          >
+                            {deg}°
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Uniform Scale Slider + Reset */}
+                    <div className="space-y-1 pt-1 border-t border-slate-200 dark:border-zinc-800">
+                      <div className="flex items-center justify-between text-[10px] text-slate-400">
+                        <span>Uniform Scale</span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-violet-500 font-semibold">{currentScalePct}%</span>
+                          {baseTpl && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateAsset(selAsset.id, {
+                                  width: baseW,
+                                  depth: baseD,
+                                  height: baseH,
+                                })
+                              }
+                              className="text-[10px] text-zinc-400 hover:text-violet-500 underline font-sans cursor-pointer"
+                            >
+                              Reset
+                            </button>
+                          )}
+                        </div>
+                      </div>
                       <input
-                        type="number"
-                        step={0.1}
-                        value={selAsset.width}
-                        onChange={(e) => updateAsset(selAsset.id, { width: Math.max(0.3, Number(e.target.value)) })}
-                        className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                        type="range"
+                        min={50}
+                        max={220}
+                        step={5}
+                        value={Math.min(220, Math.max(50, currentScalePct))}
+                        onChange={(e) => {
+                          const s = Number(e.target.value) / 100;
+                          updateAsset(selAsset.id, {
+                            width: Math.max(0.25, Number((baseW * s).toFixed(2))),
+                            depth: Math.max(0.25, Number((baseD * s).toFixed(2))),
+                            height: Math.max(0.25, Number((baseH * s).toFixed(2))),
+                          });
+                        }}
+                        className="w-full accent-violet-600"
                       />
-                    </label>
-                    <label className="space-y-1">
-                      <span className="text-[10px] text-slate-400">Depth</span>
-                      <input
-                        type="number"
-                        step={0.1}
-                        value={selAsset.depth}
-                        onChange={(e) => updateAsset(selAsset.id, { depth: Math.max(0.3, Number(e.target.value)) })}
-                        className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                      />
-                    </label>
-                    <label className="space-y-1">
-                      <span className="text-[10px] text-slate-400">Height</span>
-                      <input
-                        type="number"
-                        step={0.1}
-                        value={selAsset.height}
-                        onChange={(e) => updateAsset(selAsset.id, { height: Math.max(0.3, Number(e.target.value)) })}
-                        className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
-                      />
-                    </label>
-                  </div>
-                </fieldset>
-              )}
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-[10px] text-slate-400">Width</span>
+                        <input
+                          type="number"
+                          step={0.1}
+                          value={Number(selAsset.width.toFixed(2))}
+                          onChange={(e) => updateAsset(selAsset.id, { width: Math.max(0.25, Number(e.target.value)) })}
+                          className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-[10px] text-slate-400">Depth</span>
+                        <input
+                          type="number"
+                          step={0.1}
+                          value={Number(selAsset.depth.toFixed(2))}
+                          onChange={(e) => updateAsset(selAsset.id, { depth: Math.max(0.25, Number(e.target.value)) })}
+                          className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                        />
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-[10px] text-slate-400">Height</span>
+                        <input
+                          type="number"
+                          step={0.1}
+                          value={Number(selAsset.height.toFixed(2))}
+                          onChange={(e) => updateAsset(selAsset.id, { height: Math.max(0.25, Number(e.target.value)) })}
+                          className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700"
+                        />
+                      </label>
+                    </div>
+
+                    {/* Equipment Finish / Color Swatches */}
+                    <div className="space-y-1.5 pt-2 border-t border-slate-200 dark:border-zinc-800 font-sans">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] text-slate-400">Finish / Paint Color</span>
+                        <input
+                          type="color"
+                          value={selAsset.color}
+                          onChange={(e) => updateAsset(selAsset.id, { color: e.target.value })}
+                          className="w-6 h-5 rounded cursor-pointer border-0 bg-transparent"
+                        />
+                      </div>
+                      <div className="flex items-center gap-1 flex-wrap">
+                        {allMaterials
+                          .filter((m) => m.category === 'Metals' || m.category === 'Industrial Coatings' || m.category === 'Glass')
+                          .slice(0, 8)
+                          .map((mat) => (
+                            <button
+                              key={mat.id}
+                              type="button"
+                              title={mat.name}
+                              onClick={() => paintSurfaceWithMaterial('asset', selAsset.id, mat.id)}
+                              className={`w-5 h-5 rounded border cursor-pointer transition-transform hover:scale-110 ${
+                                selAsset.materialId === mat.id ? 'border-violet-500 ring-1 ring-violet-500' : 'border-zinc-300 dark:border-zinc-700'
+                              }`}
+                              style={{ backgroundColor: mat.baseColor }}
+                            />
+                          ))}
+                      </div>
+                    </div>
+                  </fieldset>
+                );
+              })()}
 
               {assetSubTab === 'ops' && (
                 <fieldset disabled={isReadOnly} className="space-y-2 min-w-0 disabled:opacity-80">
@@ -1932,14 +2412,14 @@ export const RightInspector: React.FC = () => {
             </div>
           )}
 
-          {/* Default Floor Summary when nothing selected */}
+          {/* Default Floor Designer when nothing selected */}
           {!selRoom && !selWall && !selOpening && !selAsset && !selCamera && !selFlow && selFloor && (
             <div className="space-y-3">
               <div className="pb-2 border-b border-zinc-200 dark:border-zinc-800 flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="text-[10px] text-zinc-400">Active Floor Inspector</div>
-                  <div className="font-semibold text-sm text-zinc-900 dark:text-zinc-100">{selFloor.name}</div>
-                  <div className="font-mono text-[11px] text-zinc-500">
+                <div className="min-w-0 flex-1">
+                  <div className="text-[10px] text-violet-500 font-medium">Active Floor Designer</div>
+                  <div className="font-semibold text-sm text-zinc-900 dark:text-zinc-100 truncate">{selFloor.name}</div>
+                  <div className="font-mono text-[11px] text-zinc-500 tabular-nums">
                     {selFloor.code} · Elev +{selFloor.elevation.toFixed(2)} m · H {selFloor.height} m
                   </div>
                 </div>
@@ -1947,13 +2427,166 @@ export const RightInspector: React.FC = () => {
                   onClick={() =>
                     copyDirectLink({ floorId: selFloor.id, drillLevel: 'floor' }, selFloor.name)
                   }
-                  className="p-1.5 rounded border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 dark:text-zinc-300 shrink-0"
+                  className="p-1.5 rounded border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 dark:text-zinc-300 shrink-0 cursor-pointer"
                   title="Copy Direct Floor URL"
                 >
                   <Link2 className="w-3.5 h-3.5" />
                 </button>
               </div>
-              <div className="grid grid-cols-2 gap-2.5 font-mono tabular-nums">
+
+              <fieldset disabled={isReadOnly} className="space-y-2.5 disabled:opacity-80">
+                <div className="grid grid-cols-3 gap-2">
+                  <label className="col-span-2 space-y-1">
+                    <span className="text-[10px] text-zinc-400">Floor Name</span>
+                    <input
+                      value={selFloor.name}
+                      onChange={(e) => updateFloor(selFloor.id, { name: e.target.value })}
+                      className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700 text-xs"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-[10px] text-zinc-400">Code</span>
+                    <input
+                      value={selFloor.code}
+                      onChange={(e) => updateFloor(selFloor.id, { code: e.target.value })}
+                      className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700 text-xs font-mono"
+                    />
+                  </label>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2 font-mono tabular-nums">
+                  <label className="space-y-1">
+                    <span className="text-[10px] text-zinc-400">Width (m)</span>
+                    <input
+                      type="number"
+                      min={6}
+                      max={200}
+                      step={1}
+                      value={selFloor.width}
+                      onChange={(e) => updateFloor(selFloor.id, { width: Math.max(6, Number(e.target.value) || 20) })}
+                      className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700 text-xs"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-[10px] text-zinc-400">Depth (m)</span>
+                    <input
+                      type="number"
+                      min={6}
+                      max={200}
+                      step={1}
+                      value={selFloor.depth}
+                      onChange={(e) => updateFloor(selFloor.id, { depth: Math.max(6, Number(e.target.value) || 20) })}
+                      className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700 text-xs"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-[10px] text-zinc-400">Ceiling (m)</span>
+                    <input
+                      type="number"
+                      min={2.4}
+                      max={16}
+                      step={0.1}
+                      value={selFloor.height}
+                      onChange={(e) => updateFloor(selFloor.id, { height: Math.max(2.4, Number(e.target.value) || 4) })}
+                      className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700 text-xs"
+                    />
+                  </label>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 font-mono tabular-nums">
+                  <label className="space-y-1">
+                    <span className="text-[10px] text-zinc-400">Elevation (m)</span>
+                    <input
+                      type="number"
+                      step={0.2}
+                      value={selFloor.elevation}
+                      onChange={(e) => updateFloor(selFloor.id, { elevation: Number(e.target.value) })}
+                      className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700 text-xs"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-[10px] text-zinc-400">Slab Thick (m)</span>
+                    <input
+                      type="number"
+                      min={0.1}
+                      max={1.2}
+                      step={0.05}
+                      value={selFloor.slabThickness}
+                      onChange={(e) => updateFloor(selFloor.id, { slabThickness: Math.max(0.1, Number(e.target.value) || 0.25) })}
+                      className="w-full px-2 py-1 rounded bg-slate-100 dark:bg-[#14141A] border border-slate-200 dark:border-zinc-700 text-xs"
+                    />
+                  </label>
+                </div>
+
+                {/* Floor Slab Material Swatches */}
+                <div className="space-y-1">
+                  <span className="text-[10px] text-zinc-400">Floor Slab Texture</span>
+                  <div className="flex items-center gap-1 flex-wrap">
+                    {allMaterials
+                      .filter((m) => m.category === 'Flooring' || m.category === 'Masonry & Stone' || m.category === 'Wood & Interior')
+                      .slice(0, 10)
+                      .map((mat) => (
+                        <button
+                          key={mat.id}
+                          type="button"
+                          title={mat.name}
+                          onClick={() => paintSurfaceWithMaterial('floor', selFloor.id, mat.id)}
+                          className={`w-5 h-5 rounded border cursor-pointer transition-transform hover:scale-110 ${
+                            selFloor.slabMaterialId === mat.id ? 'border-violet-500 ring-1 ring-violet-500' : 'border-zinc-300 dark:border-zinc-700'
+                          }`}
+                          style={{ backgroundColor: mat.baseColor }}
+                        />
+                      ))}
+                  </div>
+                </div>
+
+                {!isReadOnly && (
+                  <div className="grid grid-cols-2 gap-1.5 pt-1">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        addFloor({
+                          buildingId: selFloor.buildingId,
+                          name: `Level ${scene.floors.filter((f) => f.buildingId === selFloor.buildingId).length}`,
+                          width: selFloor.width,
+                          depth: selFloor.depth,
+                          height: selFloor.height,
+                        })
+                      }
+                      className="py-1.5 px-2 rounded bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-medium flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" /> Add Floor
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        addFloor({
+                          buildingId: selFloor.buildingId,
+                          name: `${selFloor.name} (Copy)`,
+                          width: selFloor.width,
+                          depth: selFloor.depth,
+                          height: selFloor.height,
+                          duplicateFromFloorId: selFloor.id,
+                        })
+                      }
+                      className="py-1.5 px-2 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-[11px] font-medium flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      <Copy className="w-3 h-3" /> Duplicate
+                    </button>
+                    {scene.floors.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => deleteFloor(selFloor.id)}
+                        className="col-span-2 py-1.5 rounded border border-red-500/40 text-red-500 hover:bg-red-500/10 text-[11px] font-medium cursor-pointer"
+                      >
+                        Delete Active Floor
+                      </button>
+                    )}
+                  </div>
+                )}
+              </fieldset>
+
+              <div className="grid grid-cols-2 gap-2.5 font-mono tabular-nums pt-2 border-t border-zinc-200 dark:border-zinc-800">
                 <div className="p-2.5 rounded-lg bg-zinc-50 dark:bg-[#161619] border border-zinc-200 dark:border-zinc-800">
                   <div className="text-[10px] text-zinc-400">Gross Slab</div>
                   <div className="text-sm font-semibold mt-0.5">{formatArea(kpis.slabArea, scene.unitSystem)}</div>
@@ -1971,76 +2604,232 @@ export const RightInspector: React.FC = () => {
                   <div className="text-sm font-semibold mt-0.5">{kpis.assetCount}</div>
                 </div>
               </div>
-              <p className="text-[11px] text-zinc-500 dark:text-zinc-400 leading-relaxed">
-                Select any room, wall, door, window, or equipment object in 2D or 3D to inspect dimensions, isolate same-type assets organization-wide, copy direct deep links, or edit GMP telemetry.
-              </p>
             </div>
           )}
         </div>
       )}
 
-      {/* TAB 2: VISUAL MATERIAL DESIGNER */}
-      {rightTab === 'materials' && (
-        <div className="flex-1 flex flex-col overflow-hidden text-xs">
-          <div className="p-2.5 border-b border-slate-200 dark:border-zinc-800 space-y-2">
-            <div className="flex gap-1.5">
-              <button
-                onClick={() => setActiveTool('paint-material')}
-                className="flex-1 py-1.5 rounded bg-violet-600 hover:bg-violet-500 text-white font-medium"
-              >
-                Activate Paint Tool
-              </button>
-              <button
-                onClick={() => texInputRef.current?.click()}
-                className="px-2.5 py-1.5 rounded border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-[#22222C] flex items-center gap-1"
-                title="Upload Custom Texture"
-              >
-                <Upload className="w-3.5 h-3.5" />
-              </button>
-              <input ref={texInputRef} type="file" accept="image/*" className="hidden" onChange={handleUploadCustomTexture} />
-            </div>
-            {primarySel && (primarySel.type === 'room' || primarySel.type === 'wall' || primarySel.type === 'asset') && (
-              <button
-                onClick={() => paintSurfaceWithMaterial(primarySel.type as any, primarySel.id, selectedMaterialId)}
-                className="w-full py-1.5 rounded border border-violet-500 text-violet-600 dark:text-violet-400 font-medium hover:bg-violet-500/10"
-              >
-                Apply Selected Material to Active {primarySel.type}
-              </button>
-            )}
-          </div>
-          <div className="flex-1 overflow-y-auto p-2.5 grid grid-cols-2 gap-2 content-start">
-            {allMaterials.map((mat) => {
-              const active = selectedMaterialId === mat.id;
-              return (
-                <div
-                  key={mat.id}
-                  draggable
-                  onDragStart={(e) => {
-                    e.dataTransfer.setData('application/x-gradian-material', mat.id);
-                    setSelectedMaterialId(mat.id);
-                  }}
-                  onClick={() => setSelectedMaterialId(mat.id)}
-                  className={`p-2 rounded-lg border cursor-pointer transition-colors ${
-                    active ? 'border-violet-500 bg-violet-500/5' : 'border-slate-200 dark:border-zinc-800 hover:border-slate-400'
-                  }`}
+      {/* TAB 2: VISUAL MATERIAL & TEXTURE DESIGNER */}
+      {rightTab === 'materials' && (() => {
+        const matCategories = ['All', ...Array.from(new Set(allMaterials.map((m) => m.category)))];
+        const visibleMats =
+          matCategoryFilter === 'All'
+            ? allMaterials
+            : allMaterials.filter((m) => m.category === matCategoryFilter);
+        return (
+          <div className="flex-1 flex flex-col overflow-hidden text-xs">
+            <div className="p-2.5 border-b border-slate-200 dark:border-zinc-800 space-y-2">
+              <div className="flex gap-1.5">
+                <button
+                  onClick={() => setActiveTool('paint-material')}
+                  className="flex-1 py-1.5 rounded bg-violet-600 hover:bg-violet-500 text-white font-medium cursor-pointer"
                 >
-                  <div
-                    className="h-10 rounded-md border border-black/10 mb-1.5 bg-cover bg-center"
-                    style={{
-                      backgroundColor: mat.baseColor,
-                      backgroundImage: mat.customTextureDataUrl ? `url(${mat.customTextureDataUrl})` : undefined,
-                    }}
-                  />
-                  <div className="text-[11px] font-medium truncate">{mat.name}</div>
-                  <div className="text-[10px] font-mono text-slate-400">
-                    R:{mat.roughness} M:{mat.metalness}
+                  Activate Paint Tool
+                </button>
+                <button
+                  onClick={() => texInputRef.current?.click()}
+                  className="px-2.5 py-1.5 rounded border border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-[#22222C] flex items-center gap-1 cursor-pointer"
+                  title="Upload Custom Texture"
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                </button>
+                <input ref={texInputRef} type="file" accept="image/*" className="hidden" onChange={handleUploadCustomTexture} />
+              </div>
+
+              {/* Multi-target Apply Buttons */}
+              <div className="flex flex-wrap gap-1">
+                {selFloor && (
+                  <button
+                    type="button"
+                    disabled={isReadOnly}
+                    onClick={() => paintSurfaceWithMaterial('floor', selFloor.id, selectedMaterialId)}
+                    className="px-2 py-1 rounded border border-violet-500/40 bg-violet-500/8 text-violet-600 dark:text-violet-300 text-[10.5px] font-medium hover:bg-violet-500/15 disabled:opacity-40 cursor-pointer"
+                  >
+                    Apply to Floor Slab
+                  </button>
+                )}
+                {selRoom && (
+                  <>
+                    <button
+                      type="button"
+                      disabled={isReadOnly}
+                      onClick={() => paintSurfaceWithMaterial('room', selRoom.id, selectedMaterialId)}
+                      className="px-2 py-1 rounded border border-violet-500 text-violet-600 dark:text-violet-300 text-[10.5px] font-medium hover:bg-violet-500/15 disabled:opacity-40 cursor-pointer"
+                    >
+                      Room Floor
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isReadOnly}
+                      onClick={() => paintSurfaceWithMaterial('room-walls', selRoom.id, selectedMaterialId)}
+                      className="px-2 py-1 rounded border border-violet-500 text-violet-600 dark:text-violet-300 text-[10.5px] font-medium hover:bg-violet-500/15 disabled:opacity-40 cursor-pointer"
+                    >
+                      Room Walls
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isReadOnly}
+                      onClick={() => paintSurfaceWithMaterial('room-ceiling', selRoom.id, selectedMaterialId)}
+                      className="px-2 py-1 rounded border border-violet-500/60 text-violet-600 dark:text-violet-300 text-[10.5px] font-medium hover:bg-violet-500/15 disabled:opacity-40 cursor-pointer"
+                    >
+                      Room Ceiling
+                    </button>
+                  </>
+                )}
+                {selWall && (
+                  <button
+                    type="button"
+                    disabled={isReadOnly}
+                    onClick={() => paintSurfaceWithMaterial('wall', selWall.id, selectedMaterialId)}
+                    className="px-2 py-1 rounded border border-violet-500 text-violet-600 dark:text-violet-300 text-[10.5px] font-medium hover:bg-violet-500/15 disabled:opacity-40 cursor-pointer"
+                  >
+                    Apply to Selected Wall
+                  </button>
+                )}
+                {selAsset && (
+                  <button
+                    type="button"
+                    disabled={isReadOnly}
+                    onClick={() => paintSurfaceWithMaterial('asset', selAsset.id, selectedMaterialId)}
+                    className="px-2 py-1 rounded border border-violet-500 text-violet-600 dark:text-violet-300 text-[10.5px] font-medium hover:bg-violet-500/15 disabled:opacity-40 cursor-pointer"
+                  >
+                    Apply to Selected Equipment
+                  </button>
+                )}
+              </div>
+
+              {/* Live PBR Material Tuner */}
+              {selectedMatDef && (
+                <fieldset disabled={isReadOnly} className="p-2 rounded-lg bg-zinc-50 dark:bg-[#14141A] border border-zinc-200 dark:border-zinc-800 space-y-1.5 disabled:opacity-75">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-[11px] truncate">{selectedMatDef.name}</span>
+                    <input
+                      type="color"
+                      value={selectedMatDef.baseColor}
+                      onChange={(e) => updateMaterial(selectedMatDef.id, { baseColor: e.target.value })}
+                      className="w-6 h-5 rounded border-0 bg-transparent cursor-pointer"
+                      title="Base Color"
+                    />
                   </div>
-                </div>
-              );
-            })}
+                  <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] font-mono tabular-nums">
+                    <label className="space-y-0.5">
+                      <div className="flex justify-between text-zinc-400">
+                        <span>Rough</span>
+                        <span>{selectedMatDef.roughness.toFixed(2)}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.02}
+                        value={selectedMatDef.roughness}
+                        onChange={(e) => updateMaterial(selectedMatDef.id, { roughness: Number(e.target.value) })}
+                        className="w-full accent-violet-600"
+                      />
+                    </label>
+                    <label className="space-y-0.5">
+                      <div className="flex justify-between text-zinc-400">
+                        <span>Metal</span>
+                        <span>{selectedMatDef.metalness.toFixed(2)}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.02}
+                        value={selectedMatDef.metalness}
+                        onChange={(e) => updateMaterial(selectedMatDef.id, { metalness: Number(e.target.value) })}
+                        className="w-full accent-violet-600"
+                      />
+                    </label>
+                    <label className="space-y-0.5">
+                      <div className="flex justify-between text-zinc-400">
+                        <span>UV Scale</span>
+                        <span>{selectedMatDef.uvScale.toFixed(1)}×</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0.5}
+                        max={8}
+                        step={0.5}
+                        value={selectedMatDef.uvScale}
+                        onChange={(e) => updateMaterial(selectedMatDef.id, { uvScale: Number(e.target.value) })}
+                        className="w-full accent-violet-600"
+                      />
+                    </label>
+                    <label className="space-y-0.5">
+                      <div className="flex justify-between text-zinc-400">
+                        <span>Opacity</span>
+                        <span>{Math.round(selectedMatDef.opacity * 100)}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0.15}
+                        max={1}
+                        step={0.05}
+                        value={selectedMatDef.opacity}
+                        onChange={(e) => updateMaterial(selectedMatDef.id, { opacity: Number(e.target.value) })}
+                        className="w-full accent-violet-600"
+                      />
+                    </label>
+                  </div>
+                </fieldset>
+              )}
+
+              {/* Category Filter */}
+              <div className="flex items-center gap-1 flex-wrap">
+                {matCategories.map((cat) => (
+                  <button
+                    key={cat}
+                    type="button"
+                    onClick={() => setMatCategoryFilter(cat)}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-medium cursor-pointer ${
+                      matCategoryFilter === cat
+                        ? 'bg-violet-600 text-white'
+                        : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'
+                    }`}
+                  >
+                    {cat}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-2.5 grid grid-cols-2 gap-2 content-start">
+              {visibleMats.map((mat) => {
+                const active = selectedMaterialId === mat.id;
+                return (
+                  <div
+                    key={mat.id}
+                    draggable
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData('application/x-gradian-material', mat.id);
+                      setSelectedMaterialId(mat.id);
+                    }}
+                    onClick={() => setSelectedMaterialId(mat.id)}
+                    className={`p-2 rounded-lg border cursor-pointer transition-colors ${
+                      active ? 'border-violet-500 bg-violet-500/5' : 'border-slate-200 dark:border-zinc-800 hover:border-slate-400'
+                    }`}
+                  >
+                    <div
+                      className="h-10 rounded-md border border-black/10 mb-1.5 bg-cover bg-center"
+                      style={{
+                        backgroundColor: mat.baseColor,
+                        opacity: Math.max(0.45, mat.opacity),
+                        backgroundImage: mat.customTextureDataUrl ? `url(${mat.customTextureDataUrl})` : undefined,
+                      }}
+                    />
+                    <div className="text-[11px] font-medium truncate">{mat.name}</div>
+                    <div className="text-[10px] font-mono text-slate-400 tabular-nums">
+                      R:{mat.roughness.toFixed(2)} M:{mat.metalness.toFixed(2)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* TAB 3: CAMERAS & VIEWPOINTS */}
       {rightTab === 'cameras' && (

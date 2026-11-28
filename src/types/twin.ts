@@ -245,6 +245,7 @@ export interface Room {
   width: number;
   depth: number;
   height: number;
+  polygon?: { x: number; z: number }[];
   color: string;
   floorMaterialId: string;
   wallMaterialId: string;

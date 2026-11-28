@@ -1,5 +1,32 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, Box, CheckCircle2, Eye, EyeOff, Focus, Hand, Info, Lock, Moon, Pause, Play, Route, Server, ShieldAlert, ShieldCheck, Sun, Waypoints, Wind, X } from 'lucide-react';
+import {
+  AlertTriangle,
+  AlignHorizontalJustifyCenter,
+  Box,
+  CheckCircle2,
+  DoorOpen,
+  Eye,
+  EyeOff,
+  FlipHorizontal2,
+  Focus,
+  Grid3X3,
+  Hand,
+  Info,
+  Lock,
+  Moon,
+  Pause,
+  Play,
+  Route,
+  Server,
+  ShieldAlert,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sun,
+  Trash2,
+  Waypoints,
+  Wind,
+  X,
+} from 'lucide-react';
 import { useTwinStore } from '../store/useTwinStore';
 import { useGmpStore } from '../store/useGmpStore';
 import { useAclStore, computeEffectivePermissions } from '../store/useAclStore';
@@ -15,6 +42,21 @@ import {
 import { computeFlowRoomSequence } from '../utils/flowAnalytics';
 import { computeSnappedPlacement, type PlacementSnapResult } from '../utils/placementSnap';
 import { OBJECT_LIBRARY } from '../data/objectLibrary';
+import { OPENING_PRESETS } from '../data/materialsLibrary';
+import type { OpeningSubtype } from '../types/twin';
+import {
+  detectEnclosedWallPolygons,
+  getRoomAreaSqm,
+  getRoomCentroid,
+} from '../utils/polygonSpaces';
+import {
+  OPENING_DND_MIME,
+  findOpeningDropZone,
+  getActiveDraggedOpeningSubtype,
+  setActiveDraggedOpeningSubtype,
+  type WallOpeningDropPreview,
+} from '../utils/openingPlacement';
+import { OpeningQuickBar } from './OpeningQuickBar';
 
 export const Viewport2D: React.FC = () => {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -47,16 +89,23 @@ export const Viewport2D: React.FC = () => {
   const addSmartRoomFromTemplate = useTwinStore((s) => s.addSmartRoomFromTemplate);
   const addWall = useTwinStore((s) => s.addWall);
   const addOpeningOnWall = useTwinStore((s) => s.addOpeningOnWall);
+  const updateOpening = useTwinStore((s) => s.updateOpening);
+  const deleteSelected = useTwinStore((s) => s.deleteSelected);
   const addAsset = useTwinStore((s) => s.addAsset);
   const updateAsset = useTwinStore((s) => s.updateAsset);
+  const updateRoom = useTwinStore((s) => s.updateRoom);
   const updateWall = useTwinStore((s) => s.updateWall);
   const updateFlowRoute = useTwinStore((s) => s.updateFlowRoute);
   const updateRoomHvac = useTwinStore((s) => s.updateRoomHvac);
+  const setRightTab = useTwinStore((s) => s.setRightTab);
+  const setRightPanelOpen = useTwinStore((s) => s.setRightPanelOpen);
+  const showToast = useTwinStore((s) => s.showToast);
   const addMeasurePoint = useTwinStore((s) => s.addMeasurePoint);
   const addCalibrationPoint = useTwinStore((s) => s.addCalibrationPoint);
   const paintSurfaceWithMaterial = useTwinStore((s) => s.paintSurfaceWithMaterial);
   const addFlowRoute = useTwinStore((s) => s.addFlowRoute);
   const addCamera = useTwinStore((s) => s.addCamera);
+  const cursorCoords = useTwinStore((s) => s.cursorCoords);
   const setActiveTool = useTwinStore((s) => s.setActiveTool);
   const setAnimateFlows = useTwinStore((s) => s.setAnimateFlows);
   const setShowFlows = useTwinStore((s) => s.setShowFlows);
@@ -89,9 +138,56 @@ export const Viewport2D: React.FC = () => {
 
   const selectedMaterialId = useTwinStore((s) => s.selectedMaterialId);
   const selectedObjectTemplateId = useTwinStore((s) => s.selectedObjectTemplateId);
+  const selectedOpeningSubtype = useTwinStore((s) => s.selectedOpeningSubtype);
   const selectedFlowType = useTwinStore((s) => s.selectedFlowType);
   const workspaceMode = useTwinStore((s) => s.workspaceMode);
   const categoryFilter = useTwinStore((s) => s.categoryFilter);
+  const wallChainAnchor = useTwinStore((s) => s.wallChainAnchor);
+  const setWallChainAnchor = useTwinStore((s) => s.setWallChainAnchor);
+  const pendingPolygonSpace = useTwinStore((s) => s.pendingPolygonSpace);
+  const setPendingPolygonSpace = useTwinStore((s) => s.setPendingPolygonSpace);
+  const [openingDropPreview, setOpeningDropPreview] = useState<WallOpeningDropPreview | null>(null);
+  const [openingHoverPt, setOpeningHoverPt] = useState<{ x: number; z: number } | null>(null);
+  const [draggingOpeningId, setDraggingOpeningId] = useState<string | null>(null);
+  const [hoveredOpeningId, setHoveredOpeningId] = useState<string | null>(null);
+  const [resizingOpening, setResizingOpening] = useState<{
+    id: string;
+    side: -1 | 1;
+  } | null>(null);
+  const [openingContextMenu, setOpeningContextMenu] = useState<{
+    openingId: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [dragOpeningSubtype, setDragOpeningSubtype] = useState<OpeningSubtype | null>(null);
+
+  const activeOpeningPreset = useMemo(() => {
+    if (dragOpeningSubtype) {
+      const dragged = OPENING_PRESETS.find((p) => p.subtype === dragOpeningSubtype);
+      if (dragged) return dragged;
+    }
+    const matched = OPENING_PRESETS.find((p) => p.subtype === selectedOpeningSubtype);
+    if (activeTool === 'place-window') {
+      return matched?.kind === 'window'
+        ? matched
+        : OPENING_PRESETS.find((p) => p.kind === 'window') ?? OPENING_PRESETS[0];
+    }
+    if (activeTool === 'place-door') {
+      return matched?.kind === 'door'
+        ? matched
+        : OPENING_PRESETS.find((p) => p.kind === 'door') ?? OPENING_PRESETS[0];
+    }
+    return matched ?? OPENING_PRESETS[0];
+  }, [dragOpeningSubtype, selectedOpeningSubtype, activeTool]);
+
+  useEffect(() => {
+    if (!openingContextMenu) return;
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') setOpeningContextMenu(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [openingContextMenu]);
 
   const aclUsers = useAclStore((s) => s.users);
   const aclRoles = useAclStore((s) => s.roles);
@@ -305,9 +401,30 @@ export const Viewport2D: React.FC = () => {
   const [draftStart, setDraftStart] = useState<{ x: number; z: number } | null>(null);
   const [draftCurrent, setDraftCurrent] = useState<{ x: number; z: number } | null>(null);
   const [flowDraftPoints, setFlowDraftPoints] = useState<{ x: number; z: number }[]>([]);
+
+  // Clear local wall/opening draft cursor state when tool changes or Escape stops chaining
+  useEffect(() => {
+    if (!wallChainAnchor && activeTool === 'draw-wall') {
+      setDraftStart(null);
+      setDraftCurrent(null);
+    }
+    if (activeTool !== 'place-door' && activeTool !== 'place-window') {
+      setOpeningDropPreview(null);
+      setOpeningHoverPt(null);
+    }
+  }, [wallChainAnchor, activeTool]);
   const [draggingAssetId, setDraggingAssetId] = useState<string | null>(null);
   const [draggingWallHandle, setDraggingWallHandle] = useState<{ wallId: string; end: 1 | 2 } | null>(null);
   const [draggingFlowNode, setDraggingFlowNode] = useState<{ flowId: string; idx: number } | null>(null);
+  const [draggingRoom, setDraggingRoom] = useState<{
+    roomId: string;
+    mode: 'move' | 'resize';
+    startPt: { x: number; z: number };
+    origX: number;
+    origZ: number;
+    origW: number;
+    origD: number;
+  } | null>(null);
 
   const isLayerVisible = (layerId: string) => {
     const l = scene.layers.find((x) => x.id === layerId);
@@ -325,6 +442,49 @@ export const Viewport2D: React.FC = () => {
       x: snapValue(rawX, snap.gridSize, snap.enabled && snap.snapToGrid),
       z: snapValue(rawZ, snap.gridSize, snap.enabled && snap.snapToGrid),
     };
+  };
+
+  // Snap wall points to nearby wall endpoints and angleStepDeg when enabled
+  const snapWallPoint = (
+    rawPt: { x: number; z: number },
+    anchor?: { x: number; z: number } | null,
+    excludeWallId?: string
+  ) => {
+    let x = rawPt.x;
+    let z = rawPt.z;
+    if (snap.enabled && snap.snapToWall) {
+      let bestDist = 0.65;
+      for (const w of scene.walls) {
+        if (w.floorId !== activeFloorId || w.id === excludeWallId) continue;
+        for (const ep of [
+          { x: w.x1, z: w.z1 },
+          { x: w.x2, z: w.z2 },
+        ]) {
+          const d = Math.hypot(ep.x - x, ep.z - z);
+          if (d < bestDist) {
+            bestDist = d;
+            x = ep.x;
+            z = ep.z;
+          }
+        }
+      }
+      if (bestDist < 0.65) {
+        return { x: Number(x.toFixed(3)), z: Number(z.toFixed(3)) };
+      }
+    }
+    if (anchor && snap.enabled && snap.angleStepDeg > 0) {
+      const dx = x - anchor.x;
+      const dz = z - anchor.z;
+      const len = Math.hypot(dx, dz);
+      if (len > 0.15) {
+        const stepRad = (snap.angleStepDeg * Math.PI) / 180;
+        const snappedAngle = Math.round(Math.atan2(dz, dx) / stepRad) * stepRad;
+        const snappedLen = snap.snapToGrid ? snapValue(len, snap.gridSize, true) : len;
+        x = anchor.x + Math.cos(snappedAngle) * snappedLen;
+        z = anchor.z + Math.sin(snappedAngle) * snappedLen;
+      }
+    }
+    return { x: Number(x.toFixed(3)), z: Number(z.toFixed(3)) };
   };
 
   const beginPan = (e: React.PointerEvent<SVGSVGElement>) => {
@@ -364,6 +524,14 @@ export const Viewport2D: React.FC = () => {
       return;
     }
 
+    // Right-click stops an active continuous wall chain cleanly (just like Escape)
+    if (e.button === 2 && !isReadOnly && activeTool === 'draw-wall' && wallChainAnchor) {
+      setWallChainAnchor(null);
+      setDraftStart(null);
+      setDraftCurrent(null);
+      return;
+    }
+
     // Middle click, Right click, Alt+drag, Space+drag, or Hand/Pan mode pans immediately from anywhere
     if (
       e.button === 1 ||
@@ -384,9 +552,52 @@ export const Viewport2D: React.FC = () => {
     }
 
     if (!isReadOnly) {
-      if (activeTool === 'draw-room' || activeTool === 'draw-wall') {
+      if (activeTool === 'draw-room') {
         setDraftStart(pt);
         setDraftCurrent(pt);
+        return;
+      }
+
+      if (activeTool === 'draw-wall') {
+        if (wallChainAnchor) {
+          const endPt = snapWallPoint(pt, wallChainAnchor);
+          const len = Math.hypot(endPt.x - wallChainAnchor.x, endPt.z - wallChainAnchor.z);
+          if (len >= 0.4) {
+            addWall(wallChainAnchor.x, wallChainAnchor.z, endPt.x, endPt.z);
+            setWallChainAnchor(endPt);
+            setDraftStart(null);
+            setDraftCurrent(endPt);
+          }
+        } else {
+          const startPt = snapWallPoint(pt, null);
+          setWallChainAnchor(startPt);
+          setDraftStart(startPt);
+          setDraftCurrent(startPt);
+        }
+        return;
+      }
+
+      if (activeTool === 'place-door' || activeTool === 'place-window') {
+        const drop = findOpeningDropZone(
+          pt.x,
+          pt.z,
+          scene.walls,
+          activeFloorId,
+          activeOpeningPreset,
+          snap,
+          1.8
+        );
+        if (drop) {
+          addOpeningOnWall(drop.wall.id, drop.offsetRatio, activeOpeningPreset.subtype);
+          setOpeningDropPreview(null);
+          setOpeningHoverPt(null);
+          setActiveTool('select');
+        } else {
+          showToast(
+            `${activeTool === 'place-window' ? 'Windows' : 'Doors'} must be placed on a wall or room perimeter — hover over a highlighted wall.`,
+            'warning'
+          );
+        }
         return;
       }
 
@@ -499,6 +710,23 @@ export const Viewport2D: React.FC = () => {
       setPlacePreview(null);
     }
 
+    if (!isReadOnly && (activeTool === 'place-door' || activeTool === 'place-window')) {
+      const drop = findOpeningDropZone(
+        pt.x,
+        pt.z,
+        scene.walls,
+        activeFloorId,
+        activeOpeningPreset,
+        snap,
+        1.8
+      );
+      setOpeningDropPreview(drop);
+      setOpeningHoverPt(pt);
+    } else if (openingDropPreview || openingHoverPt) {
+      setOpeningDropPreview(null);
+      setOpeningHoverPt(null);
+    }
+
     if (isPanning) {
       const dx = e.clientX - panOriginRef.current.mx;
       const dy = e.clientY - panOriginRef.current.my;
@@ -516,8 +744,34 @@ export const Viewport2D: React.FC = () => {
       return;
     }
 
+    if (!isReadOnly && activeTool === 'draw-wall' && wallChainAnchor) {
+      setDraftCurrent(snapWallPoint(pt, wallChainAnchor));
+      return;
+    }
+
     if (draftStart) {
-      setDraftCurrent(pt);
+      setDraftCurrent(activeTool === 'draw-wall' ? snapWallPoint(pt, draftStart) : pt);
+      return;
+    }
+
+    if (draggingRoom) {
+      const dx = pt.x - draggingRoom.startPt.x;
+      const dz = pt.z - draggingRoom.startPt.z;
+      if (draggingRoom.mode === 'move') {
+        const nx = snapValue(draggingRoom.origX + dx, snap.gridSize, snap.enabled && snap.snapToGrid);
+        const nz = snapValue(draggingRoom.origZ + dz, snap.gridSize, snap.enabled && snap.snapToGrid);
+        updateRoom(draggingRoom.roomId, { x: nx, z: nz });
+      } else {
+        const nw = Math.max(
+          1.5,
+          snapValue(draggingRoom.origW + dx, snap.gridSize, snap.enabled && snap.snapToGrid)
+        );
+        const nd = Math.max(
+          1.5,
+          snapValue(draggingRoom.origD + dz, snap.gridSize, snap.enabled && snap.snapToGrid)
+        );
+        updateRoom(draggingRoom.roomId, { width: nw, depth: nd });
+      }
       return;
     }
 
@@ -526,10 +780,60 @@ export const Viewport2D: React.FC = () => {
       return;
     }
 
+    if (resizingOpening) {
+      const op = scene.openings.find((o) => o.id === resizingOpening.id);
+      const hostWall = op ? scene.walls.find((w) => w.id === op.wallId) : null;
+      if (op && hostWall) {
+        const dx = hostWall.x2 - hostWall.x1;
+        const dz = hostWall.z2 - hostWall.z1;
+        const len = Math.hypot(dx, dz);
+        if (len > 0.7) {
+          const centerDist = op.offsetRatio * len;
+          const projDist = ((pt.x - hostWall.x1) * dx + (pt.z - hostWall.z1) * dz) / len;
+          const halfSpan = Math.abs(projDist - centerDist);
+          const rawWidth = Math.max(0.6, Math.min(len - 0.3, halfSpan * 2));
+          const snappedW = snap.enabled && snap.snapToGrid
+            ? Math.max(0.6, Number((Math.round(rawWidth / Math.min(0.25, snap.gridSize)) * Math.min(0.25, snap.gridSize)).toFixed(2)))
+            : Number(rawWidth.toFixed(2));
+          updateOpening(op.id, { width: snappedW });
+        }
+      }
+      return;
+    }
+
+    if (draggingOpeningId) {
+      const op = scene.openings.find((o) => o.id === draggingOpeningId);
+      const hostWall = op ? scene.walls.find((w) => w.id === op.wallId) : null;
+      if (op && hostWall) {
+        const dx = hostWall.x2 - hostWall.x1;
+        const dz = hostWall.z2 - hostWall.z1;
+        const lenSq = dx * dx + dz * dz;
+        if (lenSq > 0.04) {
+          const len = Math.sqrt(lenSq);
+          let distAlong = ((pt.x - hostWall.x1) * dx + (pt.z - hostWall.z1) * dz) / len;
+          if (snap.enabled && snap.snapToGrid) {
+            distAlong = snapValue(distAlong, snap.gridSize, true);
+          }
+          const clampedRatio = Math.max(0.05, Math.min(0.95, distAlong / len));
+          updateOpening(op.id, { offsetRatio: Number(clampedRatio.toFixed(3)) });
+        }
+      }
+      return;
+    }
+
     if (draggingWallHandle) {
+      const w = scene.walls.find((x) => x.id === draggingWallHandle.wallId);
+      const anchor = w
+        ? draggingWallHandle.end === 1
+          ? { x: w.x2, z: w.z2 }
+          : { x: w.x1, z: w.z1 }
+        : null;
+      const snappedEnd = snapWallPoint(pt, anchor, draggingWallHandle.wallId);
       updateWall(
         draggingWallHandle.wallId,
-        draggingWallHandle.end === 1 ? { x1: pt.x, z1: pt.z } : { x2: pt.x, z2: pt.z }
+        draggingWallHandle.end === 1
+          ? { x1: snappedEnd.x, z1: snappedEnd.z }
+          : { x2: snappedEnd.x, z2: snappedEnd.z }
       );
       return;
     }
@@ -584,14 +888,16 @@ export const Viewport2D: React.FC = () => {
           addRoom(rx, rz, rw, rd);
           setActiveTool('select');
         }
+        setDraftStart(null);
+        setDraftCurrent(null);
       } else if (activeTool === 'draw-wall') {
         const len = Math.hypot(draftCurrent.x - draftStart.x, draftCurrent.z - draftStart.z);
         if (len >= 0.4) {
           addWall(draftStart.x, draftStart.z, draftCurrent.x, draftCurrent.z);
+          setWallChainAnchor(draftCurrent);
         }
+        setDraftStart(null);
       }
-      setDraftStart(null);
-      setDraftCurrent(null);
     }
 
     if (draggingAssetId) {
@@ -602,8 +908,20 @@ export const Viewport2D: React.FC = () => {
       setDraggingAssetId(null);
     }
 
+    if (draggingRoom) {
+      setDraggingRoom(null);
+    }
+
     if (draggingWallHandle) {
       setDraggingWallHandle(null);
+    }
+
+    if (draggingOpeningId) {
+      setDraggingOpeningId(null);
+    }
+
+    if (resizingOpening) {
+      setResizingOpening(null);
     }
 
     if (draggingFlowNode) {
@@ -642,9 +960,66 @@ export const Viewport2D: React.FC = () => {
     setActiveTool('select');
   };
 
+  const handleDragOver = (e: React.DragEvent<SVGSVGElement>) => {
+    e.preventDefault();
+    if (isReadOnly) return;
+    const draggedSubtype =
+      getActiveDraggedOpeningSubtype() ??
+      (Array.from(e.dataTransfer.types).includes(OPENING_DND_MIME) ? selectedOpeningSubtype : null);
+    if (draggedSubtype) {
+      e.dataTransfer.dropEffect = 'copy';
+      if (dragOpeningSubtype !== draggedSubtype) {
+        setDragOpeningSubtype(draggedSubtype);
+      }
+      const preset =
+        OPENING_PRESETS.find((p) => p.subtype === draggedSubtype) ?? activeOpeningPreset;
+      const pt = screenToWorld(e.clientX, e.clientY);
+      const drop = findOpeningDropZone(pt.x, pt.z, scene.walls, activeFloorId, preset, snap, 2.2);
+      setOpeningDropPreview(drop);
+      setOpeningHoverPt(pt);
+    }
+  };
+
+  const handleDragLeave = (e: React.DragEvent<SVGSVGElement>) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+      if (dragOpeningSubtype) {
+        setDragOpeningSubtype(null);
+        setOpeningDropPreview(null);
+        setOpeningHoverPt(null);
+      }
+    }
+  };
+
   const handleDrop = (e: React.DragEvent<SVGSVGElement>) => {
     e.preventDefault();
     if (isReadOnly) return;
+
+    const openingSubtype = (e.dataTransfer.getData(OPENING_DND_MIME) ||
+      getActiveDraggedOpeningSubtype() ||
+      '') as OpeningSubtype | '';
+    if (openingSubtype) {
+      setDragOpeningSubtype(null);
+      setActiveDraggedOpeningSubtype(null);
+      setOpeningDropPreview(null);
+      setOpeningHoverPt(null);
+      const preset =
+        OPENING_PRESETS.find((p) => p.subtype === openingSubtype) ?? activeOpeningPreset;
+      const pt = screenToWorld(e.clientX, e.clientY);
+      const drop = findOpeningDropZone(pt.x, pt.z, scene.walls, activeFloorId, preset, snap, 2.2);
+      if (drop) {
+        addOpeningOnWall(drop.wall.id, drop.offsetRatio, preset.subtype);
+        setActiveTool('select');
+      } else {
+        showToast(
+          preset.kind === 'window'
+            ? 'Drop windows directly onto a highlighted wall segment.'
+            : 'Drop doors directly onto a highlighted wall segment.',
+          'warning'
+        );
+      }
+      return;
+    }
+
     const smartRoomId = e.dataTransfer.getData('application/x-gradian-smart-room');
     if (smartRoomId) {
       const pt = screenToWorld(e.clientX, e.clientY);
@@ -655,6 +1030,24 @@ export const Viewport2D: React.FC = () => {
     if (templateId) {
       const pt = screenToWorld(e.clientX, e.clientY);
       addAsset(templateId, pt.x, pt.z);
+      return;
+    }
+    const materialId = e.dataTransfer.getData('application/x-gradian-material');
+    if (materialId) {
+      const pt = screenToWorld(e.clientX, e.clientY);
+      const hitRoom = scene.rooms.find(
+        (r) =>
+          r.floorId === activeFloorId &&
+          pt.x >= r.x &&
+          pt.x <= r.x + r.width &&
+          pt.z >= r.z &&
+          pt.z <= r.z + r.depth
+      );
+      if (hitRoom) {
+        paintSurfaceWithMaterial('room', hitRoom.id, materialId);
+      } else if (activeFloor) {
+        paintSurfaceWithMaterial('floor', activeFloor.id, materialId);
+      }
     }
   };
 
@@ -685,6 +1078,10 @@ export const Viewport2D: React.FC = () => {
   const references = useMemo(
     () => scene.references.filter((r) => r.floorId === activeFloorId && r.visible),
     [scene.references, activeFloorId]
+  );
+  const detectedSpaces = useMemo(
+    () => detectEnclosedWallPolygons(walls, rooms, activeFloorId),
+    [walls, rooms, activeFloorId]
   );
 
   // Pre-compute Room FMEA summaries so panning/zooming never re-runs incident scans
@@ -791,12 +1188,16 @@ export const Viewport2D: React.FC = () => {
                 ? 'cursor-grab'
                 : 'cursor-crosshair'
         }`}
-        onPointerDown={handleSvgPointerDown}
+        onPointerDown={(e) => {
+          if (openingContextMenu) setOpeningContextMenu(null);
+          handleSvgPointerDown(e);
+        }}
         onPointerMove={handleSvgPointerMove}
         onPointerUp={handleSvgPointerUp}
         onPointerCancel={handleSvgPointerUp}
         onContextMenu={(e) => e.preventDefault()}
-        onDragOver={(e) => e.preventDefault()}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
         onDrop={handleDrop}
       >
         <defs>
@@ -918,12 +1319,17 @@ export const Viewport2D: React.FC = () => {
               </g>
             ))}
 
-          {/* Rooms */}
+          {/* Rooms (Rectangular & Enclosed Polygon Spaces) */}
           {isLayerVisible('layer-architecture') &&
             rooms.map((rm) => {
               const isSel = selectedSet.has(`room:${rm.id}`);
               const fillColor = getRoomColorForAnalytics(rm, analyticsMetric);
-              const area = rm.width * rm.depth;
+              const hasPoly = Boolean(rm.polygon && rm.polygon.length >= 3);
+              const polyPointsAttr = hasPoly
+                ? rm.polygon!.map((p) => `${p.x * zoom},${p.z * zoom}`).join(' ')
+                : '';
+              const area = getRoomAreaSqm(rm);
+              const centroid = getRoomCentroid(rm);
               const rw = rm.width * zoom;
               const rd = rm.depth * zoom;
               const rx = rm.x * zoom;
@@ -944,13 +1350,37 @@ export const Viewport2D: React.FC = () => {
                     : '#34D399'
                   : fillColor;
 
+              const roomFillOpacity =
+                isLineFailRoom || isLineOkRoom
+                  ? 0.28
+                  : isLineDimmed
+                    ? 0.04
+                    : analyticsMetric !== 'none'
+                      ? isDarkBg
+                        ? 0.3
+                        : 0.34
+                      : isDarkBg
+                        ? 0.085
+                        : 0.13;
+              const roomStroke = isLineFailRoom
+                ? '#EF4444'
+                : isLineOkRoom
+                  ? '#10B981'
+                  : isSel
+                    ? '#8B5CF6'
+                    : isDarkBg
+                      ? '#2F2F3D'
+                      : fillColor;
+              const roomStrokeOpacity = isSel || isLineFailRoom || isLineOkRoom ? 1 : isDarkBg ? 0.9 : 0.45;
+              const roomStrokeWidth = isLineFailRoom || isLineOkRoom ? 3 : isSel ? 2.5 : 1.1;
+
               return (
                 <g
                   key={rm.id}
                   opacity={isCatDimmed ? 0.16 : 1}
                   onPointerDown={(e) => {
-                    if (isHandMode || spacePressed || e.button !== 0 || e.altKey) {
-                      return; // Allow bubbling to SVG pan handler
+                    if (isHandMode || spacePressed || e.button !== 0 || e.altKey || activeTool === 'draw-wall') {
+                      return; // Allow bubbling to SVG pan / continuous wall chain handler
                     }
                     if (activeTool === 'paint-material' && !isReadOnly) {
                       e.stopPropagation();
@@ -960,72 +1390,129 @@ export const Viewport2D: React.FC = () => {
                       pendingRoomSelectRef.current = { roomId: rm.id, shiftKey: e.shiftKey };
                     }
                   }}
-                  className={isHandMode || spacePressed ? 'cursor-grab' : 'cursor-pointer'}
+                  className={
+                    activeTool === 'draw-wall'
+                      ? 'cursor-crosshair'
+                      : isHandMode || spacePressed
+                        ? 'cursor-grab'
+                        : 'cursor-pointer'
+                  }
                 >
-                  {/* Neutral Charcoal Base Plate in Dark Mode (prevents muddy navy tint) */}
-                  {isDarkBg && (
-                    <rect
-                      x={rx}
-                      y={rz}
-                      width={rw}
-                      height={rd}
-                      fill="#181822"
-                    />
+                  {hasPoly ? (
+                    <>
+                      {isDarkBg && <polygon points={polyPointsAttr} fill="#181822" />}
+                      <polygon
+                        points={polyPointsAttr}
+                        fill={roomBaseFill}
+                        fillOpacity={roomFillOpacity}
+                        stroke={roomStroke}
+                        strokeOpacity={roomStrokeOpacity}
+                        strokeWidth={roomStrokeWidth}
+                        strokeLinejoin="round"
+                      />
+                    </>
+                  ) : (
+                    <>
+                      {/* Neutral Charcoal Base Plate in Dark Mode (prevents muddy navy tint) */}
+                      {isDarkBg && (
+                        <rect
+                          x={rx}
+                          y={rz}
+                          width={rw}
+                          height={rd}
+                          fill="#181822"
+                        />
+                      )}
+                      <rect
+                        x={rx}
+                        y={rz}
+                        width={rw}
+                        height={rd}
+                        fill={roomBaseFill}
+                        fillOpacity={roomFillOpacity}
+                        stroke={roomStroke}
+                        strokeOpacity={roomStrokeOpacity}
+                        strokeWidth={roomStrokeWidth}
+                      />
+                      {/* Subtle Zone Color Top Accent Bar */}
+                      <rect
+                        x={rx + 1}
+                        y={rz + 1}
+                        width={Math.max(0, rw - 2)}
+                        height={Math.min(3.5, rd)}
+                        fill={
+                          isLineFailRoom
+                            ? '#EF4444'
+                            : isLineOkRoom
+                              ? '#10B981'
+                              : isSel
+                                ? '#8B5CF6'
+                                : fillColor
+                        }
+                        fillOpacity={isLineDimmed ? 0.2 : isDarkBg ? 0.78 : 0.7}
+                        pointerEvents="none"
+                      />
+                    </>
                   )}
-                  <rect
-                    x={rx}
-                    y={rz}
-                    width={rw}
-                    height={rd}
-                    fill={roomBaseFill}
-                    fillOpacity={
-                      isLineFailRoom || isLineOkRoom
-                        ? 0.28
-                        : isLineDimmed
-                          ? 0.04
-                          : analyticsMetric !== 'none'
-                            ? isDarkBg
-                              ? 0.3
-                              : 0.34
-                            : isDarkBg
-                              ? 0.085
-                              : 0.13
-                    }
-                    stroke={
-                      isLineFailRoom
-                        ? '#EF4444'
-                        : isLineOkRoom
-                          ? '#10B981'
-                          : isSel
-                            ? '#8B5CF6'
-                            : isDarkBg
-                              ? '#2F2F3D'
-                              : fillColor
-                    }
-                    strokeOpacity={isSel || isLineFailRoom || isLineOkRoom ? 1 : isDarkBg ? 0.9 : 0.45}
-                    strokeWidth={isLineFailRoom || isLineOkRoom ? 3 : isSel ? 2.5 : 1.1}
-                  />
-                  {/* Subtle Zone Color Top Accent Bar */}
-                  <rect
-                    x={rx + 1}
-                    y={rz + 1}
-                    width={Math.max(0, rw - 2)}
-                    height={Math.min(3.5, rd)}
-                    fill={
-                      isLineFailRoom
-                        ? '#EF4444'
-                        : isLineOkRoom
-                          ? '#10B981'
-                          : isSel
-                            ? '#8B5CF6'
-                            : fillColor
-                    }
-                    fillOpacity={isLineDimmed ? 0.2 : isDarkBg ? 0.78 : 0.7}
-                    pointerEvents="none"
-                  />
-                  {/* Readable Top-Anchored Room Label Badge (avoids colliding with center equipment) */}
+                  {/* Selected Room Move & Corner Resize Handles in Design Mode */}
+                  {isSel && !isReadOnly && activeTool === 'select' && !hasPoly && (
+                    <g>
+                      <rect
+                        x={rx + rw - 11}
+                        y={rz + rd - 11}
+                        width={11}
+                        height={11}
+                        rx={2}
+                        fill="#8B5CF6"
+                        stroke="#FFFFFF"
+                        strokeWidth={1.5}
+                        className="cursor-nwse-resize"
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          setDraggingRoom({
+                            roomId: rm.id,
+                            mode: 'resize',
+                            startPt: screenToWorld(e.clientX, e.clientY),
+                            origX: rm.x,
+                            origZ: rm.z,
+                            origW: rm.width,
+                            origD: rm.depth,
+                          });
+                        }}
+                      />
+                      <circle
+                        cx={rx + 10}
+                        cy={rz + rd - 10}
+                        r={5.5}
+                        fill="#10B981"
+                        stroke="#FFFFFF"
+                        strokeWidth={1.5}
+                        className="cursor-move"
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          setDraggingRoom({
+                            roomId: rm.id,
+                            mode: 'move',
+                            startPt: screenToWorld(e.clientX, e.clientY),
+                            origX: rm.x,
+                            origZ: rm.z,
+                            origW: rm.width,
+                            origD: rm.depth,
+                          });
+                        }}
+                      />
+                    </g>
+                  )}
+                  {/* Readable Room Label Badge (centroid for polygon rooms, top-left for rectangular rooms) */}
                   {zoom >= 12 && rw >= 68 && rd >= 42 && (
-                    <g pointerEvents="none" transform={`translate(${rx + 6}, ${rz + 7})`}>
+                    <g
+                      pointerEvents="none"
+                      transform={
+                        hasPoly
+                          ? `translate(${centroid.x * zoom - pillW / 2}, ${centroid.z * zoom - 15})`
+                          : `translate(${rx + 6}, ${rz + 7})`
+                      }
+                    >
                       <rect
                         x={0}
                         y={0}
@@ -1089,6 +1576,67 @@ export const Viewport2D: React.FC = () => {
                       </g>
                     );
                   })()}
+                </g>
+              );
+            })}
+
+          {/* Auto-Detected Unnamed Enclosed Polygon Spaces */}
+          {isLayerVisible('layer-architecture') &&
+            detectedSpaces.map((sp) => {
+              const ptsAttr = sp.polygon.map((p) => `${p.x * zoom},${p.z * zoom}`).join(' ');
+              const isPending = pendingPolygonSpace?.id === sp.id;
+              const cx = sp.centroid.x * zoom;
+              const cy = sp.centroid.z * zoom;
+              const badgeText = `${formatArea(sp.areaSqm, scene.unitSystem)} · Name Area`;
+              const badgeW = Math.max(98, badgeText.length * 6.2 + 16);
+              return (
+                <g
+                  key={sp.id}
+                  pointerEvents={activeTool === 'draw-wall' ? 'none' : 'auto'}
+                  className={activeTool === 'draw-wall' ? undefined : 'cursor-pointer'}
+                  onPointerDown={(e) => {
+                    if (activeTool === 'draw-wall' || isReadOnly || e.button !== 0 || isHandMode || spacePressed) return;
+                    e.stopPropagation();
+                    setPendingPolygonSpace(sp);
+                  }}
+                >
+                  <polygon
+                    points={ptsAttr}
+                    fill="#10B981"
+                    fillOpacity={isPending ? 0.26 : isDarkBg ? 0.12 : 0.14}
+                    stroke="#10B981"
+                    strokeWidth={isPending ? 2.4 : 1.6}
+                    strokeDasharray="6 4"
+                    strokeLinejoin="round"
+                  />
+                  {zoom >= 10 && (
+                    <g transform={`translate(${cx - badgeW / 2}, ${cy - 11})`}>
+                      <rect
+                        x={0}
+                        y={0}
+                        width={badgeW}
+                        height={22}
+                        rx={6}
+                        fill={isPending ? '#059669' : isDarkBg ? '#0F1A17' : '#ECFDF5'}
+                        stroke="#10B981"
+                        strokeWidth={1.1}
+                      />
+                      <text
+                        x={badgeW / 2}
+                        y={14}
+                        textAnchor="middle"
+                        className={`font-mono text-[9.5px] font-semibold ${
+                          isPending
+                            ? 'fill-white'
+                            : isDarkBg
+                              ? 'fill-emerald-300'
+                              : 'fill-emerald-800'
+                        }`}
+                      >
+                        {badgeText}
+                      </text>
+                    </g>
+                  )}
                 </g>
               );
             })}
@@ -1162,38 +1710,104 @@ export const Viewport2D: React.FC = () => {
             walls.map((w) => {
               const isSel = selectedSet.has(`wall:${w.id}`);
               const isGlassWall = w.presetId === 'full-glass-wall' || w.presetId === 'glass-partition';
+              const wallLen = Math.hypot(w.x2 - w.x1, w.z2 - w.z1);
+              const isOpeningTool =
+                !isReadOnly &&
+                (activeTool === 'place-door' ||
+                  activeTool === 'place-window' ||
+                  Boolean(dragOpeningSubtype));
+              const isDropTargetWall = isOpeningTool && openingDropPreview?.wall.id === w.id;
+              const isEligibleDropWall = isOpeningTool && wallLen >= 0.7;
+              const dropAccent =
+                activeOpeningPreset.kind === 'window' ? '#38BDF8' : '#F59E0B';
+              const markerRatios = wallLen >= 6 ? [0.25, 0.5, 0.75] : [0.5];
               return (
                 <g key={w.id}>
+                  {/* Glowing Wall Drop-Zone Corridor & Target Markers when placing/dragging a Door or Window */}
+                  {isEligibleDropWall && (
+                    <g pointerEvents="none">
+                      <line
+                        x1={w.x1 * zoom}
+                        y1={w.z1 * zoom}
+                        x2={w.x2 * zoom}
+                        y2={w.z2 * zoom}
+                        stroke={isDropTargetWall ? '#10B981' : dropAccent}
+                        strokeWidth={Math.max(14, w.thickness * zoom + 12)}
+                        strokeOpacity={isDropTargetWall ? 0.38 : 0.16}
+                        strokeLinecap="round"
+                      />
+                      <line
+                        x1={w.x1 * zoom}
+                        y1={w.z1 * zoom}
+                        x2={w.x2 * zoom}
+                        y2={w.z2 * zoom}
+                        stroke={isDropTargetWall ? '#34D399' : dropAccent}
+                        strokeWidth={1.6}
+                        strokeOpacity={isDropTargetWall ? 0.9 : 0.55}
+                        strokeDasharray="6 4"
+                      />
+                      {!isDropTargetWall &&
+                        markerRatios.map((r) => {
+                          const mx = (w.x1 + (w.x2 - w.x1) * r) * zoom;
+                          const mz = (w.z1 + (w.z2 - w.z1) * r) * zoom;
+                          return (
+                            <g key={r} transform={`translate(${mx}, ${mz})`}>
+                              <circle
+                                r={5.5}
+                                fill={isDarkBg ? '#0F172A' : '#FFFFFF'}
+                                stroke={dropAccent}
+                                strokeWidth={1.6}
+                              />
+                              <circle r={2} fill={dropAccent} />
+                            </g>
+                          );
+                        })}
+                    </g>
+                  )}
                   <line
                     x1={w.x1 * zoom}
                     y1={w.z1 * zoom}
                     x2={w.x2 * zoom}
                     y2={w.z2 * zoom}
                     stroke={
-                      isSel
-                        ? '#8B5CF6'
-                        : isGlassWall
-                          ? '#38BDF8'
-                          : isDarkBg
-                            ? '#D4D4DE'
-                            : '#27272A'
+                      isDropTargetWall
+                        ? '#10B981'
+                        : isSel
+                          ? '#8B5CF6'
+                          : isGlassWall
+                            ? '#38BDF8'
+                            : isDarkBg
+                              ? '#D4D4DE'
+                              : '#27272A'
                     }
                     strokeWidth={Math.max(3, w.thickness * zoom)}
                     strokeOpacity={isGlassWall && !isSel ? 0.78 : 1}
                     strokeDasharray={w.presetId === 'full-glass-wall' ? '8 2' : undefined}
                     strokeLinecap="square"
-                    className="cursor-pointer"
+                    className={activeTool === 'draw-wall' || isOpeningTool ? 'cursor-crosshair' : 'cursor-pointer'}
                     onPointerDown={(e) => {
+                      if (activeTool === 'draw-wall' || isHandMode || spacePressed || e.altKey || e.button !== 0) {
+                        return; // Let click bubble to SVG wall chaining / pan handler so users can snap onto walls & close loops
+                      }
                       e.stopPropagation();
-                      if (!isReadOnly && (activeTool === 'place-door' || activeTool === 'place-window')) {
+                      if (isOpeningTool) {
                         const clickPt = screenToWorld(e.clientX, e.clientY);
-                        const len = Math.hypot(w.x2 - w.x1, w.z2 - w.z1);
-                        const t =
-                          len > 0
-                            ? ((clickPt.x - w.x1) * (w.x2 - w.x1) + (clickPt.z - w.z1) * (w.z2 - w.z1)) / (len * len)
-                            : 0.5;
-                        addOpeningOnWall(w.id, t);
-                        setActiveTool('select');
+                        const drop = findOpeningDropZone(
+                          clickPt.x,
+                          clickPt.z,
+                          scene.walls,
+                          activeFloorId,
+                          activeOpeningPreset,
+                          snap,
+                          2.2,
+                          w.id
+                        );
+                        if (drop) {
+                          addOpeningOnWall(drop.wall.id, drop.offsetRatio, activeOpeningPreset.subtype);
+                          setOpeningDropPreview(null);
+                          setOpeningHoverPt(null);
+                          setActiveTool('select');
+                        }
                       } else if (!isReadOnly && activeTool === 'paint-material') {
                         paintSurfaceWithMaterial('wall', w.id, selectedMaterialId);
                       } else if (activeTool === 'select' || isReadOnly) {
@@ -1236,70 +1850,383 @@ export const Viewport2D: React.FC = () => {
               );
             })}
 
-          {/* Doors & Windows */}
+          {/* Doors & Windows (Interactive: Hover Highlight, Select, Slide Along Wall, Resize Handles, Right-Click Context Menu) */}
           {isLayerVisible('layer-openings') &&
             openings.map((op) => {
               const wall = walls.find((w) => w.id === op.wallId);
               if (!wall) return null;
+              const wallLen = Math.hypot(wall.x2 - wall.x1, wall.z2 - wall.z1);
               const angleRad = Math.atan2(wall.z2 - wall.z1, wall.x2 - wall.x1);
               const angleDeg = (angleRad * 180) / Math.PI;
               const cx = (wall.x1 + (wall.x2 - wall.x1) * op.offsetRatio) * zoom;
               const cy = (wall.z1 + (wall.z2 - wall.z1) * op.offsetRatio) * zoom;
               const isSel = selectedSet.has(`opening:${op.id}`);
+              const isHovered = hoveredOpeningId === op.id;
+              const isDraggingThis = draggingOpeningId === op.id || resizingOpening?.id === op.id;
               const ow = op.width * zoom;
+              const swingFlip = op.swingDirection === 'left' ? -1 : 1;
+              const hoverStroke = op.kind === 'window' ? '#38BDF8' : '#A78BFA';
+              const leftClearM = Math.max(0, op.offsetRatio * wallLen - op.width / 2);
+              const rightClearM = Math.max(0, (1 - op.offsetRatio) * wallLen - op.width / 2);
 
               return (
-                <g
-                  key={op.id}
-                  transform={`translate(${cx}, ${cy}) rotate(${angleDeg})`}
-                  className="cursor-pointer"
-                  onPointerDown={(e) => {
-                    e.stopPropagation();
-                    selectEntity({ type: 'opening', id: op.id }, e.shiftKey);
-                  }}
-                >
-                  {/* Cut wall gap (matches charcoal slab in dark mode, white in light mode) */}
-                  <rect
-                    x={-ow / 2}
-                    y={-4.5}
-                    width={ow}
-                    height={9}
-                    fill={isDarkBg ? '#181822' : '#FFFFFF'}
-                  />
-                  {op.kind === 'window' ? (
+                <g key={op.id}>
+                  <g
+                    transform={`translate(${cx}, ${cy}) rotate(${angleDeg})`}
+                    className={
+                      isDraggingThis
+                        ? 'cursor-grabbing'
+                        : isSel && !isReadOnly
+                          ? 'cursor-grab'
+                          : 'cursor-pointer'
+                    }
+                    onPointerEnter={() => setHoveredOpeningId(op.id)}
+                    onPointerLeave={() =>
+                      setHoveredOpeningId((cur) => (cur === op.id ? null : cur))
+                    }
+                    onPointerDown={(e) => {
+                      if (
+                        activeTool === 'draw-wall' ||
+                        activeTool === 'place-door' ||
+                        activeTool === 'place-window' ||
+                        isHandMode ||
+                        spacePressed ||
+                        e.altKey ||
+                        e.button !== 0
+                      ) {
+                        return;
+                      }
+                      e.stopPropagation();
+                      setOpeningContextMenu(null);
+                      selectEntity({ type: 'opening', id: op.id }, e.shiftKey);
+                      setRightTab('properties');
+                      setRightPanelOpen(true);
+                      if (!isReadOnly && activeTool === 'select') {
+                        setDraggingOpeningId(op.id);
+                      }
+                    }}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      selectEntity({ type: 'opening', id: op.id });
+                      const rect = containerRef.current?.getBoundingClientRect();
+                      const rawX = rect ? e.clientX - rect.left : e.clientX;
+                      const rawY = rect ? e.clientY - rect.top : e.clientY;
+                      const maxW = rect ? rect.width - 280 : rawX;
+                      const maxH = rect ? rect.height - 340 : rawY;
+                      setOpeningContextMenu({
+                        openingId: op.id,
+                        x: Math.max(12, Math.min(maxW, rawX)),
+                        y: Math.max(12, Math.min(maxH, rawY)),
+                      });
+                    }}
+                  >
+                    {/* Generous transparent hit target for effortless clicking & hovering */}
+                    <rect x={-ow / 2 - 8} y={-15} width={ow + 16} height={30} fill="transparent" />
+
+                    {/* Hover Highlight Halo */}
+                    {isHovered && !isSel && (
+                      <rect
+                        x={-ow / 2 - 5}
+                        y={-9.5}
+                        width={ow + 10}
+                        height={19}
+                        rx={4}
+                        fill={hoverStroke}
+                        fillOpacity={0.18}
+                        stroke={hoverStroke}
+                        strokeWidth={1.6}
+                      />
+                    )}
+
+                    {/* Selection Highlight Ring */}
+                    {isSel && (
+                      <rect
+                        x={-ow / 2 - 5}
+                        y={-9.5}
+                        width={ow + 10}
+                        height={19}
+                        rx={4}
+                        fill="#8B5CF6"
+                        fillOpacity={0.22}
+                        stroke="#8B5CF6"
+                        strokeWidth={1.8}
+                        strokeDasharray="4 2"
+                      />
+                    )}
+
+                    {/* Cut wall gap */}
                     <rect
                       x={-ow / 2}
-                      y={-2.5}
+                      y={-4.5}
                       width={ow}
-                      height={5}
-                      fill="#38BDF8"
-                      fillOpacity={0.7}
-                      stroke={isSel ? '#8B5CF6' : '#0284C7'}
-                      strokeWidth={1.5}
+                      height={9}
+                      fill={isDarkBg ? '#181822' : '#FFFFFF'}
                     />
-                  ) : (
-                    <>
-                      <line
-                        x1={-ow / 2}
-                        y1={0}
-                        x2={-ow / 2}
-                        y2={ow * 0.85}
-                        stroke={isSel ? '#8B5CF6' : isDarkBg ? '#F59E0B' : '#7C3AED'}
-                        strokeWidth={2}
-                      />
-                      <path
-                        d={`M ${-ow / 2} ${ow * 0.85} A ${ow * 0.85} ${ow * 0.85} 0 0 0 ${ow / 2} 0`}
-                        fill="none"
-                        stroke={isSel ? '#8B5CF6' : isDarkBg ? '#F59E0B' : '#7C3AED'}
-                        strokeOpacity={0.85}
-                        strokeWidth={1.2}
-                        strokeDasharray="3 2"
-                      />
-                    </>
-                  )}
+
+                    {op.kind === 'window' ? (
+                      <>
+                        <rect
+                          x={-ow / 2}
+                          y={-3.2}
+                          width={ow}
+                          height={6.4}
+                          fill="#38BDF8"
+                          fillOpacity={isSel || isHovered ? 0.92 : 0.78}
+                          stroke={isSel ? '#8B5CF6' : isHovered ? '#7DD3FC' : '#0284C7'}
+                          strokeWidth={isSel || isHovered ? 2 : 1.5}
+                        />
+                        <line
+                          x1={-ow / 2 + 2}
+                          y1={0}
+                          x2={ow / 2 - 2}
+                          y2={0}
+                          stroke="#E0F2FE"
+                          strokeWidth={1}
+                          strokeOpacity={0.9}
+                        />
+                      </>
+                    ) : (
+                      <>
+                        <line
+                          x1={-ow / 2}
+                          y1={0}
+                          x2={-ow / 2}
+                          y2={swingFlip * ow * 0.85}
+                          stroke={
+                            isSel
+                              ? '#8B5CF6'
+                              : isHovered
+                                ? '#C4B5FD'
+                                : isDarkBg
+                                  ? '#F59E0B'
+                                  : '#7C3AED'
+                          }
+                          strokeWidth={isSel || isHovered ? 2.6 : 2}
+                        />
+                        <path
+                          d={`M ${-ow / 2} ${swingFlip * ow * 0.85} A ${ow * 0.85} ${ow * 0.85} 0 0 ${swingFlip > 0 ? 0 : 1} ${ow / 2} 0`}
+                          fill={isHovered || isSel ? '#8B5CF6' : 'none'}
+                          fillOpacity={isHovered || isSel ? 0.1 : 0}
+                          stroke={
+                            isSel
+                              ? '#8B5CF6'
+                              : isHovered
+                                ? '#C4B5FD'
+                                : isDarkBg
+                                  ? '#F59E0B'
+                                  : '#7C3AED'
+                          }
+                          strokeOpacity={0.88}
+                          strokeWidth={isSel || isHovered ? 1.6 : 1.2}
+                          strokeDasharray="3 2"
+                        />
+                      </>
+                    )}
+
+                    {/* Selected Opening Slide & Endpoint Width Resize Handles */}
+                    {isSel && !isReadOnly && (
+                      <>
+                        <circle
+                          cx={0}
+                          cy={0}
+                          r={4.2}
+                          fill="#8B5CF6"
+                          stroke="#FFFFFF"
+                          strokeWidth={1.4}
+                        />
+                        {([-1, 1] as const).map((side) => (
+                          <rect
+                            key={side}
+                            x={side * (ow / 2) - 3.5}
+                            y={-6.5}
+                            width={7}
+                            height={13}
+                            rx={2}
+                            fill="#FFFFFF"
+                            stroke="#7C3AED"
+                            strokeWidth={1.6}
+                            className="cursor-ew-resize"
+                            onPointerDown={(ev) => {
+                              if (ev.button !== 0) return;
+                              ev.stopPropagation();
+                              setOpeningContextMenu(null);
+                              setResizingOpening({ id: op.id, side });
+                            }}
+                          />
+                        ))}
+                      </>
+                    )}
+                  </g>
+
+                  {/* Floating Hover / Live Drag Dimension Callout */}
+                  {(isHovered || isDraggingThis) && !openingContextMenu && (() => {
+                    const labelText = isDraggingThis
+                      ? `← ${leftClearM.toFixed(1)}m | ${op.width.toFixed(2)}m (${Math.round(op.offsetRatio * 100)}%) | ${rightClearM.toFixed(1)}m →`
+                      : `${op.name} · ${op.width.toFixed(2)}×${op.height.toFixed(2)}m · Right-click`;
+                    const boxW = Math.max(138, labelText.length * 5.6 + 16);
+                    return (
+                      <g pointerEvents="none" transform={`translate(${cx - boxW / 2}, ${cy - 30})`}>
+                        <rect
+                          x={0}
+                          y={0}
+                          width={boxW}
+                          height={20}
+                          rx={5}
+                          fill={isDraggingThis ? '#4C1D95' : isDarkBg ? '#14141D' : '#18181B'}
+                          fillOpacity={0.94}
+                          stroke={isDraggingThis ? '#A78BFA' : hoverStroke}
+                          strokeWidth={1}
+                        />
+                        <text
+                          x={boxW / 2}
+                          y={13}
+                          textAnchor="middle"
+                          className="font-mono text-[9px] font-semibold fill-white"
+                        >
+                          {labelText}
+                        </text>
+                      </g>
+                    );
+                  })()}
                 </g>
               );
             })}
+
+          {/* Live 2D Door / Window Wall Drop-Zone Preview Ghost (Active for both Tool Click & Drag-and-Drop) */}
+          {!isReadOnly &&
+            (activeTool === 'place-door' ||
+              activeTool === 'place-window' ||
+              Boolean(dragOpeningSubtype)) &&
+            openingDropPreview &&
+            (() => {
+              const angleDeg = (openingDropPreview.angleRad * 180) / Math.PI;
+              const cx = openingDropPreview.worldX * zoom;
+              const cy = openingDropPreview.worldZ * zoom;
+              const ow = openingDropPreview.width * zoom;
+              const isWin = activeOpeningPreset.kind === 'window';
+              const isDraggingDnd = Boolean(dragOpeningSubtype);
+              const leftDist = Math.max(
+                0,
+                openingDropPreview.distFromStart - openingDropPreview.width / 2
+              );
+              const rightDist = Math.max(
+                0,
+                openingDropPreview.wallLength -
+                  openingDropPreview.distFromStart -
+                  openingDropPreview.width / 2
+              );
+              const badgeLabel = `${isWin ? 'Window' : 'Door'} · ${openingDropPreview.width.toFixed(1)}×${openingDropPreview.height.toFixed(1)}m · ${Math.round(openingDropPreview.offsetRatio * 100)}%${isDraggingDnd ? ' · Drop to place' : ''}`;
+              const badgeW = Math.max(132, badgeLabel.length * 6.0 + 16);
+              const wx1 = openingDropPreview.wall.x1 * zoom;
+              const wy1 = openingDropPreview.wall.z1 * zoom;
+              const wx2 = openingDropPreview.wall.x2 * zoom;
+              const wy2 = openingDropPreview.wall.z2 * zoom;
+              const cosA = Math.cos(openingDropPreview.angleRad);
+              const sinA = Math.sin(openingDropPreview.angleRad);
+              const edgeLx = cx - cosA * (ow / 2);
+              const edgeLy = cy - sinA * (ow / 2);
+              const edgeRx = cx + cosA * (ow / 2);
+              const edgeRy = cy + sinA * (ow / 2);
+              const midLx = (wx1 + edgeLx) / 2;
+              const midLy = (wy1 + edgeLy) / 2;
+              const midRx = (wx2 + edgeRx) / 2;
+              const midRy = (wy2 + edgeRy) / 2;
+
+              return (
+                <g pointerEvents="none">
+                  {/* Live Wall Endpoint Clearance Labels */}
+                  {leftDist >= 0.25 && (
+                    <g transform={`translate(${midLx - 18}, ${midLy - 16})`}>
+                      <rect x={0} y={0} width={36} height={14} rx={3} fill="#064E3B" fillOpacity={0.92} />
+                      <text x={18} y={10} textAnchor="middle" className="font-mono text-[8.5px] font-semibold fill-emerald-200">
+                        {leftDist.toFixed(1)}m
+                      </text>
+                    </g>
+                  )}
+                  {rightDist >= 0.25 && (
+                    <g transform={`translate(${midRx - 18}, ${midRy - 16})`}>
+                      <rect x={0} y={0} width={36} height={14} rx={3} fill="#064E3B" fillOpacity={0.92} />
+                      <text x={18} y={10} textAnchor="middle" className="font-mono text-[8.5px] font-semibold fill-emerald-200">
+                        {rightDist.toFixed(1)}m
+                      </text>
+                    </g>
+                  )}
+
+                  {/* Architectural Opening Ghost Preview */}
+                  <g transform={`translate(${cx}, ${cy}) rotate(${angleDeg})`}>
+                    <rect
+                      x={-ow / 2 - 5}
+                      y={-10}
+                      width={ow + 10}
+                      height={20}
+                      rx={4}
+                      fill="#10B981"
+                      fillOpacity={0.28}
+                      stroke="#10B981"
+                      strokeWidth={2}
+                    />
+                    {/* Drop-zone edge anchor brackets */}
+                    <line x1={-ow / 2} y1={-12} x2={-ow / 2} y2={12} stroke="#34D399" strokeWidth={1.6} />
+                    <line x1={ow / 2} y1={-12} x2={ow / 2} y2={12} stroke="#34D399" strokeWidth={1.6} />
+                    {isWin ? (
+                      <>
+                        <rect
+                          x={-ow / 2}
+                          y={-3.5}
+                          width={ow}
+                          height={7}
+                          fill="#38BDF8"
+                          fillOpacity={0.92}
+                          stroke="#FFFFFF"
+                          strokeWidth={1.2}
+                        />
+                        <line x1={-ow / 2 + 2} y1={0} x2={ow / 2 - 2} y2={0} stroke="#FFFFFF" strokeWidth={1} />
+                      </>
+                    ) : (
+                      <>
+                        <line x1={-ow / 2} y1={0} x2={-ow / 2} y2={ow * 0.85} stroke="#10B981" strokeWidth={2.5} />
+                        <path
+                          d={`M ${-ow / 2} ${ow * 0.85} A ${ow * 0.85} ${ow * 0.85} 0 0 0 ${ow / 2} 0`}
+                          fill="#10B981"
+                          fillOpacity={0.16}
+                          stroke="#10B981"
+                          strokeWidth={1.5}
+                          strokeDasharray="4 2"
+                        />
+                      </>
+                    )}
+                  </g>
+
+                  <g transform={`translate(${cx - badgeW / 2}, ${cy - 34})`}>
+                    <rect x={0} y={0} width={badgeW} height={21} rx={5} fill="#065F46" stroke="#34D399" strokeWidth={1.2} />
+                    <text x={badgeW / 2} y={13.5} textAnchor="middle" className="font-mono text-[9.5px] font-semibold fill-white">
+                      {badgeLabel}
+                    </text>
+                  </g>
+                </g>
+              );
+            })()}
+
+          {/* Off-wall Invalid Drop Indicator when hovering or dragging in empty air */}
+          {!isReadOnly &&
+            (activeTool === 'place-door' ||
+              activeTool === 'place-window' ||
+              Boolean(dragOpeningSubtype)) &&
+            !openingDropPreview &&
+            openingHoverPt && (
+              <g pointerEvents="none" transform={`translate(${openingHoverPt.x * zoom}, ${openingHoverPt.z * zoom})`}>
+                <circle r={7} fill="#EF4444" fillOpacity={0.14} stroke="#EF4444" strokeWidth={1.8} strokeDasharray="3 2" />
+                <line x1={-3.5} y1={-3.5} x2={3.5} y2={3.5} stroke="#EF4444" strokeWidth={1.5} />
+                <line x1={3.5} y1={-3.5} x2={-3.5} y2={3.5} stroke="#EF4444" strokeWidth={1.5} />
+                <g transform="translate(-84, -30)">
+                  <rect x={0} y={0} width={168} height={20} rx={5} fill="#7F1D1D" stroke="#EF4444" strokeWidth={1} />
+                  <text x={84} y={13} textAnchor="middle" className="font-mono text-[9px] font-semibold fill-red-100">
+                    {dragOpeningSubtype ? 'Drop onto a highlighted wall' : 'Move onto a wall to place'}
+                  </text>
+                </g>
+              </g>
+            )}
 
           {/* Flow Routes (Animated + Toggle Off + Isolate + Interactive Node Modify Mode) */}
           {showFlows &&
@@ -1699,27 +2626,63 @@ export const Viewport2D: React.FC = () => {
             </g>
           )}
 
-          {draftStart && draftCurrent && activeTool === 'draw-wall' && (
-            <g>
-              <line
-                x1={draftStart.x * zoom}
-                y1={draftStart.z * zoom}
-                x2={draftCurrent.x * zoom}
-                y2={draftCurrent.z * zoom}
-                stroke="#3B82F6"
-                strokeWidth={4}
-                strokeDasharray="6 4"
-              />
-              <text
-                x={((draftStart.x + draftCurrent.x) / 2) * zoom}
-                y={((draftStart.z + draftCurrent.z) / 2) * zoom - 8}
-                textAnchor="middle"
-                className="font-mono text-xs fill-blue-400 font-semibold"
-              >
-                {formatLength(Math.hypot(draftCurrent.x - draftStart.x, draftCurrent.z - draftStart.z), scene.unitSystem)}
-              </text>
-            </g>
-          )}
+          {wallChainAnchor && draftCurrent && activeTool === 'draw-wall' && (() => {
+            const len = Math.hypot(draftCurrent.x - wallChainAnchor.x, draftCurrent.z - wallChainAnchor.z);
+            const deg = Math.round(
+              ((Math.atan2(draftCurrent.z - wallChainAnchor.z, draftCurrent.x - wallChainAnchor.x) * 180) / Math.PI +
+                360) %
+                360
+            );
+            return (
+              <g pointerEvents="none">
+                <line
+                  x1={wallChainAnchor.x * zoom}
+                  y1={wallChainAnchor.z * zoom}
+                  x2={draftCurrent.x * zoom}
+                  y2={draftCurrent.z * zoom}
+                  stroke="#8B5CF6"
+                  strokeWidth={4}
+                  strokeDasharray="6 4"
+                />
+                {/* Active chain continuation anchor dot */}
+                <circle
+                  cx={wallChainAnchor.x * zoom}
+                  cy={wallChainAnchor.z * zoom}
+                  r={7.5}
+                  fill="#10B981"
+                  fillOpacity={0.25}
+                  stroke="#10B981"
+                  strokeWidth={1.6}
+                />
+                <circle
+                  cx={wallChainAnchor.x * zoom}
+                  cy={wallChainAnchor.z * zoom}
+                  r={4}
+                  fill="#10B981"
+                  stroke="#FFFFFF"
+                  strokeWidth={1.5}
+                />
+                <circle
+                  cx={draftCurrent.x * zoom}
+                  cy={draftCurrent.z * zoom}
+                  r={4.5}
+                  fill="#8B5CF6"
+                  stroke="#FFFFFF"
+                  strokeWidth={1.5}
+                />
+                {len >= 0.1 && (
+                  <text
+                    x={((wallChainAnchor.x + draftCurrent.x) / 2) * zoom}
+                    y={((wallChainAnchor.z + draftCurrent.z) / 2) * zoom - 10}
+                    textAnchor="middle"
+                    className="font-mono text-xs fill-violet-400 font-semibold"
+                  >
+                    {formatLength(len, scene.unitSystem)} · {deg}°
+                  </text>
+                )}
+              </g>
+            );
+          })()}
 
           {/* Flow Draft Polyline */}
           {flowDraftPoints.length > 0 && (
@@ -1737,35 +2700,111 @@ export const Viewport2D: React.FC = () => {
             </g>
           )}
 
-          {/* Measurement Tape */}
-          {measurePoints.length > 0 && (
-            <g>
-              {measurePoints.map((p, idx) => (
-                <circle key={idx} cx={p.x * zoom} cy={p.z * zoom} r={5} fill="#F59E0B" stroke="#FFFFFF" strokeWidth={1.5} />
-              ))}
-              {measurePoints.length === 2 && measureDist !== null && (
-                <>
-                  <line
-                    x1={measurePoints[0].x * zoom}
-                    y1={measurePoints[0].z * zoom}
-                    x2={measurePoints[1].x * zoom}
-                    y2={measurePoints[1].z * zoom}
+          {/* Multi-Point Measurement Tape & Area Polygon */}
+          {measurePoints.length > 0 && (() => {
+            let totalDist = 0;
+            const segments: { a: { x: number; z: number }; b: { x: number; z: number }; dist: number }[] = [];
+            for (let i = 1; i < measurePoints.length; i++) {
+              const a = measurePoints[i - 1];
+              const b = measurePoints[i];
+              const d = Math.hypot(b.x - a.x, b.z - a.z);
+              totalDist += d;
+              segments.push({ a, b, dist: d });
+            }
+            let polyArea = 0;
+            if (measurePoints.length >= 3) {
+              for (let i = 0; i < measurePoints.length; i++) {
+                const a = measurePoints[i];
+                const b = measurePoints[(i + 1) % measurePoints.length];
+                polyArea += a.x * b.z - b.x * a.z;
+              }
+              polyArea = Math.abs(polyArea) / 2;
+            }
+            const lastPt = measurePoints[measurePoints.length - 1];
+            const liveSegDist =
+              activeTool === 'measure'
+                ? Math.hypot(cursorCoords.x - lastPt.x, cursorCoords.z - lastPt.z)
+                : 0;
+            return (
+              <g pointerEvents="none">
+                {measurePoints.length >= 3 && (
+                  <polygon
+                    points={measurePoints.map((p) => `${p.x * zoom},${p.z * zoom}`).join(' ')}
+                    fill="#F59E0B"
+                    fillOpacity={0.14}
                     stroke="#F59E0B"
-                    strokeWidth={2}
-                    strokeDasharray="5 3"
+                    strokeWidth={1.2}
+                    strokeDasharray="3 3"
                   />
-                  <text
-                    x={((measurePoints[0].x + measurePoints[1].x) / 2) * zoom}
-                    y={((measurePoints[0].z + measurePoints[1].z) / 2) * zoom - 8}
-                    textAnchor="middle"
-                    className="font-mono text-xs fill-amber-400 font-semibold"
-                  >
-                    {formatLength(measureDist, scene.unitSystem)}
-                  </text>
-                </>
-              )}
-            </g>
-          )}
+                )}
+                {segments.map((seg, idx) => (
+                  <g key={idx}>
+                    <line
+                      x1={seg.a.x * zoom}
+                      y1={seg.a.z * zoom}
+                      x2={seg.b.x * zoom}
+                      y2={seg.b.z * zoom}
+                      stroke="#F59E0B"
+                      strokeWidth={2.5}
+                    />
+                    <text
+                      x={((seg.a.x + seg.b.x) / 2) * zoom}
+                      y={((seg.a.z + seg.b.z) / 2) * zoom - 7}
+                      textAnchor="middle"
+                      className="font-mono text-[11px] fill-amber-400 font-semibold"
+                    >
+                      {formatLength(seg.dist, scene.unitSystem)}
+                    </text>
+                  </g>
+                ))}
+                {/* Live cursor preview segment while Measure tool is active */}
+                {activeTool === 'measure' && liveSegDist > 0.05 && (
+                  <g>
+                    <line
+                      x1={lastPt.x * zoom}
+                      y1={lastPt.z * zoom}
+                      x2={cursorCoords.x * zoom}
+                      y2={cursorCoords.z * zoom}
+                      stroke="#F59E0B"
+                      strokeWidth={1.8}
+                      strokeDasharray="5 4"
+                      strokeOpacity={0.85}
+                    />
+                    <text
+                      x={((lastPt.x + cursorCoords.x) / 2) * zoom}
+                      y={((lastPt.z + cursorCoords.z) / 2) * zoom - 7}
+                      textAnchor="middle"
+                      className="font-mono text-[10.5px] fill-amber-300 font-semibold"
+                    >
+                      {formatLength(liveSegDist, scene.unitSystem)}
+                    </text>
+                  </g>
+                )}
+                {measurePoints.map((p, idx) => (
+                  <circle key={idx} cx={p.x * zoom} cy={p.z * zoom} r={5} fill="#F59E0B" stroke="#FFFFFF" strokeWidth={1.5} />
+                ))}
+                {measurePoints.length >= 2 && (
+                  <g transform={`translate(${lastPt.x * zoom + 10}, ${lastPt.z * zoom - 12})`}>
+                    <rect
+                      x={0}
+                      y={0}
+                      width={polyArea > 0.05 ? 164 : 112}
+                      height={22}
+                      rx={5}
+                      fill="#14141B"
+                      fillOpacity={0.94}
+                      stroke="#F59E0B"
+                      strokeWidth={1}
+                    />
+                    <text x={8} y={14.5} className="font-mono text-[10.5px] fill-amber-300 font-semibold">
+                      Σ {formatLength(totalDist, scene.unitSystem)}
+                      {polyArea > 0.05 ? ` · ${formatArea(polyArea, scene.unitSystem)}` : ''}
+                    </text>
+                  </g>
+                )}
+              </g>
+            );
+          })()}
 
           {/* Reference Calibration Points */}
           {calibrationPoints.length > 0 && (
@@ -2045,7 +3084,10 @@ export const Viewport2D: React.FC = () => {
       {activeTool !== 'select' && activeTool !== 'draw-flow' && (
         <div className="absolute top-3 left-3 px-3 py-1.5 rounded-md bg-violet-600 text-white text-xs font-medium shadow-sm pointer-events-none">
           {activeTool === 'draw-room' && 'Click and drag on the 2D floor plan to draw a room with automatic walls'}
-          {activeTool === 'draw-wall' && 'Click and drag between two points to draw a wall segment'}
+          {activeTool === 'draw-wall' &&
+            (wallChainAnchor
+              ? 'Wall chain active — click next point to continue · Press Esc or Right-Click to stop'
+              : 'Click a starting dot to draw continuous walls · Press Esc to stop')}
           {activeTool === 'place-door' && 'Click any wall line to insert a door opening'}
           {activeTool === 'place-window' && 'Click any wall line to insert an observation window'}
           {activeTool === 'place-object' && 'Click floor to place equipment — auto Snap-to-Grid & Snap-to-Wall active'}
@@ -2179,6 +3221,9 @@ export const Viewport2D: React.FC = () => {
         onPointerDown={(e) => e.stopPropagation()}
         className="absolute bottom-2.5 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-1.5 w-[min(96%,640px)] pointer-events-none"
       >
+        {/* Inline Quick Editor for Selected Door / Window */}
+        <OpeningQuickBar isDark={isDarkBg} />
+
         {/* Selected Entity Toolbox (cleanly stacked ABOVE the dock — zero overlap) */}
         {selected.length > 0 && (() => {
           const primary = selected[0];
@@ -2655,6 +3700,251 @@ export const Viewport2D: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* RIGHT-CLICK OPENING CONTEXT MENU (Edit Type, Size, Sill, Position Along Wall, Flip Swing, Delete) */}
+      {openingContextMenu && (() => {
+        const ctxOp = scene.openings.find((o) => o.id === openingContextMenu.openingId);
+        if (!ctxOp) return null;
+        const hostWall = scene.walls.find((w) => w.id === ctxOp.wallId);
+        const wallLen = hostWall
+          ? Math.hypot(hostWall.x2 - hostWall.x1, hostWall.z2 - hostWall.z1)
+          : 4;
+        const doorPresets = OPENING_PRESETS.filter((p) => p.kind === 'door');
+        const windowPresets = OPENING_PRESETS.filter((p) => p.kind === 'window');
+
+        return (
+          <div
+            style={{ left: openingContextMenu.x, top: openingContextMenu.y }}
+            onPointerDown={(e) => e.stopPropagation()}
+            onContextMenu={(e) => e.preventDefault()}
+            className={`absolute z-50 w-[272px] rounded-xl border shadow-2xl p-3 space-y-2.5 text-[11px] ${
+              isDarkBg
+                ? 'bg-[#14141D] border-violet-500/50 text-zinc-100'
+                : 'bg-white border-violet-300 text-zinc-900'
+            }`}
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between gap-2 pb-2 border-b border-zinc-200 dark:border-zinc-800">
+              <div className="flex items-center gap-1.5 min-w-0">
+                {ctxOp.kind === 'window' ? (
+                  <Grid3X3 className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                ) : (
+                  <DoorOpen className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                )}
+                <div className="min-w-0">
+                  <div className="font-semibold truncate">{ctxOp.name}</div>
+                  <div className="text-[9.5px] font-mono text-zinc-400 tabular-nums">
+                    Wall {wallLen.toFixed(1)}m · {ctxOp.width.toFixed(2)}×{ctxOp.height.toFixed(2)}m
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setOpeningContextMenu(null)}
+                aria-label="Close menu"
+                className="p-1 rounded-lg hover:bg-zinc-200 dark:hover:bg-zinc-800 text-zinc-400 cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {!isReadOnly ? (
+              <>
+                {/* Type Selector */}
+                <label className="block space-y-1">
+                  <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                    Opening Type
+                  </span>
+                  <select
+                    value={ctxOp.subtype}
+                    onChange={(e) => {
+                      const nextPreset = OPENING_PRESETS.find((p) => p.subtype === e.target.value);
+                      if (!nextPreset) return;
+                      updateOpening(ctxOp.id, {
+                        kind: nextPreset.kind,
+                        subtype: nextPreset.subtype,
+                        name: nextPreset.name,
+                        width: nextPreset.width,
+                        height: nextPreset.height,
+                        sillHeight: nextPreset.sillHeight,
+                        frameColor: nextPreset.frameColor,
+                        accessControl: nextPreset.accessControl,
+                      });
+                    }}
+                    className={`w-full h-7 px-2 rounded-lg border text-[11px] font-medium focus:outline-none focus:border-violet-500 ${
+                      isDarkBg
+                        ? 'bg-[#1B1B26] border-zinc-700 text-zinc-100'
+                        : 'bg-zinc-50 border-zinc-300 text-zinc-900'
+                    }`}
+                  >
+                    <optgroup label="Doors">
+                      {doorPresets.map((p) => (
+                        <option key={p.subtype} value={p.subtype}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="Windows">
+                      {windowPresets.map((p) => (
+                        <option key={p.subtype} value={p.subtype}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  </select>
+                </label>
+
+                {/* Dimensions: Width, Height, Sill */}
+                <div className={`grid gap-1.5 ${ctxOp.kind === 'window' ? 'grid-cols-3' : 'grid-cols-2'}`}>
+                  <label className="block space-y-0.5">
+                    <span className="text-[10px] text-zinc-400">Width (m)</span>
+                    <input
+                      type="number"
+                      min={0.6}
+                      max={Math.max(0.8, Number((wallLen - 0.3).toFixed(2)))}
+                      step={0.1}
+                      value={ctxOp.width}
+                      onChange={(e) =>
+                        updateOpening(ctxOp.id, { width: Math.max(0.6, Number(e.target.value) || 0.9) })
+                      }
+                      className={`w-full h-7 px-1.5 rounded-lg border font-mono tabular-nums text-[11px] ${
+                        isDarkBg
+                          ? 'bg-[#1B1B26] border-zinc-700 text-zinc-100'
+                          : 'bg-zinc-50 border-zinc-300 text-zinc-900'
+                      }`}
+                    />
+                  </label>
+                  <label className="block space-y-0.5">
+                    <span className="text-[10px] text-zinc-400">Height (m)</span>
+                    <input
+                      type="number"
+                      min={0.5}
+                      max={hostWall ? Number((hostWall.height - 0.1).toFixed(2)) : 3.2}
+                      step={0.1}
+                      value={ctxOp.height}
+                      onChange={(e) =>
+                        updateOpening(ctxOp.id, { height: Math.max(0.5, Number(e.target.value) || 1.2) })
+                      }
+                      className={`w-full h-7 px-1.5 rounded-lg border font-mono tabular-nums text-[11px] ${
+                        isDarkBg
+                          ? 'bg-[#1B1B26] border-zinc-700 text-zinc-100'
+                          : 'bg-zinc-50 border-zinc-300 text-zinc-900'
+                      }`}
+                    />
+                  </label>
+                  {ctxOp.kind === 'window' && (
+                    <label className="block space-y-0.5">
+                      <span className="text-[10px] text-zinc-400">Sill (m)</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={hostWall ? Number(Math.max(0, hostWall.height - 0.7).toFixed(2)) : 2.2}
+                        step={0.1}
+                        value={ctxOp.sillHeight}
+                        onChange={(e) =>
+                          updateOpening(ctxOp.id, { sillHeight: Math.max(0, Number(e.target.value) || 0) })
+                        }
+                        className={`w-full h-7 px-1.5 rounded-lg border font-mono tabular-nums text-[11px] ${
+                          isDarkBg
+                            ? 'bg-[#1B1B26] border-zinc-700 text-zinc-100'
+                            : 'bg-zinc-50 border-zinc-300 text-zinc-900'
+                        }`}
+                      />
+                    </label>
+                  )}
+                </div>
+
+                {/* Position Along Wall */}
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between text-[10px] text-zinc-400">
+                    <span>Position Along Wall</span>
+                    <span className="font-mono tabular-nums font-semibold text-violet-400">
+                      {Math.round(ctxOp.offsetRatio * 100)}%
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.05}
+                    max={0.95}
+                    step={0.01}
+                    value={ctxOp.offsetRatio}
+                    onChange={(e) => updateOpening(ctxOp.id, { offsetRatio: Number(e.target.value) })}
+                    className="w-full accent-violet-500 cursor-pointer"
+                  />
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => updateOpening(ctxOp.id, { offsetRatio: 0.5 })}
+                      className={`flex-1 h-7 px-2 rounded-lg border text-[10.5px] font-medium flex items-center justify-center gap-1 cursor-pointer ${
+                        isDarkBg
+                          ? 'bg-[#1B1B26] border-zinc-700 hover:border-violet-500 text-zinc-200'
+                          : 'bg-zinc-50 border-zinc-300 hover:border-violet-500 text-zinc-800'
+                      }`}
+                    >
+                      <AlignHorizontalJustifyCenter className="w-3 h-3" /> Center
+                    </button>
+                    {ctxOp.kind === 'door' && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          updateOpening(ctxOp.id, {
+                            swingDirection: ctxOp.swingDirection === 'left' ? 'right' : 'left',
+                          })
+                        }
+                        className={`flex-1 h-7 px-2 rounded-lg border text-[10.5px] font-medium flex items-center justify-center gap-1 cursor-pointer ${
+                          isDarkBg
+                            ? 'bg-[#1B1B26] border-zinc-700 hover:border-violet-500 text-zinc-200'
+                            : 'bg-zinc-50 border-zinc-300 hover:border-violet-500 text-zinc-800'
+                        }`}
+                      >
+                        <FlipHorizontal2 className="w-3 h-3" /> Flip Swing
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="text-[10.5px] text-amber-400 flex items-center gap-1.5 py-1">
+                <Lock className="w-3.5 h-3.5 shrink-0" />
+                Switch to Design Mode to edit or delete openings.
+              </div>
+            )}
+
+            {/* Footer: Full Properties + Delete */}
+            <div className="pt-2 border-t border-zinc-200 dark:border-zinc-800 flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  selectEntity({ type: 'opening', id: ctxOp.id });
+                  setRightTab('properties');
+                  setRightPanelOpen(true);
+                  setOpeningContextMenu(null);
+                }}
+                className={`flex-1 h-7 px-2 rounded-lg border text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer ${
+                  isDarkBg
+                    ? 'bg-violet-600/20 border-violet-500/50 text-violet-300 hover:bg-violet-600 hover:text-white'
+                    : 'bg-violet-50 border-violet-300 text-violet-700 hover:bg-violet-600 hover:text-white'
+                }`}
+              >
+                <SlidersHorizontal className="w-3 h-3" /> Properties
+              </button>
+              {!isReadOnly && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    selectEntity({ type: 'opening', id: ctxOp.id });
+                    deleteSelected();
+                    setOpeningContextMenu(null);
+                  }}
+                  className="h-7 px-2.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[10.5px] font-semibold flex items-center justify-center gap-1 cursor-pointer"
+                >
+                  <Trash2 className="w-3 h-3" /> Delete
+                </button>
+              )}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

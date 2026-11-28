@@ -368,7 +368,7 @@ export const TopToolbar: React.FC = () => {
       className="h-13 sm:h-14 bg-white dark:bg-[#121216] border-b border-zinc-200 dark:border-zinc-800/90 px-2 sm:px-3 flex items-center justify-between gap-1.5 sm:gap-2 shrink-0 z-30"
     >
       {/* ZONE 1 (Left): Overview + Active Floor + Search + Undo/Redo */}
-      <div className="flex items-center gap-1.5 min-w-0 shrink">
+      <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
         <IconTooltip label="Executive Overview Hub" align="left">
           <button
             type="button"
@@ -401,7 +401,7 @@ export const TopToolbar: React.FC = () => {
               setActiveFloor(val);
             }
           }}
-          className="h-9 px-2 text-xs font-medium rounded-xl bg-zinc-100 dark:bg-[#18181F] border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100 min-w-[84px] max-w-[118px] sm:max-w-[152px] lg:max-w-[186px] truncate focus:outline-none focus:border-violet-500"
+          className="h-9 px-2 text-xs font-medium rounded-xl bg-zinc-100 dark:bg-[#18181F] border border-zinc-200 dark:border-zinc-800 text-zinc-900 dark:text-zinc-100 w-[86px] sm:w-[116px] lg:w-[144px] xl:w-[172px] 2xl:w-[196px] truncate focus:outline-none focus:border-violet-500 shrink-0"
         >
           <option value="__SITE__">All Buildings (Site)</option>
           <option value="__ALL_FLOORS__">All Floors (Building)</option>
@@ -418,17 +418,17 @@ export const TopToolbar: React.FC = () => {
             type="button"
             onClick={() => setShowQuickSearch(true)}
             aria-label="Command & Asset Search"
-            className="flex items-center justify-center gap-1.5 h-9 w-9 xl:w-auto xl:px-2.5 rounded-xl bg-zinc-100 dark:bg-[#18181F] border border-zinc-200 dark:border-zinc-800 hover:border-violet-500/70 text-xs text-zinc-600 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors shrink-0 cursor-pointer"
+            className="flex items-center justify-center gap-1.5 h-9 w-9 2xl:w-auto 2xl:px-2.5 rounded-xl bg-zinc-100 dark:bg-[#18181F] border border-zinc-200 dark:border-zinc-800 hover:border-violet-500/70 text-xs text-zinc-600 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors shrink-0 cursor-pointer"
           >
-            <Search className="w-4 h-4 text-violet-500" />
-            <kbd className="hidden xl:inline px-1 py-0.5 text-[9.5px] font-mono rounded bg-white dark:bg-[#111116] border border-zinc-200 dark:border-zinc-700 text-zinc-500">
+            <Search className="w-4 h-4 text-violet-500 shrink-0" />
+            <kbd className="hidden 2xl:inline px-1 py-0.5 text-[9.5px] font-mono rounded bg-white dark:bg-[#111116] border border-zinc-200 dark:border-zinc-700 text-zinc-500">
               ⌘K
             </kbd>
           </button>
         </IconTooltip>
 
-        {/* Compact Undo / Redo */}
-        <div className="hidden lg:flex items-center gap-0.5 pl-1 border-l border-zinc-200 dark:border-zinc-800 shrink-0">
+        {/* Compact Undo / Redo (also available in More menu on narrower viewports) */}
+        <div className="hidden 2xl:flex items-center gap-0.5 pl-1 border-l border-zinc-200 dark:border-zinc-800 shrink-0">
           <IconTooltip label="Undo" shortcut="Ctrl+Z">
             <button
               type="button"
@@ -456,9 +456,9 @@ export const TopToolbar: React.FC = () => {
 
       {/* ZONE 2 (Center): Minimal Icon Controls — Mode, CAD Tools, View Dim, 3D Inspection, Walkthrough, VR */}
       <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
-        {/* Compact Design / View Icon Toggle */}
-        <div className="flex items-center bg-zinc-100 dark:bg-[#18181F] p-0.5 rounded-xl border border-zinc-200 dark:border-zinc-800">
-          <IconTooltip label={aclCanEdit ? 'Design Mode (Editable)' : 'ACL Read-Only'}>
+        {/* Clear Design / View Mode Toggle */}
+        <div className="flex items-center bg-zinc-100 dark:bg-[#18181F] p-0.5 rounded-xl border border-zinc-200 dark:border-zinc-800 shrink-0">
+          <IconTooltip label={aclCanEdit ? 'Design Mode — Full CAD, Floors, Walls, MEP & Textures' : 'ACL Read-Only'}>
             <button
               type="button"
               onClick={() => {
@@ -469,27 +469,29 @@ export const TopToolbar: React.FC = () => {
                 setWorkspaceMode('design');
               }}
               aria-label="Design Mode"
-              className={`h-8 w-8 rounded-lg flex items-center justify-center transition-colors ${
+              className={`h-8 px-2 lg:px-2.5 rounded-lg flex items-center gap-1.5 text-[11px] font-semibold whitespace-nowrap transition-colors ${
                 !isReadOnly
                   ? 'bg-violet-600 text-white shadow-xs'
-                  : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
+                  : 'text-zinc-600 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-white'
               } ${!aclCanEdit ? 'opacity-45 cursor-not-allowed' : 'cursor-pointer'}`}
             >
-              <Pencil className="w-3.5 h-3.5" />
+              <Pencil className="w-3.5 h-3.5 shrink-0" />
+              <span className="hidden lg:inline">Design</span>
             </button>
           </IconTooltip>
-          <IconTooltip label={!aclCanEdit ? 'ACL Locked View' : 'View Mode (Read-Only)'}>
+          <IconTooltip label={!aclCanEdit ? 'ACL Locked View' : 'View Mode (Read-Only Operations)'}>
             <button
               type="button"
               onClick={() => setWorkspaceMode('view')}
               aria-label="View Mode"
-              className={`h-8 w-8 rounded-lg flex items-center justify-center transition-colors cursor-pointer ${
+              className={`h-8 px-2 lg:px-2.5 rounded-lg flex items-center gap-1.5 text-[11px] font-semibold whitespace-nowrap transition-colors cursor-pointer ${
                 isReadOnly
                   ? 'bg-amber-500 text-zinc-950 shadow-xs'
-                  : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-white'
+                  : 'text-zinc-600 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-white'
               }`}
             >
-              {!aclCanEdit ? <Lock className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+              {!aclCanEdit ? <Lock className="w-3.5 h-3.5 shrink-0" /> : <Eye className="w-3.5 h-3.5 shrink-0" />}
+              <span className="hidden lg:inline">View</span>
             </button>
           </IconTooltip>
         </div>
@@ -645,7 +647,7 @@ export const TopToolbar: React.FC = () => {
               3D
             </button>
           </IconTooltip>
-          <IconTooltip label="3D Orthographic Presets" className="hidden sm:inline-flex">
+          <IconTooltip label="3D Orthographic Presets" className="hidden md:inline-flex">
             <button
               type="button"
               onClick={() => {
@@ -662,7 +664,7 @@ export const TopToolbar: React.FC = () => {
               <Box className="w-3.5 h-3.5" />
             </button>
           </IconTooltip>
-          <IconTooltip label="2D + 3D Split View" className="hidden md:inline-flex">
+          <IconTooltip label="2D + 3D Split View" className="hidden lg:inline-flex">
             <button
               type="button"
               onClick={() => setViewMode('split')}
@@ -951,7 +953,7 @@ export const TopToolbar: React.FC = () => {
         </IconTooltip>
 
         {/* WebXR VR Immersion Icon */}
-        <IconTooltip label={vrSessionActive ? 'Exit VR Immersion' : 'VR Immersion Session'} className="hidden sm:inline-flex">
+        <IconTooltip label={vrSessionActive ? 'Exit VR Immersion' : 'VR Immersion Session'} className="hidden lg:inline-flex">
           <button
             type="button"
             onClick={() => {
@@ -1006,7 +1008,7 @@ export const TopToolbar: React.FC = () => {
         {/* Auto-save Icon Toggle */}
         <IconTooltip
           label={autoSaveEnabled ? `Auto-save ON (${autoSaveSecondsLeft}s idle)` : 'Auto-save OFF'}
-          className="hidden md:inline-flex"
+          className="hidden 2xl:inline-flex"
         >
           <button
             type="button"
@@ -1048,7 +1050,7 @@ export const TopToolbar: React.FC = () => {
         </IconTooltip>
 
         {/* MAYA Life Studio Dedicated Page */}
-        <IconTooltip label="MAYA Life · 3D Companion, SOPs & AI">
+        <IconTooltip label="MAYA Life · 3D Companion, SOPs & AI" className="hidden xl:inline-flex">
           <button
             type="button"
             onClick={() => setScreen('maya-life')}
@@ -1077,7 +1079,7 @@ export const TopToolbar: React.FC = () => {
         </IconTooltip>
 
         {/* GMP Ops Icon */}
-        <IconTooltip label="GMP Operations & Production Lines" className="hidden sm:inline-flex">
+        <IconTooltip label="GMP Operations & Production Lines" className="hidden xl:inline-flex">
           <button
             type="button"
             onClick={() => openGmpModal({ tab: 'lines' })}
@@ -1094,7 +1096,7 @@ export const TopToolbar: React.FC = () => {
         </IconTooltip>
 
         {/* Resource Schedule Icon */}
-        <IconTooltip label="Resource & Zone Scheduling" className="hidden lg:inline-flex">
+        <IconTooltip label="Resource & Zone Scheduling" className="hidden 2xl:inline-flex">
           <button
             type="button"
             onClick={() => openResourceSchedulingModal(null)}
@@ -1111,7 +1113,7 @@ export const TopToolbar: React.FC = () => {
         </IconTooltip>
 
         {/* CAD / SVG OCR Icon */}
-        <IconTooltip label="DWG / SVG to Plan Walls OCR" className="hidden xl:inline-flex">
+        <IconTooltip label="DWG / SVG to Plan Walls OCR" className="hidden 2xl:inline-flex">
           <button
             type="button"
             onClick={() => setShowCadOcrModal(true)}
@@ -1123,7 +1125,7 @@ export const TopToolbar: React.FC = () => {
         </IconTooltip>
 
         {/* QR Scanner Icon */}
-        <IconTooltip label="QR Camera Scanner & Labels" className="hidden md:inline-flex">
+        <IconTooltip label="QR Camera Scanner & Labels" className="hidden 2xl:inline-flex">
           <button
             type="button"
             onClick={() => openQrLabelModal('scanner')}
@@ -1152,10 +1154,57 @@ export const TopToolbar: React.FC = () => {
           </IconTooltip>
 
           {openMenu === 'more' && (
-            <div className="absolute right-0 top-full mt-1.5 w-64 rounded-2xl bg-white dark:bg-[#15151C] border border-zinc-200 dark:border-zinc-800 shadow-2xl p-2 space-y-1 z-50">
+            <div className="absolute right-0 top-full mt-1.5 w-68 max-h-[82vh] overflow-y-auto rounded-2xl bg-white dark:bg-[#15151C] border border-zinc-200 dark:border-zinc-800 shadow-2xl p-2 space-y-1 z-50">
+              {/* Quick History Row for compact viewports */}
+              <div className="flex 2xl:hidden items-center gap-1 pb-1.5 mb-1 border-b border-zinc-200 dark:border-zinc-800">
+                <button
+                  type="button"
+                  onClick={() => {
+                    undo();
+                    setOpenMenu('none');
+                  }}
+                  disabled={past.length === 0}
+                  className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-xl bg-zinc-100 dark:bg-[#1D1D26] text-xs font-medium text-zinc-700 dark:text-zinc-200 disabled:opacity-35 cursor-pointer"
+                >
+                  <Undo2 className="w-3.5 h-3.5" /> Undo
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    redo();
+                    setOpenMenu('none');
+                  }}
+                  disabled={future.length === 0}
+                  className="flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-xl bg-zinc-100 dark:bg-[#1D1D26] text-xs font-medium text-zinc-700 dark:text-zinc-200 disabled:opacity-35 cursor-pointer"
+                >
+                  <Redo2 className="w-3.5 h-3.5" /> Redo
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setViewMode('split');
+                    setOpenMenu('none');
+                  }}
+                  className="lg:hidden px-2.5 py-1.5 rounded-xl bg-zinc-100 dark:bg-[#1D1D26] text-xs font-medium text-zinc-700 dark:text-zinc-200 cursor-pointer"
+                  title="2D + 3D Split View"
+                >
+                  <Columns2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
               <div className="px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
                 Studios &amp; Libraries
               </div>
+              <button
+                onClick={() => {
+                  setScreen('maya-life');
+                  setOpenMenu('none');
+                }}
+                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-xl text-xs font-medium text-zinc-700 dark:text-zinc-200 hover:bg-violet-500/12 hover:text-violet-600 dark:hover:text-violet-300 transition-colors cursor-pointer"
+              >
+                <Bot className="w-4 h-4 text-violet-500" />
+                <span>MAYA Life Studio &amp; SOPs</span>
+              </button>
               <button
                 onClick={() => {
                   setShowAIPlannerModal(true);
