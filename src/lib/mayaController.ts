@@ -185,6 +185,23 @@ export class MayaController {
   private manualFace = false;
   private disposed = false;
 
+  isGowned = false;
+  private gownNodes: THREE.Object3D[] = [];
+  private gownDisposables: { geometries: THREE.BufferGeometry[]; materials: THREE.Material[] } = {
+    geometries: [],
+    materials: [],
+  };
+  private origMeshMaterials = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>();
+  private poloHideMeshes: THREE.Object3D[] = [];
+  private suitCoverallMeshes: THREE.Mesh[] = [];
+  private gloveMeshes: THREE.Mesh[] = [];
+  private trouserMeshes: THREE.Mesh[] = [];
+  private bootMeshes: THREE.Mesh[] = [];
+  private gownCoverallMat: THREE.MeshStandardMaterial | null = null;
+  private gownGloveMat: THREE.MeshStandardMaterial | null = null;
+  private gownTrouserMat: THREE.MeshStandardMaterial | null = null;
+  private gownBootMat: THREE.MeshStandardMaterial | null = null;
+
   constructor(
     gltf: GLTF,
     {
@@ -286,8 +303,299 @@ export class MayaController {
     this.onStateChange = onStateChange;
     this.onFinished = onFinished;
 
+    this.buildCleanroomGownRig();
     this.paintFace(true);
     this.setState('idle', { fade: 0 });
+  }
+
+  /**
+   * Builds a full Grade A/B Sterile Cleanroom Bunny Suit overlay attached directly
+   * to MAYA's animated bones (HeadPivot, TorsoPivot, Elbow_L/R, Leg_L/R) so every
+   * head turn, wave, walk stride, and jump moves the sterile PPE naturally.
+   */
+  private buildCleanroomGownRig() {
+    this.gownCoverallMat = new THREE.MeshStandardMaterial({
+      color: 0xf1f7fe,
+      roughness: 0.42,
+      metalness: 0.04,
+    });
+    this.gownTrouserMat = new THREE.MeshStandardMaterial({
+      color: 0xeaf4fd,
+      roughness: 0.44,
+      metalness: 0.04,
+    });
+    this.gownGloveMat = new THREE.MeshStandardMaterial({
+      color: 0x06b6d4,
+      roughness: 0.28,
+      metalness: 0.06,
+    });
+    this.gownBootMat = new THREE.MeshStandardMaterial({
+      color: 0xe0f2fe,
+      roughness: 0.36,
+      metalness: 0.08,
+    });
+    const trimCyanMat = new THREE.MeshStandardMaterial({
+      color: 0x0284c7,
+      roughness: 0.32,
+      metalness: 0.12,
+    });
+    const maskMat = new THREE.MeshStandardMaterial({
+      color: 0xbae6fd,
+      roughness: 0.55,
+      metalness: 0.02,
+      side: THREE.DoubleSide,
+    });
+    const goggleFrameMat = new THREE.MeshStandardMaterial({
+      color: 0xf8fafc,
+      roughness: 0.35,
+      metalness: 0.08,
+    });
+    const visorGlassMat = new THREE.MeshPhysicalMaterial({
+      color: 0x7dd3fc,
+      roughness: 0.08,
+      metalness: 0.05,
+      transparent: true,
+      opacity: 0.34,
+      transmission: 0.25,
+      clearcoat: 1.0,
+      depthWrite: false,
+    });
+    const badgeMat = new THREE.MeshStandardMaterial({
+      color: 0x0ea5e9,
+      emissive: 0x0369a1,
+      emissiveIntensity: 0.32,
+      roughness: 0.28,
+      metalness: 0.15,
+    });
+
+    this.gownDisposables.materials.push(
+      this.gownCoverallMat,
+      this.gownTrouserMat,
+      this.gownGloveMat,
+      this.gownBootMat,
+      trimCyanMat,
+      maskMat,
+      goggleFrameMat,
+      visorGlassMat,
+      badgeMat
+    );
+
+    const trackGeo = <T extends THREE.BufferGeometry>(g: T): T => {
+      this.gownDisposables.geometries.push(g);
+      return g;
+    };
+
+    // Catalog original clothing/limb meshes for clean material toggling
+    this.scene.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const n = obj.name;
+      if (/^(LongPolo|Sleeve_|CollarStand)/.test(n)) {
+        this.origMeshMaterials.set(mesh, mesh.material);
+        this.suitCoverallMeshes.push(mesh);
+      } else if (/^(PointedCollar|WhiteCollarEdge|RedCollarEdge|Placket|Button|GradianLogo)/.test(n)) {
+        this.poloHideMeshes.push(obj);
+      } else if (/^ForearmMitten_/.test(n)) {
+        this.origMeshMaterials.set(mesh, mesh.material);
+        this.gloveMeshes.push(mesh);
+      } else if (/^LegShape_/.test(n)) {
+        this.origMeshMaterials.set(mesh, mesh.material);
+        this.trouserMeshes.push(mesh);
+      } else if (/^Foot_/.test(n)) {
+        this.origMeshMaterials.set(mesh, mesh.material);
+        this.bootMeshes.push(mesh);
+      }
+    });
+
+    // 1. HeadPivot: Full Sterile Cleanroom Hood + Anti-Fog Goggles + Surgical Face Mask
+    const headPivot = this.scene.getObjectByName('HeadPivot');
+    if (headPivot) {
+      const headGown = new THREE.Group();
+      headGown.name = 'MAYA_CleanroomHood';
+      headGown.visible = false;
+
+      // Sculpted ellipsoid hood shell wrapping top, back, and sides while keeping front face window clear
+      // Maya's head spans x:[-0.62,0.62], y:[0.01,0.99], z:[-0.49,0.49] centered at (0, 0.50, 0)
+      const hoodGeo = trackGeo(new THREE.SphereGeometry(1, 32, 24, Math.PI * 0.72, Math.PI * 1.56, 0.02, Math.PI * 0.94));
+      const hoodMesh = new THREE.Mesh(hoodGeo, this.gownCoverallMat);
+      hoodMesh.scale.set(0.655, 0.525, 0.525);
+      hoodMesh.position.set(0, 0.505, -0.015);
+      // Rotate so open aperture faces +Z (MAYA's face)
+      hoodMesh.rotation.y = Math.PI * 0.5;
+      hoodMesh.castShadow = true;
+      hoodMesh.receiveShadow = true;
+      headGown.add(hoodMesh);
+
+      // Upper crown cap closing top of head seamlessly
+      const crownGeo = trackGeo(new THREE.SphereGeometry(1, 28, 16, 0, Math.PI * 2, 0, Math.PI * 0.42));
+      const crownMesh = new THREE.Mesh(crownGeo, this.gownCoverallMat);
+      crownMesh.scale.set(0.65, 0.52, 0.52);
+      crownMesh.position.set(0, 0.515, -0.005);
+      crownMesh.castShadow = true;
+      headGown.add(crownMesh);
+
+      // Cyan elastic hood face-aperture seal ring framing MAYA's face
+      const sealGeo = trackGeo(new THREE.TorusGeometry(0.42, 0.028, 12, 36));
+      const sealMesh = new THREE.Mesh(sealGeo, trimCyanMat);
+      sealMesh.scale.set(1.12, 0.96, 0.65);
+      sealMesh.position.set(0, 0.48, 0.35);
+      headGown.add(sealMesh);
+
+      // Neck drape connecting hood smoothly down into coverall shoulders
+      const drapeGeo = trackGeo(new THREE.CylinderGeometry(0.32, 0.44, 0.24, 24, 1, true));
+      const drapeMesh = new THREE.Mesh(drapeGeo, this.gownCoverallMat);
+      drapeMesh.scale.set(1.0, 1.0, 0.78);
+      drapeMesh.position.set(0, 0.03, -0.02);
+      headGown.add(drapeMesh);
+
+      // Sterile Anti-Fog Cleanroom Goggles (curved translucent lens + white silicone rim)
+      const visorGeo = trackGeo(
+        new THREE.CylinderGeometry(0.545, 0.545, 0.24, 28, 1, true, -Math.PI * 0.34, Math.PI * 0.68)
+      );
+      const visorMesh = new THREE.Mesh(visorGeo, visorGlassMat);
+      visorMesh.scale.set(1.08, 1.0, 0.96);
+      visorMesh.position.set(0, 0.57, 0.03);
+      headGown.add(visorMesh);
+
+      const goggleTopRimGeo = trackGeo(
+        new THREE.TorusGeometry(0.535, 0.022, 10, 28, Math.PI * 0.68)
+      );
+      const goggleTopRim = new THREE.Mesh(goggleTopRimGeo, goggleFrameMat);
+      goggleTopRim.rotation.x = Math.PI / 2;
+      goggleTopRim.rotation.z = Math.PI * 0.16;
+      goggleTopRim.scale.set(1.08, 0.96, 1.0);
+      goggleTopRim.position.set(0, 0.685, 0.03);
+      headGown.add(goggleTopRim);
+
+      const goggleBotRim = new THREE.Mesh(goggleTopRimGeo, goggleFrameMat);
+      goggleBotRim.rotation.x = Math.PI / 2;
+      goggleBotRim.rotation.z = Math.PI * 0.16;
+      goggleBotRim.scale.set(1.08, 0.96, 1.0);
+      goggleBotRim.position.set(0, 0.455, 0.03);
+      headGown.add(goggleBotRim);
+
+      // Elastic goggle strap wrapping behind hood
+      const strapGeo = trackGeo(new THREE.TorusGeometry(0.56, 0.022, 8, 32));
+      const strapMesh = new THREE.Mesh(strapGeo, trimCyanMat);
+      strapMesh.rotation.x = Math.PI / 2;
+      strapMesh.scale.set(1.16, 0.94, 1.0);
+      strapMesh.position.set(0, 0.57, -0.01);
+      headGown.add(strapMesh);
+
+      // Sterile Cleanroom Face Mask covering lower chin/mouth area
+      const maskGeo = trackGeo(
+        new THREE.CylinderGeometry(0.525, 0.48, 0.21, 24, 1, true, -Math.PI * 0.3, Math.PI * 0.6)
+      );
+      const maskMesh = new THREE.Mesh(maskGeo, maskMat);
+      maskMesh.scale.set(1.08, 1.0, 0.96);
+      maskMesh.position.set(0, 0.29, 0.04);
+      headGown.add(maskMesh);
+
+      headPivot.add(headGown);
+      this.gownNodes.push(headGown);
+    }
+
+    // 2. TorsoPivot: Front Sterile Zipper Seam, Waist Seal Belt & Grade A/B Chest Badge
+    const torsoPivot = this.scene.getObjectByName('TorsoPivot');
+    if (torsoPivot) {
+      const torsoGown = new THREE.Group();
+      torsoGown.name = 'MAYA_CleanroomTorso';
+      torsoGown.visible = false;
+
+      // Vertical sterile front zipper track
+      const zipGeo = trackGeo(new THREE.BoxGeometry(0.036, 0.56, 0.024));
+      const zipMesh = new THREE.Mesh(zipGeo, trimCyanMat);
+      zipMesh.position.set(0, 0.39, 0.258);
+      torsoGown.add(zipMesh);
+
+      // Zipper pull tab near collar
+      const pullGeo = trackGeo(new THREE.BoxGeometry(0.055, 0.04, 0.032));
+      const pullMesh = new THREE.Mesh(pullGeo, goggleFrameMat);
+      pullMesh.position.set(0, 0.65, 0.264);
+      torsoGown.add(pullMesh);
+
+      // Sterile chest badge (Grade A/B Cleanroom ID)
+      const badgeGeo = trackGeo(new THREE.BoxGeometry(0.115, 0.075, 0.02));
+      const badgeMesh = new THREE.Mesh(badgeGeo, badgeMat);
+      badgeMesh.position.set(0.155, 0.49, 0.245);
+      badgeMesh.rotation.y = 0.26;
+      torsoGown.add(badgeMesh);
+
+      // Waist elastic seal band
+      const waistGeo = trackGeo(new THREE.TorusGeometry(0.32, 0.024, 10, 32));
+      const waistMesh = new THREE.Mesh(waistGeo, trimCyanMat);
+      waistMesh.rotation.x = Math.PI / 2;
+      waistMesh.scale.set(1.13, 0.82, 1.0);
+      waistMesh.position.set(0, 0.19, 0);
+      torsoGown.add(waistMesh);
+
+      torsoPivot.add(torsoGown);
+      this.gownNodes.push(torsoGown);
+    }
+
+    // 3. Wrist Elastic Cuff Seals on Elbow_L & Elbow_R
+    for (const elbowName of ['Elbow_L', 'Elbow_R']) {
+      const elbow = this.scene.getObjectByName(elbowName);
+      if (!elbow) continue;
+      const cuffGeo = trackGeo(new THREE.TorusGeometry(0.108, 0.018, 10, 20));
+      const cuff = new THREE.Mesh(cuffGeo, trimCyanMat);
+      cuff.rotation.x = Math.PI / 2;
+      cuff.position.set(0, -0.015, 0.005);
+      cuff.visible = false;
+      elbow.add(cuff);
+      this.gownNodes.push(cuff);
+    }
+
+    // 4. Cleanroom Boot Cuff Straps on Leg_L & Leg_R
+    for (const legName of ['Leg_L', 'Leg_R']) {
+      const leg = this.scene.getObjectByName(legName);
+      if (!leg) continue;
+      const bootStrapGeo = trackGeo(new THREE.TorusGeometry(0.125, 0.02, 10, 20));
+      const bootStrap = new THREE.Mesh(bootStrapGeo, trimCyanMat);
+      bootStrap.rotation.x = Math.PI / 2;
+      bootStrap.position.set(0, -0.21, 0.015);
+      bootStrap.visible = false;
+      leg.add(bootStrap);
+      this.gownNodes.push(bootStrap);
+    }
+  }
+
+  /**
+   * Toggles MAYA between her standard Gradian.me navy polo uniform and a full
+   * EU GMP Grade A/B sterile cleanroom gown (bunny suit, hood, goggles, mask, nitrile gloves & over-boots).
+   */
+  setGowned(gowned: boolean): this {
+    if (this.disposed) return this;
+    const next = Boolean(gowned);
+    if (this.isGowned === next) return this;
+    this.isGowned = next;
+
+    for (const node of this.gownNodes) {
+      node.visible = next;
+    }
+    for (const obj of this.poloHideMeshes) {
+      obj.visible = !next;
+    }
+
+    if (next) {
+      if (this.gownCoverallMat) {
+        for (const m of this.suitCoverallMeshes) m.material = this.gownCoverallMat;
+      }
+      if (this.gownGloveMat) {
+        for (const m of this.gloveMeshes) m.material = this.gownGloveMat;
+      }
+      if (this.gownTrouserMat) {
+        for (const m of this.trouserMeshes) m.material = this.gownTrouserMat;
+      }
+      if (this.gownBootMat) {
+        for (const m of this.bootMeshes) m.material = this.gownBootMat;
+      }
+    } else {
+      this.origMeshMaterials.forEach((mat, mesh) => {
+        mesh.material = mat;
+      });
+    }
+    return this;
   }
 
   private drawCell(name: MayaFaceTile, alpha: number) {
@@ -459,6 +767,17 @@ export class MayaController {
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
+    this.origMeshMaterials.forEach((mat, mesh) => {
+      mesh.material = mat;
+    });
+    for (const node of this.gownNodes) {
+      node.parent?.remove(node);
+    }
+    this.gownNodes = [];
+    for (const geo of this.gownDisposables.geometries) geo.dispose();
+    for (const mat of this.gownDisposables.materials) mat.dispose();
+    this.gownDisposables.geometries = [];
+    this.gownDisposables.materials = [];
     this.map.dispose();
     this.iconMap.dispose();
     (this.face.material as THREE.Material).dispose();

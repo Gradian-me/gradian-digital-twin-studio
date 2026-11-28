@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import type { MayaExpressionName, MayaStateName } from '../lib/mayaController';
 import type { ProposedAIAction } from '../types/twin';
 
-export type MayaInteractionKind = 'room' | 'equipment' | 'door' | 'light' | 'sop' | 'chat' | 'voice';
+export type MayaInteractionKind = 'room' | 'equipment' | 'door' | 'light' | 'sop' | 'chat' | 'voice' | 'gown';
 
 export interface MayaInteractionEntry {
   id: string;
@@ -142,6 +142,7 @@ interface PersistedMayaData {
   switchStates: Record<string, boolean>;
   openDoors: Record<string, boolean>;
   savedWalkPose: SavedWalkPose | null;
+  isGowned?: boolean;
 }
 
 function loadMayaState(): Partial<PersistedMayaData> {
@@ -243,6 +244,7 @@ interface MayaDomainState {
   statusNote: string;
   isThinking: boolean;
   isReadingSop: boolean;
+  isGowned: boolean;
   activeWorkflowId: string | null;
   activeRoomId: string | null;
   activeRoomCode: string | null;
@@ -272,6 +274,7 @@ interface MayaDomainState {
     statusNote?: string,
     autoReturnMs?: number
   ) => void;
+  setGowned: (gowned: boolean, locationLabel?: string, roomId?: string | null) => void;
   setThinking: (thinking: boolean, statusNote?: string) => void;
   setActiveLocation: (roomId: string | null, roomCode?: string | null, roomName?: string | null) => void;
   startReadingSop: (sopId: string, sopTitle: string, assetId?: string | null, assetCode?: string) => void;
@@ -359,6 +362,7 @@ function persistFromState(s: MayaDomainState) {
     switchStates: s.switchStates,
     openDoors: s.openDoors,
     savedWalkPose: s.savedWalkPose,
+    isGowned: s.isGowned,
   });
 }
 
@@ -368,6 +372,7 @@ export const useMayaStore = create<MayaDomainState>((set, get) => ({
   statusNote: 'Monitoring facility rooms, equipment & SOPs',
   isThinking: false,
   isReadingSop: false,
+  isGowned: Boolean(initial.isGowned ?? false),
   activeWorkflowId: null,
   activeRoomId: null,
   activeRoomCode: null,
@@ -413,6 +418,51 @@ export const useMayaStore = create<MayaDomainState>((set, get) => ({
         }
       }, autoReturnMs);
     }
+  },
+
+  setGowned: (gowned, locationLabel = 'Gowning Room (PAL)', roomId = null) => {
+    const next = Boolean(gowned);
+    const prev = get().isGowned;
+    if (prev === next) return;
+    const wfId = get().startWorkflowEvent({
+      kind: 'gown',
+      action: next ? 'Don Full Cleanroom Gown' : 'De-Gown Cleanroom Suit',
+      targetCode: next ? 'PPE-GRADE-A/B' : 'PPE-STANDARD',
+      targetName: locationLabel,
+      toState: 'approval',
+      roomId,
+    });
+    set((s) => {
+      const patch = {
+        isGowned: next,
+        currentState: 'approval' as MayaStateName,
+        currentExpression: 'happy' as MayaExpressionName,
+        statusNote: next
+          ? `Full sterile cleanroom gown on (${locationLabel})`
+          : `Changed back to standard facility uniform (${locationLabel})`,
+      };
+      persistFromState({ ...s, ...patch });
+      return patch;
+    });
+    get().logInteraction({
+      kind: 'gown',
+      targetId: roomId || 'pal-gowning',
+      targetCode: next ? 'GOWN-ON' : 'GOWN-OFF',
+      targetName: locationLabel,
+      summary: next
+        ? `Changed into full sterile cleanroom gown, hood, visor & gloves in ${locationLabel}`
+        : `Removed sterile cleanroom gown in ${locationLabel}`,
+      mayaState: 'approval',
+      roomId,
+    });
+    setTimeout(() => {
+      get().completeWorkflowEvent(wfId, {
+        finalState: 'idle',
+        statusNote: next
+          ? 'Sterile cleanroom gowning verified · Cleared for Grade A/B/C'
+          : 'Standard facility uniform active',
+      });
+    }, 1100);
   },
 
   setThinking: (isThinking, statusNote) => {

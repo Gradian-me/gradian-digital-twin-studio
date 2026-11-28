@@ -90,7 +90,9 @@ import { buildProceduralEquipmentGroup } from '../engine/equipmentBuilder';
 import {
   buildFloorNavMesh,
   buildNavMeshVisualGroup,
+  planGmpRoute,
   type FloorNavMesh,
+  type GmpRouteCheckpoint,
   type NoGoZone,
   type PathRoutingAlgorithm,
 } from '../engine/navMesh';
@@ -111,7 +113,7 @@ import {
   PathFinderConfigPopover,
   SpatialAudioSettingsPopover,
 } from './WalkthroughConfigPopovers';
-import { getRoomColorForAnalytics, snapValue } from '../utils/spatial';
+import { getAssetBounds, getRoomColorForAnalytics, snapValue } from '../utils/spatial';
 import { computeFlowRoomSequence } from '../utils/flowAnalytics';
 import { computeSnappedPlacement } from '../utils/placementSnap';
 import { detectEnclosedWallPolygons } from '../utils/polygonSpaces';
@@ -123,7 +125,7 @@ import {
 } from '../utils/lighting';
 import { attachCanvasPinchGuard } from '../utils/preventPinchZoom';
 import { MayaController, loadMayaGltf } from '../lib/mayaController';
-import type { Building, Floor, MaterialDef, Opening, Room, Wall } from '../types/twin';
+import type { Building, Floor, MaterialDef, Opening, Room, SpatialAsset, Wall } from '../types/twin';
 
 const _projVec = new THREE.Vector3();
 const _projViewMat = new THREE.Matrix4();
@@ -241,6 +243,7 @@ function buildWalkAvatar(onLoaded?: () => void): WalkAvatarRig {
         faceFade: 0.16,
         autoReturn: true,
       });
+      controller.setGowned(useMayaStore.getState().isGowned);
 
       rig.mayaController = controller;
       rig.torsoPivot = model.getObjectByName('TorsoPivot') ?? null;
@@ -423,7 +426,8 @@ function deduplicateCoplanarWalls(walls: Wall[], openings: Opening[]): Wall[] {
 }
 
 // Exact sub-stepped 2D circle-vs-wall-segment collision with wall sliding.
-// Walkable door openings (sillHeight < 0.25m) remain passable; solid walls, glass walls, and windows block 100%.
+// Walkable open door openings (sillHeight < 0.25m) punch cleanly through BOTH their host wall
+// AND any coplanar adjacent/shared room wall; closed doors, solid walls, glass walls, and windows block 100%.
 function resolveStrictWallCollision(
   prevX: number,
   prevZ: number,
@@ -436,6 +440,60 @@ function resolveStrictWallCollision(
   floorDepth: number,
   openDoorsMap?: Record<string, boolean>
 ): { x: number; z: number } {
+  const wallById = new Map<string, Wall>();
+  for (const w of walls) {
+    wallById.set(w.id, w);
+  }
+
+  // Precompute world-space passable door portals so open doors cut through double/shared adjacent walls
+  const passablePortals: {
+    wallId: string;
+    cx: number;
+    cz: number;
+    ux: number;
+    uz: number;
+    width: number;
+    hostThickness: number;
+  }[] = [];
+
+  for (const o of openings) {
+    if (o.kind !== 'door' || o.sillHeight >= 0.25) continue;
+    const host = wallById.get(o.wallId);
+    if (!host) continue;
+    const hdx = host.x2 - host.x1;
+    const hdz = host.z2 - host.z1;
+    const hlen = Math.hypot(hdx, hdz);
+    if (hlen < 0.05) continue;
+
+    const cx = host.x1 + hdx * o.offsetRatio;
+    const cz = host.z1 + hdz * o.offsetRatio;
+    const ux = hdx / hlen;
+    const uz = hdz / hlen;
+    const hostThick = host.thickness || 0.18;
+    const isOpen = !openDoorsMap ? true : (openDoorsMap[o.id] ?? o.status === 'open');
+
+    // Only allow escape if player center is literally embedded INSIDE the solid wall slab
+    // (never when standing in front of a closed door!)
+    const relPrevX = prevX - cx;
+    const relPrevZ = prevZ - cz;
+    const prevAlong = Math.abs(relPrevX * ux + relPrevZ * uz);
+    const prevPerp = Math.abs(relPrevX * -uz + relPrevZ * ux);
+    const stuckInsideWallPlane =
+      !isOpen && prevPerp < hostThick * 0.5 + 0.04 && prevAlong < o.width * 0.45;
+
+    if (!isOpen && !stuckInsideWallPlane) continue;
+
+    passablePortals.push({
+      wallId: host.id,
+      cx,
+      cz,
+      ux,
+      uz,
+      width: o.width,
+      hostThickness: hostThick,
+    });
+  }
+
   const solidSegments: { ax: number; az: number; bx: number; bz: number; halfThick: number }[] = [];
 
   for (const w of walls) {
@@ -445,26 +503,38 @@ function resolveStrictWallCollision(
     if (len < 0.05) continue;
     const ux = dx / len;
     const uz = dz / len;
-    const halfThick = Math.max(0.08, (w.thickness || 0.18) * 0.5);
+    const wallThick = w.thickness || 0.18;
+    const halfThick = Math.max(0.08, wallThick * 0.5);
 
-    const doorGaps = openings
-      .filter((o) => {
-        if (o.wallId !== w.id || o.kind !== 'door' || o.sillHeight >= 0.25) return false;
-        if (!openDoorsMap) return true;
-        const isOpen = openDoorsMap[o.id] ?? o.status === 'open';
-        if (isOpen) return true;
-        // If player is already standing inside the closed doorway threshold, never trap them
-        const dcx = w.x1 + dx * o.offsetRatio;
-        const dcz = w.z1 + dz * o.offsetRatio;
-        return Math.hypot(prevX - dcx, prevZ - dcz) < Math.max(0.75, o.width * 0.55);
-      })
-      .map((o) => {
-        const c = o.offsetRatio * len;
-        // Slightly widened clearance on open doors so MAYA's larger head passes cleanly without snagging jambs
-        const half = Math.max(0.58, o.width * 0.54);
-        return [Math.max(0, c - half), Math.min(len, c + half)] as [number, number];
-      })
-      .sort((a, b) => a[0] - b[0]);
+    const doorGaps: [number, number][] = [];
+    for (const portal of passablePortals) {
+      const relX = portal.cx - w.x1;
+      const relZ = portal.cz - w.z1;
+      const proj = relX * ux + relZ * uz;
+
+      let cutsThisWall = portal.wallId === w.id;
+      if (!cutsThisWall) {
+        // Cut coplanar / parallel adjacent walls (e.g. Room South Wall overlapping Corridor North Wall)
+        const parallelDot = Math.abs(portal.ux * ux + portal.uz * uz);
+        if (parallelDot >= 0.88) {
+          const perp = Math.abs(relX * -uz + relZ * ux);
+          const maxCoplanarSep = Math.max(0.65, wallThick + portal.hostThickness + 0.28);
+          if (perp <= maxCoplanarSep) {
+            cutsThisWall = true;
+          }
+        }
+      }
+
+      if (!cutsThisWall) continue;
+
+      // Account for wall-end circular collision cap (playerRadius + halfThick) so MAYA never snags jambs
+      const half = Math.max(0.46, portal.width * 0.5) + halfThick + Math.min(0.16, playerRadius * 0.4);
+      if (proj + half > 0 && proj - half < len) {
+        doorGaps.push([Math.max(0, proj - half), Math.min(len, proj + half)]);
+      }
+    }
+
+    doorGaps.sort((a, b) => a[0] - b[0]);
 
     let cursor = 0;
     for (const [gStart, gEnd] of doorGaps) {
@@ -546,6 +616,105 @@ function resolveStrictWallCollision(
   return { x: cx, z: cz };
 }
 
+/**
+ * Exact 2D circle-vs-equipment AABB pushout so MAYA smoothly glides around
+ * bioreactors, tanks, benches, lockers, and skids in both manual & auto-walk modes.
+ */
+function resolveAssetCollisions(
+  x: number,
+  z: number,
+  playerRadius: number,
+  assets: SpatialAsset[],
+  walls: Wall[],
+  openings: Opening[],
+  openDoorsMap?: Record<string, boolean>
+): { x: number; z: number } {
+  if (assets.length === 0) return { x, z };
+  if (isInsideOpenDoorPortal(x, z, walls, openings, openDoorsMap)) {
+    return { x, z };
+  }
+  let cx = x;
+  let cz = z;
+  const r = Math.max(0.18, playerRadius * 0.92);
+
+  for (let iter = 0; iter < 2; iter++) {
+    for (const a of assets) {
+      if (a.hidden || a.y >= 1.55) continue;
+      if (a.width < 0.24 && a.depth < 0.24) continue;
+      const b = getAssetBounds(a);
+      const shrink = 0.04;
+      const minX = b.minX + shrink;
+      const maxX = b.maxX - shrink;
+      const minZ = b.minZ + shrink;
+      const maxZ = b.maxZ - shrink;
+      if (maxX <= minX || maxZ <= minZ) continue;
+
+      const closestX = Math.max(minX, Math.min(cx, maxX));
+      const closestZ = Math.max(minZ, Math.min(cz, maxZ));
+      const dx = cx - closestX;
+      const dz = cz - closestZ;
+      const distSq = dx * dx + dz * dz;
+
+      if (distSq < r * r) {
+        if (distSq > 1e-6) {
+          const dist = Math.sqrt(distSq);
+          const push = r - dist;
+          cx += (dx / dist) * push;
+          cz += (dz / dist) * push;
+        } else {
+          // Inside box: push out along nearest face
+          const penLeft = Math.abs(cx - minX);
+          const penRight = Math.abs(maxX - cx);
+          const penTop = Math.abs(cz - minZ);
+          const penBot = Math.abs(maxZ - cz);
+          const m = Math.min(penLeft, penRight, penTop, penBot);
+          if (m === penLeft) cx = minX - r;
+          else if (m === penRight) cx = maxX + r;
+          else if (m === penTop) cz = minZ - r;
+          else cz = maxZ + r;
+        }
+      }
+    }
+  }
+  return { x: cx, z: cz };
+}
+
+function isInsideOpenDoorPortal(
+  x: number,
+  z: number,
+  walls: Wall[],
+  openings: Opening[],
+  openDoorsMap?: Record<string, boolean>
+): boolean {
+  for (const o of openings) {
+    if (o.kind !== 'door' || o.sillHeight >= 0.25) continue;
+    const isOpen = !openDoorsMap ? true : (openDoorsMap[o.id] ?? o.status === 'open');
+    if (!isOpen) continue;
+    const host = walls.find((w) => w.id === o.wallId);
+    if (!host) continue;
+    const dx = host.x2 - host.x1;
+    const dz = host.z2 - host.z1;
+    const len = Math.hypot(dx, dz);
+    if (len < 0.05) continue;
+    const ux = dx / len;
+    const uz = dz / len;
+    const nx = -uz;
+    const nz = ux;
+    const cx = host.x1 + dx * o.offsetRatio;
+    const cz = host.z1 + dz * o.offsetRatio;
+    const rx = x - cx;
+    const rz = z - cz;
+    const along = Math.abs(rx * ux + rz * uz);
+    const perp = Math.abs(rx * nx + rz * nz);
+    const halfWidth = Math.max(0.5, o.width * 0.5 + 0.04);
+    const halfDepth = Math.max(0.95, (host.thickness || 0.18) + 0.72);
+    if (along <= halfWidth && perp <= halfDepth) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function isNearFloorDoorway(x: number, z: number, walls: Wall[], openings: Opening[]): boolean {
   for (const o of openings) {
     if (o.kind !== 'door' || o.sillHeight >= 0.25) continue;
@@ -558,6 +727,57 @@ function isNearFloorDoorway(x: number, z: number, walls: Wall[], openings: Openi
     }
   }
   return false;
+}
+
+function findClosedDoorAhead(
+  px: number,
+  pz: number,
+  tx: number,
+  tz: number,
+  walls: Wall[],
+  openings: Opening[],
+  openDoorsMap: Record<string, boolean>,
+  maxLookAhead = 1.95
+): { opening: Opening; wall: Wall; cx: number; cz: number; dist: number } | null {
+  const segDx = tx - px;
+  const segDz = tz - pz;
+  const segLen = Math.hypot(segDx, segDz);
+  const dirX = segLen > 1e-4 ? segDx / segLen : 0;
+  const dirZ = segLen > 1e-4 ? segDz / segLen : 0;
+
+  let best: { opening: Opening; wall: Wall; cx: number; cz: number; dist: number } | null = null;
+  for (const o of openings) {
+    if (o.kind !== 'door' || o.sillHeight >= 0.25) continue;
+    const isOpen = Boolean(openDoorsMap[o.id] ?? o.status === 'open');
+    if (isOpen) continue;
+    const host = walls.find((w) => w.id === o.wallId);
+    if (!host) continue;
+
+    const dcx = host.x1 + (host.x2 - host.x1) * o.offsetRatio;
+    const dcz = host.z1 + (host.z2 - host.z1) * o.offsetRatio;
+    const dist = Math.hypot(dcx - px, dcz - pz);
+    if (dist > maxLookAhead) continue;
+
+    // Check if door lies ahead along travel direction OR sits right on the segment toward target
+    const toDoorX = dcx - px;
+    const toDoorZ = dcz - pz;
+    const forwardDot = dist > 1e-4 ? (toDoorX * dirX + toDoorZ * dirZ) / dist : 1;
+
+    let distToSeg = dist;
+    if (segLen > 1e-4) {
+      const t = Math.max(0, Math.min(1, (toDoorX * segDx + toDoorZ * segDz) / (segLen * segLen)));
+      distToSeg = Math.hypot(dcx - (px + segDx * t), dcz - (pz + segDz * t));
+    }
+
+    const onPath =
+      dist <= 1.25 ||
+      (forwardDot >= 0.35 && distToSeg <= Math.max(0.85, o.width * 0.65));
+
+    if (onPath && (!best || dist < best.dist)) {
+      best = { opening: o, wall: host, cx: dcx, cz: dcz, dist };
+    }
+  }
+  return best;
 }
 
 // Cached procedural radial floor light-pool texture for ultra-fast Night Mode warm room glow
@@ -1165,7 +1385,7 @@ export const Viewport3D: React.FC = () => {
   const lastCamProjRef = useRef<Float32Array>(new Float32Array(16));
 
   type WalkInteractable = {
-    kind: 'door' | 'light' | 'equipment';
+    kind: 'door' | 'light' | 'equipment' | 'gown';
     id: string;
     code: string;
     title: string;
@@ -1240,10 +1460,10 @@ export const Viewport3D: React.FC = () => {
   const [placeSnapBadge, setPlaceSnapBadge] = useState<{ label: string; isWall: boolean; isWarning?: boolean } | null>(null);
   const [fpExpandedPad, setFpExpandedPad] = useState(false);
 
-  // 3D HRTF Spatial Audio & Visual Path Finder State
+  // 3D HRTF Spatial Audio & Visual Path Finder State (muted by default)
   const spatialAudioRef = useRef<FacilitySpatialAudioEngine | null>(null);
-  const [spatialAudioEnabled, setSpatialAudioEnabled] = useState(true);
-  const spatialAudioEnabledRef = useRef(true);
+  const [spatialAudioEnabled, setSpatialAudioEnabled] = useState(false);
+  const spatialAudioEnabledRef = useRef(false);
   spatialAudioEnabledRef.current = spatialAudioEnabled;
   const [spatialAudioSettingsOpen, setSpatialAudioSettingsOpen] = useState(false);
   const [spatialAudioSettings, setSpatialAudioSettings] = useState<SpatialAudioSettings>(() => ({
@@ -1253,9 +1473,23 @@ export const Viewport3D: React.FC = () => {
   }));
   const [audioTelemetry, setAudioTelemetry] = useState<NearbyAudioTelemetry | null>(null);
 
+  const toggleSpatialAudio = useCallback(() => {
+    const next = !spatialAudioEnabledRef.current;
+    spatialAudioEnabledRef.current = next;
+    setSpatialAudioEnabled(next);
+    if (!spatialAudioRef.current) {
+      spatialAudioRef.current = new FacilitySpatialAudioEngine();
+    }
+    const shouldBeActive = Boolean(storeRef.current.firstPersonMode && next);
+    spatialAudioRef.current.setEnabled(shouldBeActive);
+    if (!shouldBeActive) {
+      setAudioTelemetry(null);
+    }
+  }, []);
+
   const [pathFinderOpen, setPathFinderOpen] = useState(false);
-  const [pathAlgorithm, setPathAlgorithm] = useState<PathRoutingAlgorithm>('shortest');
-  const pathAlgorithmRef = useRef<PathRoutingAlgorithm>('shortest');
+  const [pathAlgorithm, setPathAlgorithm] = useState<PathRoutingAlgorithm>('gmp-compliant');
+  const pathAlgorithmRef = useRef<PathRoutingAlgorithm>('gmp-compliant');
   pathAlgorithmRef.current = pathAlgorithm;
 
   const [noGoZones, setNoGoZones] = useState<NoGoZone[]>([]);
@@ -1279,12 +1513,21 @@ export const Viewport3D: React.FC = () => {
     code: string;
     remainingM: number;
     autoWalking: boolean;
+    protocolSummary?: string;
+    roomTrail?: string;
+    statusStep?: string | null;
   } | null>(null);
 
   const openDoorsState = useMayaStore((s) => s.openDoors);
   const roomLightsState = useMayaStore((s) => s.roomLights);
   const switchStates = useMayaStore((s) => s.switchStates);
+  const mayaIsGowned = useMayaStore((s) => s.isGowned);
   const focusedInspectorRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    engineRef.current?.walkAvatar.mayaController?.setGowned(mayaIsGowned);
+    engineRef.current?.requestRender();
+  }, [mayaIsGowned]);
 
   useEffect(() => {
     engineRef.current?.requestRender();
@@ -1303,6 +1546,10 @@ export const Viewport3D: React.FC = () => {
       eng.pathFinderWaypoints = [];
       eng.teleportQueue = [];
       eng.teleportTarget = null;
+      eng.autoNavCheckpoints = [];
+      eng.autoNavPendingDoorId = null;
+      eng.autoNavPauseUntil = 0;
+      eng.autoNavStatus = null;
       eng.teleportRing.visible = false;
       eng.pathFinderGroup.visible = false;
       disposeObject3D(eng.pathFinderGroup);
@@ -1315,7 +1562,7 @@ export const Viewport3D: React.FC = () => {
 
   const setPathFinderRoute = useCallback(
     (
-      dest: { label: string; code: string; x: number; z: number },
+      dest: { label: string; code: string; x: number; z: number; roomId?: string },
       autoWalk: boolean
     ) => {
       const eng = engineRef.current;
@@ -1323,27 +1570,61 @@ export const Viewport3D: React.FC = () => {
       const st = storeRef.current;
       const fl = st.scene.floors.find((f) => f.id === st.activeFloorId);
       const flElev = fl?.elevation ?? 0;
+      const floorRooms = st.scene.rooms.filter((r) => r.floorId === st.activeFloorId);
       const algo = pathAlgorithmRef.current;
       const zones = noGoZonesRef.current;
 
-      const pts = eng.navMesh
-        ? eng.navMesh.findPath(eng.fpPosX, eng.fpPosZ, dest.x, dest.z, {
-            algorithm: algo,
-            noGoZones: zones,
-          })
-        : [
-            { x: eng.fpPosX, z: eng.fpPosZ },
-            { x: dest.x, z: dest.z },
-          ];
+      const plan = planGmpRoute(
+        eng.navMesh,
+        eng.fpPosX,
+        eng.fpPosZ,
+        dest.x,
+        dest.z,
+        floorRooms,
+        {
+          algorithm: algo,
+          noGoZones: zones,
+          rooms: floorRooms,
+          isGowned: useMayaStore.getState().isGowned,
+        }
+      );
+
+      const pts = plan.points;
       const finalPt = pts[pts.length - 1] ?? { x: dest.x, z: dest.z };
-      eng.pathFinderDest = { label: dest.label, code: dest.code, x: finalPt.x, z: finalPt.z };
+      const destRoomMatch =
+        (dest.roomId ? floorRooms.find((r) => r.id === dest.roomId) : undefined) ??
+        floorRooms.find(
+          (r) =>
+            finalPt.x >= r.x &&
+            finalPt.x <= r.x + r.width &&
+            finalPt.z >= r.z &&
+            finalPt.z <= r.z + r.depth
+        );
+
+      eng.pathFinderDest = {
+        label: dest.label,
+        code: dest.code,
+        x: finalPt.x,
+        z: finalPt.z,
+        roomId: destRoomMatch?.id,
+      };
       eng.pathFinderWaypoints = pts;
+      eng.autoNavCheckpoints = autoWalk ? [...plan.checkpoints] : [];
+      eng.autoNavPendingDoorId = null;
+      eng.autoNavPauseUntil = 0;
+      eng.autoNavStatus = autoWalk
+        ? plan.passesThroughPal
+          ? 'Routing via PAL gowning & clean corridor...'
+          : 'Walking along GMP path (auto-opening doors)...'
+        : null;
+
       eng.pathFinderRig = populatePathFinderVisual(
         eng.pathFinderGroup,
         pts,
         flElev,
         disposeObject3D,
-        algo
+        algo,
+        plan.checkpoints
       );
       eng.lastPathRerouteAt = performance.now();
 
@@ -1362,17 +1643,24 @@ export const Viewport3D: React.FC = () => {
       }
 
       const distM = Number(computePathLengthMeters(pts).toFixed(1));
+      const roomTrail =
+        plan.roomSequence.length > 1
+          ? plan.roomSequence.map((r) => r.code).join(' → ')
+          : undefined;
       setPathFinderHud({
         label: dest.label,
         code: dest.code,
         remainingM: distM,
         autoWalking: autoWalk,
+        protocolSummary: plan.gmpProtocolSummary,
+        roomTrail,
+        statusStep: eng.autoNavStatus,
       });
       setPathFinderOpen(false);
       st.showToast(
         autoWalk
-          ? `Path Finder (${algo === 'least-congested' ? 'Least Congested' : 'Shortest'}): auto-walking to ${dest.code} (${distM}m)`
-          : `Path Finder (${algo === 'least-congested' ? 'Least Congested' : 'Shortest'}): route highlighted to ${dest.code} (${distM}m)`,
+          ? `${plan.gmpProtocolSummary}: walking to ${dest.code} (${distM}m)`
+          : `${plan.gmpProtocolSummary}: route highlighted to ${dest.code} (${distM}m)`,
         'info'
       );
       eng.requestRender();
@@ -1394,37 +1682,59 @@ export const Viewport3D: React.FC = () => {
     if (!eng) return;
     const fl = sceneData.floors.find((f) => f.id === activeFloorId);
     const flElev = fl?.elevation ?? 0;
+    const floorRooms = sceneData.rooms.filter((r) => r.floorId === activeFloorId);
     const floorZones = noGoZones.filter((z) => z.floorId === activeFloorId);
     populateNoGoZonesVisual(eng.noGoZonesGroup, floorZones, flElev, disposeObject3D);
 
     if (eng.pathFinderDest && eng.pathFinderGroup.visible) {
       const dest = eng.pathFinderDest;
-      const pts = eng.navMesh
-        ? eng.navMesh.findPath(eng.fpPosX, eng.fpPosZ, dest.x, dest.z, {
-            algorithm: pathAlgorithm,
-            noGoZones,
-          })
-        : [
-            { x: eng.fpPosX, z: eng.fpPosZ },
-            { x: dest.x, z: dest.z },
-          ];
+      const plan = planGmpRoute(
+        eng.navMesh,
+        eng.fpPosX,
+        eng.fpPosZ,
+        dest.x,
+        dest.z,
+        floorRooms,
+        {
+          algorithm: pathAlgorithm,
+          noGoZones,
+          rooms: floorRooms,
+          isGowned: useMayaStore.getState().isGowned,
+        }
+      );
+      const pts = plan.points;
       eng.pathFinderWaypoints = pts;
       eng.pathFinderRig = populatePathFinderVisual(
         eng.pathFinderGroup,
         pts,
         flElev,
         disposeObject3D,
-        pathAlgorithm
+        pathAlgorithm,
+        plan.checkpoints
       );
       if (eng.teleportTarget) {
+        eng.autoNavCheckpoints = [...plan.checkpoints];
         eng.teleportQueue = pts.slice(1);
         eng.teleportTarget = eng.teleportQueue.shift() ?? null;
       }
       const distM = Number(computePathLengthMeters(pts).toFixed(1));
-      setPathFinderHud((prev) => (prev ? { ...prev, remainingM: distM } : null));
+      const roomTrail =
+        plan.roomSequence.length > 1
+          ? plan.roomSequence.map((r) => r.code).join(' → ')
+          : undefined;
+      setPathFinderHud((prev) =>
+        prev
+          ? {
+              ...prev,
+              remainingM: distM,
+              protocolSummary: plan.gmpProtocolSummary,
+              roomTrail,
+            }
+          : null
+      );
     }
     eng.requestRender();
-  }, [noGoZones, pathAlgorithm, activeFloorId, sceneData.floors]);
+  }, [noGoZones, pathAlgorithm, activeFloorId, sceneData.floors, sceneData.rooms]);
 
   // Manage 3D Spatial Audio activation with first-person walkthrough mode
   useEffect(() => {
@@ -1505,6 +1815,25 @@ export const Viewport3D: React.FC = () => {
         eng.walkAvatar.mayaController.setState('analyze', { expression: 'curious', fade: 0.25, restart: true });
       }
       eng?.requestRender();
+    } else if (item.kind === 'gown') {
+      const nextGowned = !maya.isGowned;
+      maya.setGowned(nextGowned, item.title, item.roomId ?? null);
+      if (eng?.walkAvatar.mayaController) {
+        eng.walkAvatar.mayaController.setGowned(nextGowned);
+        eng.walkAvatar.manualEmoteUntil = performance.now() + 2200;
+        eng.walkAvatar.mayaController.setState(nextGowned ? 'celebrate' : 'approval', {
+          expression: 'happy',
+          fade: 0.22,
+          restart: true,
+        });
+      }
+      storeRef.current.showToast(
+        nextGowned
+          ? 'MAYA changed into Full Sterile Cleanroom Gown (Grade A/B)'
+          : 'MAYA de-gowned back to Standard Facility Uniform',
+        'success'
+      );
+      eng?.requestRender();
     }
   }, []);
 
@@ -1553,9 +1882,22 @@ export const Viewport3D: React.FC = () => {
     pathFinderGroup: THREE.Group;
     noGoZonesGroup: THREE.Group;
     pathFinderRig: PathFinderVisualRig | null;
-    pathFinderDest: { label: string; code: string; x: number; z: number } | null;
+    pathFinderDest: { label: string; code: string; x: number; z: number; roomId?: string } | null;
     pathFinderWaypoints: Array<{ x: number; z: number }>;
     teleportQueue: Array<{ x: number; z: number }>;
+    autoNavCheckpoints: GmpRouteCheckpoint[];
+    autoNavPendingDoorId: string | null;
+    autoNavPauseUntil: number;
+    autoNavStatus: string | null;
+    autoOpenedDoors: Array<{
+      id: string;
+      label: string;
+      roomId: string | null;
+      x: number;
+      z: number;
+      subtype: string;
+      openedAt: number;
+    }>;
     lastPathRerouteAt: number;
     teleportRing: THREE.Mesh;
     teleportTarget: { x: number; z: number } | null;
@@ -1566,7 +1908,14 @@ export const Viewport3D: React.FC = () => {
     tracePulseInstancedMesh: THREE.InstancedMesh | null;
     tracePulseTracks: FlowPulseTrack[];
     lastPulseTick: number;
+    fpVelX: number;
+    fpVelZ: number;
     fpVelY: number;
+    autoWalkSpeed: number;
+    camSmoothX: number;
+    camSmoothY: number;
+    camSmoothZ: number;
+    camSmoothReady: boolean;
     fpOnGround: boolean;
     fpYaw: number;
     fpCamYaw: number;
@@ -1832,8 +2181,13 @@ export const Viewport3D: React.FC = () => {
 
           // Animate realistic doors by type + sync dynamic room lighting every frame
           const mayaSnapshot = useMayaStore.getState();
+          const sceneOpeningsById = new Map(
+            storeRef.current.scene.openings.map((op) => [op.id, op] as const)
+          );
           eng.animatedDoors.forEach((rig) => {
-            const targetOpen = mayaSnapshot.openDoors[rig.openingId] ? 1 : 0;
+            const opRecord = sceneOpeningsById.get(rig.openingId);
+            const isDoorOpen = mayaSnapshot.openDoors[rig.openingId] ?? opRecord?.status === 'open';
+            const targetOpen = isDoorOpen ? 1 : 0;
             if (Math.abs(rig.progress - targetOpen) > 0.002) {
               rig.progress = THREE.MathUtils.damp(rig.progress, targetOpen, 7.5, dt);
               if (Math.abs(rig.progress - targetOpen) <= 0.004) rig.progress = targetOpen;
@@ -1958,177 +2312,504 @@ export const Viewport3D: React.FC = () => {
             const flId = storeRef.current.activeFloorId;
             const flWalls = storeRef.current.scene.walls.filter((w) => w.floorId === flId);
             const flOpenings = storeRef.current.scene.openings.filter((o) => o.floorId === flId);
+            const flAssets = storeRef.current.scene.assets.filter(
+              (a) => a.floorId === flId && !a.hidden
+            );
             const floorW = activeFl?.width ?? 0;
             const floorD = activeFl?.depth ?? 0;
             const openDoorsMap = mayaSnapshot.openDoors;
             const MAYA_RADIUS = 0.28;
 
-            if (inputLen > 0.02) {
-              manualWalkActive = true;
-              eng.teleportTarget = null;
-              eng.teleportRing.visible = false;
-
-              const speed = (sprinting ? 8.2 : 4.8) * dt;
-              const moveYaw = isThirdPerson ? eng.fpCamYaw : eng.fpYaw;
-              const forward = new THREE.Vector3(-Math.sin(moveYaw), 0, -Math.cos(moveYaw)).normalize();
-              const right = new THREE.Vector3(Math.cos(moveYaw), 0, -Math.sin(moveYaw)).normalize();
-
-              const throttle = Math.min(1, inputLen);
-              const move = new THREE.Vector3()
-                .addScaledVector(forward, fwdAmt / inputLen)
-                .addScaledVector(right, rightAmt / inputLen)
-                .multiplyScalar(speed * throttle);
-
-              // Rotate MAYA smoothly toward movement direction + GTA-style follow-behind camera alignment
-              if (isThirdPerson) {
-                const desiredCharYaw = Math.atan2(-move.x, -move.z);
-                let diffChar = desiredCharYaw - eng.fpYaw;
-                while (diffChar > Math.PI) diffChar -= Math.PI * 2;
-                while (diffChar < -Math.PI) diffChar += Math.PI * 2;
-                eng.fpYaw += diffChar * Math.min(1, dt * 11);
-
-                // Smoothly swing camera behind character while walking (GTA style)
-                if (!eng.fpLookDragging) {
-                  let diffCam = eng.fpYaw - eng.fpCamYaw;
-                  while (diffCam > Math.PI) diffCam -= Math.PI * 2;
-                  while (diffCam < -Math.PI) diffCam += Math.PI * 2;
-                  eng.fpCamYaw += diffCam * Math.min(1, dt * 4.5);
-                }
-              } else {
-                eng.fpCamYaw = eng.fpYaw;
-              }
-
-              // Sub-step every <= 0.075m so even Sprint mode NEVER clips MAYA's head into walls
-              const totalDist = Math.hypot(move.x, move.z);
-              const subSteps = Math.max(1, Math.ceil(totalDist / 0.075));
-              const stepDx = move.x / subSteps;
-              const stepDz = move.z / subSteps;
-
-              let stepX = eng.fpPosX;
-              let stepZ = eng.fpPosZ;
-
-              for (let s = 0; s < subSteps; s++) {
-                const wantX = stepX + stepDx;
-                const wantZ = stepZ + stepDz;
-
-                const navRes = eng.navMesh
-                  ? eng.navMesh.resolveMove(stepX, stepZ, wantX, wantZ)
-                  : { x: wantX, z: wantZ };
-
-                const strict = resolveStrictWallCollision(
-                  stepX,
-                  stepZ,
-                  navRes.x,
-                  navRes.z,
-                  MAYA_RADIUS,
-                  flWalls,
-                  flOpenings,
-                  floorW,
-                  floorD,
-                  openDoorsMap
+            // GMP Pressure Cascade Integrity: auto-close cleanroom/airlock/fire doors behind MAYA
+            // once she has walked cleanly past them (> 2.25m away and > 900ms after opening)
+            if (eng.autoOpenedDoors.length > 0) {
+              for (let di = eng.autoOpenedDoors.length - 1; di >= 0; di--) {
+                const openedDoor = eng.autoOpenedDoors[di];
+                if (openedDoor.id === eng.autoNavPendingDoorId) continue;
+                const clearDist = Math.hypot(
+                  eng.fpPosX - openedDoor.x,
+                  eng.fpPosZ - openedDoor.z
                 );
-
-                if (eng.navMesh && !eng.navMesh.isWalkable(strict.x, strict.z)) {
-                  const reNav = eng.navMesh.resolveMove(stepX, stepZ, strict.x, strict.z);
-                  if (eng.navMesh.isWalkable(reNav.x, reNav.z)) {
-                    stepX = reNav.x;
-                    stepZ = reNav.z;
-                  }
-                  break;
-                }
-
-                if (Math.hypot(strict.x - stepX, strict.z - stepZ) < 0.0005) {
-                  break;
-                }
-                stepX = strict.x;
-                stepZ = strict.z;
-              }
-
-              if (Math.hypot(stepX - eng.fpPosX, stepZ - eng.fpPosZ) > 0.0008) {
-                movedThisFrame = true;
-              }
-              eng.fpPosX = stepX;
-              eng.fpPosZ = stepZ;
-              needsAnother = true;
-            } else if (eng.teleportTarget) {
-              // Smooth A* Waypoint-by-Waypoint Path Finder Teleport Glide
-              const tdx = eng.teleportTarget.x - eng.fpPosX;
-              const tdz = eng.teleportTarget.z - eng.fpPosZ;
-              const dist = Math.hypot(tdx, tdz);
-              if (dist < 0.22) {
-                if (eng.teleportQueue.length > 0) {
-                  eng.teleportTarget = eng.teleportQueue.shift() ?? null;
-                  needsAnother = true;
-                } else {
-                  eng.teleportTarget = null;
-                  eng.teleportRing.visible = false;
-                  if (eng.pathFinderDest) {
-                    const destDist = Math.hypot(
-                      eng.pathFinderDest.x - eng.fpPosX,
-                      eng.pathFinderDest.z - eng.fpPosZ
-                    );
-                    if (destDist < 1.35) {
-                      const arrivedLabel = eng.pathFinderDest.label;
-                      eng.pathFinderDest = null;
-                      eng.pathFinderWaypoints = [];
-                      eng.pathFinderGroup.visible = false;
-                      disposeObject3D(eng.pathFinderGroup);
-                      eng.pathFinderGroup.clear();
-                      eng.pathFinderRig = null;
-                      setPathFinderHud(null);
-                      storeRef.current.showToast(`Arrived at ${arrivedLabel}`, 'success');
-                    } else {
-                      setPathFinderHud((prev) => (prev ? { ...prev, autoWalking: false } : null));
+                if (clearDist > 2.25 && now - openedDoor.openedAt > 900) {
+                  if (useMayaStore.getState().openDoors[openedDoor.id]) {
+                    useMayaStore
+                      .getState()
+                      .toggleDoor(openedDoor.id, openedDoor.label, openedDoor.roomId);
+                    if (spatialAudioEnabledRef.current) {
+                      spatialAudioRef.current?.playDoorCue(false);
                     }
                   }
-                }
-              } else {
-                const step = Math.min(dist, 9.5 * dt);
-                const wantX = eng.fpPosX + (tdx / dist) * step;
-                const wantZ = eng.fpPosZ + (tdz / dist) * step;
-                const strict = resolveStrictWallCollision(
-                  eng.fpPosX,
-                  eng.fpPosZ,
-                  wantX,
-                  wantZ,
-                  MAYA_RADIUS,
-                  flWalls,
-                  flOpenings,
-                  floorW,
-                  floorD,
-                  openDoorsMap
-                );
-                const moved = Math.hypot(strict.x - eng.fpPosX, strict.z - eng.fpPosZ);
-                if (moved < 0.004) {
-                  // Hit a closed door or obstacle along path — stop auto-glide so user can press Space to open door
-                  eng.teleportTarget = null;
-                  eng.teleportQueue = [];
-                  eng.teleportRing.visible = false;
-                  setPathFinderHud((prev) => (prev ? { ...prev, autoWalking: false } : null));
-                } else {
-                  eng.fpPosX = strict.x;
-                  eng.fpPosZ = strict.z;
-                  movedThisFrame = true;
-                  const targetYaw = Math.atan2(-tdx, -tdz);
-                  let dyaw = targetYaw - eng.fpYaw;
-                  while (dyaw > Math.PI) dyaw -= Math.PI * 2;
-                  while (dyaw < -Math.PI) dyaw += Math.PI * 2;
-                  eng.fpYaw += dyaw * Math.min(1, dt * 12);
-                  if (!eng.fpLookDragging) {
-                    let dcam = eng.fpYaw - eng.fpCamYaw;
-                    while (dcam > Math.PI) dcam -= Math.PI * 2;
-                    while (dcam < -Math.PI) dcam += Math.PI * 2;
-                    eng.fpCamYaw += dcam * Math.min(1, dt * 6);
-                  }
-                  const finalGoal =
-                    eng.teleportQueue.length > 0
-                      ? eng.teleportQueue[eng.teleportQueue.length - 1]
-                      : eng.teleportTarget;
-                  eng.teleportRing.visible = true;
-                  eng.teleportRing.position.set(finalGoal.x, floorElev + 0.055, finalGoal.z);
-                  const pulse = 0.85 + Math.sin(now * 0.01) * 0.18;
-                  eng.teleportRing.scale.setScalar(pulse);
+                  eng.autoOpenedDoors.splice(di, 1);
                   needsAnother = true;
+                }
+              }
+            }
+
+            // Smooth velocity-damped manual walking (supports smooth acceleration + inertia coasting)
+            const hasManualInput = inputLen > 0.02;
+            const hasResidualVel = !eng.teleportTarget && Math.hypot(eng.fpVelX, eng.fpVelZ) > 0.08;
+
+            if (hasManualInput || hasResidualVel) {
+              if (hasManualInput) {
+                manualWalkActive = true;
+                eng.teleportTarget = null;
+                eng.teleportQueue = [];
+                eng.autoNavPendingDoorId = null;
+                eng.autoNavPauseUntil = 0;
+                eng.autoNavStatus = null;
+                eng.autoWalkSpeed = 0;
+                eng.teleportRing.visible = false;
+
+                const maxSpeed = sprinting ? 7.4 : 4.4;
+                const moveYaw = isThirdPerson ? eng.fpCamYaw : eng.fpYaw;
+                const fwdX = -Math.sin(moveYaw);
+                const fwdZ = -Math.cos(moveYaw);
+                const rgtX = Math.cos(moveYaw);
+                const rgtZ = -Math.sin(moveYaw);
+
+                const throttle = Math.min(1, inputLen);
+                const targetVx = ((fwdX * fwdAmt + rgtX * rightAmt) / inputLen) * maxSpeed * throttle;
+                const targetVz = ((fwdZ * fwdAmt + rgtZ * rightAmt) / inputLen) * maxSpeed * throttle;
+                eng.fpVelX = THREE.MathUtils.damp(eng.fpVelX, targetVx, 13, dt);
+                eng.fpVelZ = THREE.MathUtils.damp(eng.fpVelZ, targetVz, 13, dt);
+              } else {
+                // Smooth deceleration glide to stop
+                eng.fpVelX = THREE.MathUtils.damp(eng.fpVelX, 0, 16, dt);
+                eng.fpVelZ = THREE.MathUtils.damp(eng.fpVelZ, 0, 16, dt);
+                if (Math.hypot(eng.fpVelX, eng.fpVelZ) < 0.06) {
+                  eng.fpVelX = 0;
+                  eng.fpVelZ = 0;
+                }
+              }
+
+              const moveX = eng.fpVelX * dt;
+              const moveZ = eng.fpVelZ * dt;
+              const totalDist = Math.hypot(moveX, moveZ);
+
+              // Rotate MAYA smoothly toward movement direction + smooth follow-behind camera alignment
+              if (totalDist > 0.001) {
+                if (isThirdPerson) {
+                  const desiredCharYaw = Math.atan2(-moveX, -moveZ);
+                  let diffChar = desiredCharYaw - eng.fpYaw;
+                  while (diffChar > Math.PI) diffChar -= Math.PI * 2;
+                  while (diffChar < -Math.PI) diffChar += Math.PI * 2;
+                  eng.fpYaw += diffChar * Math.min(1, dt * 10);
+
+                  if (!eng.fpLookDragging && hasManualInput) {
+                    let diffCam = eng.fpYaw - eng.fpCamYaw;
+                    while (diffCam > Math.PI) diffCam -= Math.PI * 2;
+                    while (diffCam < -Math.PI) diffCam += Math.PI * 2;
+                    eng.fpCamYaw += diffCam * Math.min(1, dt * 3.8);
+                  }
+                } else {
+                  eng.fpCamYaw = eng.fpYaw;
+                }
+
+                // Sub-step every <= 0.075m with strict closed-door, wall & equipment collision
+                const subSteps = Math.max(1, Math.ceil(totalDist / 0.075));
+                const stepDx = moveX / subSteps;
+                const stepDz = moveZ / subSteps;
+
+                let stepX = eng.fpPosX;
+                let stepZ = eng.fpPosZ;
+
+                for (let s = 0; s < subSteps; s++) {
+                  const wantX = stepX + stepDx;
+                  const wantZ = stepZ + stepDz;
+
+                  // Strict wall & closed-door collision FIRST
+                  const wallRes = resolveStrictWallCollision(
+                    stepX,
+                    stepZ,
+                    wantX,
+                    wantZ,
+                    MAYA_RADIUS,
+                    flWalls,
+                    flOpenings,
+                    floorW,
+                    floorD,
+                    openDoorsMap
+                  );
+
+                  // Strict equipment/furniture collision SECOND, then re-verify walls
+                  const assetRes = resolveAssetCollisions(
+                    wallRes.x,
+                    wallRes.z,
+                    MAYA_RADIUS,
+                    flAssets,
+                    flWalls,
+                    flOpenings,
+                    openDoorsMap
+                  );
+                  const strict = resolveStrictWallCollision(
+                    stepX,
+                    stepZ,
+                    assetRes.x,
+                    assetRes.z,
+                    MAYA_RADIUS,
+                    flWalls,
+                    flOpenings,
+                    floorW,
+                    floorD,
+                    openDoorsMap
+                  );
+
+                  if (Math.hypot(strict.x - stepX, strict.z - stepZ) < 0.0005) {
+                    // Kill velocity component pushing into wall/closed door so zero jitter occurs
+                    eng.fpVelX *= 0.45;
+                    eng.fpVelZ *= 0.45;
+                    break;
+                  }
+                  stepX = strict.x;
+                  stepZ = strict.z;
+                }
+
+                if (Math.hypot(stepX - eng.fpPosX, stepZ - eng.fpPosZ) > 0.0008) {
+                  movedThisFrame = true;
+                }
+                eng.fpPosX = stepX;
+                eng.fpPosZ = stepZ;
+              }
+              needsAnother = true;
+            } else if (eng.teleportTarget) {
+              // Autonomous GMP Waypoint Navigation (auto-opens doors/airlocks, stages via PAL gowning, closes cleanroom doors behind)
+              const triggerAutoDoorOpen = (doorHit: {
+                opening: Opening;
+                wall: Wall;
+                cx: number;
+                cz: number;
+              }) => {
+                const op = doorHit.opening;
+                const maya = useMayaStore.getState();
+                const isInterlock =
+                  op.subtype === 'airlock-door' || op.accessControl === 'interlock';
+                // GMP Airlock Cascade: close any previously auto-opened door before opening an interlocked door
+                if (isInterlock && eng.autoOpenedDoors.length > 0) {
+                  for (let k = eng.autoOpenedDoors.length - 1; k >= 0; k--) {
+                    const prevDoor = eng.autoOpenedDoors[k];
+                    if (prevDoor.id !== op.id && maya.openDoors[prevDoor.id]) {
+                      maya.toggleDoor(prevDoor.id, prevDoor.label, prevDoor.roomId);
+                      if (spatialAudioEnabledRef.current) {
+                        spatialAudioRef.current?.playDoorCue(false);
+                      }
+                    }
+                    eng.autoOpenedDoors.splice(k, 1);
+                  }
+                }
+
+                const doorLabel = op.name || 'Facility Door';
+                const waitMs = isInterlock
+                  ? 720
+                  : op.accessControl === 'biometric'
+                    ? 660
+                    : op.accessControl === 'badge'
+                      ? 500
+                      : 400;
+                const stepMsg = isInterlock
+                  ? `Interlock cascade · Opening ${doorLabel}`
+                  : op.accessControl === 'biometric'
+                    ? `Biometric scan · Opening ${doorLabel}`
+                    : op.accessControl === 'badge'
+                      ? `Badge access · Opening ${doorLabel}`
+                      : `Opening ${doorLabel}`;
+
+                if (!(maya.openDoors[op.id] ?? op.status === 'open')) {
+                  maya.toggleDoor(op.id, doorLabel, doorHit.wall.roomId ?? null);
+                  if (spatialAudioEnabledRef.current) {
+                    spatialAudioRef.current?.playDoorCue(true);
+                  }
+                }
+
+                if (!eng.autoOpenedDoors.some((d) => d.id === op.id)) {
+                  eng.autoOpenedDoors.push({
+                    id: op.id,
+                    label: doorLabel,
+                    roomId: doorHit.wall.roomId ?? null,
+                    x: doorHit.cx,
+                    z: doorHit.cz,
+                    subtype: op.subtype,
+                    openedAt: now,
+                  });
+                }
+
+                eng.autoNavPendingDoorId = op.id;
+                eng.autoNavPauseUntil = now + waitMs;
+                eng.autoNavStatus = stepMsg;
+                if (eng.walkAvatar.mayaController) {
+                  eng.walkAvatar.manualEmoteUntil = now + waitMs + 350;
+                  eng.walkAvatar.mayaController.setState('working', {
+                    expression: 'approval',
+                    fade: 0.2,
+                    restart: true,
+                  });
+                }
+                setPathFinderHud((prev) => (prev ? { ...prev, statusStep: stepMsg } : null));
+              };
+
+              let autoPaused = false;
+
+              // 1. Wait for a door that MAYA just triggered to finish swinging/sliding clear
+              if (eng.autoNavPendingDoorId) {
+                const rig = eng.animatedDoors.get(eng.autoNavPendingDoorId);
+                if (rig) {
+                  const faceYaw = Math.atan2(-(rig.worldX - eng.fpPosX), -(rig.worldZ - eng.fpPosZ));
+                  let dy = faceYaw - eng.fpYaw;
+                  while (dy > Math.PI) dy -= Math.PI * 2;
+                  while (dy < -Math.PI) dy += Math.PI * 2;
+                  eng.fpYaw += dy * Math.min(1, dt * 10);
+                }
+                const doorReady = !rig || rig.progress >= 0.72;
+                if (now < eng.autoNavPauseUntil || !doorReady) {
+                  eng.autoWalkSpeed = THREE.MathUtils.damp(eng.autoWalkSpeed, 0, 12, dt);
+                  autoPaused = true;
+                  needsAnother = true;
+                } else {
+                  eng.autoNavPendingDoorId = null;
+                  eng.autoNavStatus = 'Walking along GMP path...';
+                  setPathFinderHud((prev) =>
+                    prev ? { ...prev, statusStep: eng.autoNavStatus } : null
+                  );
+                }
+              } else if (now < eng.autoNavPauseUntil) {
+                // 2. Waiting at GMP PAL Gowning / De-Gowning protocol checkpoint
+                eng.autoWalkSpeed = THREE.MathUtils.damp(eng.autoWalkSpeed, 0, 12, dt);
+                autoPaused = true;
+                needsAnother = true;
+              }
+
+              // 3. Trigger PAL Gowning / De-Gowning checkpoint when MAYA reaches it
+              if (!autoPaused && eng.autoNavCheckpoints.length > 0) {
+                const cp = eng.autoNavCheckpoints[0];
+                if (Math.hypot(cp.x - eng.fpPosX, cp.z - eng.fpPosZ) < 1.15) {
+                  eng.autoNavCheckpoints.shift();
+                  eng.autoNavPauseUntil = now + cp.durationMs;
+                  eng.autoNavStatus = cp.label;
+                  eng.autoWalkSpeed = 0;
+                  const gownOn = cp.kind === 'gowning';
+                  useMayaStore
+                    .getState()
+                    .setGowned(gownOn, `${cp.roomCode} · ${cp.roomName}`, cp.roomId);
+                  if (eng.walkAvatar.mayaController) {
+                    eng.walkAvatar.mayaController.setGowned(gownOn);
+                    eng.walkAvatar.manualEmoteUntil = now + cp.durationMs + 300;
+                    eng.walkAvatar.mayaController.setState(gownOn ? 'celebrate' : 'working', {
+                      expression: 'happy',
+                      fade: 0.2,
+                      restart: true,
+                    });
+                  }
+                  storeRef.current.showToast(
+                    gownOn
+                      ? `Changed into Full Sterile Cleanroom Gown in ${cp.roomCode}`
+                      : `De-Gowned Cleanroom Suit in ${cp.roomCode}`,
+                    'success'
+                  );
+                  setPathFinderHud((prev) => (prev ? { ...prev, statusStep: cp.label } : null));
+                  autoPaused = true;
+                  needsAnother = true;
+                }
+              }
+
+              if (!autoPaused) {
+                const tdx = eng.teleportTarget.x - eng.fpPosX;
+                const tdz = eng.teleportTarget.z - eng.fpPosZ;
+                const dist = Math.hypot(tdx, tdz);
+                if (dist < 0.28) {
+                  if (eng.teleportQueue.length > 0) {
+                    eng.teleportTarget = eng.teleportQueue.shift() ?? null;
+                    needsAnother = true;
+                  } else {
+                    eng.teleportTarget = null;
+                    eng.teleportRing.visible = false;
+                    eng.autoNavPendingDoorId = null;
+                    eng.autoNavPauseUntil = 0;
+                    eng.autoNavStatus = null;
+                    if (eng.pathFinderDest) {
+                      const arrivedDest = eng.pathFinderDest;
+                      const destDist = Math.hypot(
+                        arrivedDest.x - eng.fpPosX,
+                        arrivedDest.z - eng.fpPosZ
+                      );
+                      if (destDist < 1.6) {
+                        // If arriving in a dark room, automatically turn on room lighting
+                        const destRoom =
+                          (arrivedDest.roomId
+                            ? storeRef.current.scene.rooms.find(
+                                (r) => r.id === arrivedDest.roomId
+                              )
+                            : undefined) ??
+                          storeRef.current.scene.rooms.find(
+                            (r) =>
+                              r.floorId === flId &&
+                              eng.fpPosX >= r.x &&
+                              eng.fpPosX <= r.x + r.width &&
+                              eng.fpPosZ >= r.z &&
+                              eng.fpPosZ <= r.z + r.depth
+                          );
+                        if (destRoom && useMayaStore.getState().roomLights[destRoom.id] === false) {
+                          const turnedOn = useMayaStore
+                            .getState()
+                            .toggleRoomLight(destRoom.id, destRoom.code, destRoom.name);
+                          if (spatialAudioEnabledRef.current) {
+                            spatialAudioRef.current?.playSwitchCue(turnedOn);
+                          }
+                        }
+                        if (eng.walkAvatar.mayaController) {
+                          eng.walkAvatar.manualEmoteUntil = now + 1800;
+                          eng.walkAvatar.mayaController.setState('approval', {
+                            expression: 'happy',
+                            fade: 0.22,
+                            restart: true,
+                          });
+                        }
+                        eng.pathFinderDest = null;
+                        eng.pathFinderWaypoints = [];
+                        eng.autoNavCheckpoints = [];
+                        eng.pathFinderGroup.visible = false;
+                        disposeObject3D(eng.pathFinderGroup);
+                        eng.pathFinderGroup.clear();
+                        eng.pathFinderRig = null;
+                        setPathFinderHud(null);
+                        storeRef.current.showToast(
+                          `Arrived at ${arrivedDest.code} · ${arrivedDest.label}`,
+                          'success'
+                        );
+                      } else {
+                        setPathFinderHud((prev) =>
+                          prev ? { ...prev, autoWalking: false, statusStep: null } : null
+                        );
+                      }
+                    }
+                  }
+                } else {
+                  // 4. Proactively scan ahead for any closed door along the planned GMP route
+                  const upcomingDoor = findClosedDoorAhead(
+                    eng.fpPosX,
+                    eng.fpPosZ,
+                    eng.teleportTarget.x,
+                    eng.teleportTarget.z,
+                    flWalls,
+                    flOpenings,
+                    useMayaStore.getState().openDoors,
+                    1.95
+                  );
+
+                  if (upcomingDoor) {
+                    triggerAutoDoorOpen(upcomingDoor);
+                    needsAnother = true;
+                  } else {
+                    // Smooth speed ramp-in & arrival ease-out for silky autonomous walking
+                    const isFinalLeg = eng.teleportQueue.length === 0;
+                    const desiredAutoSpeed =
+                      isFinalLeg && dist < 1.25 ? Math.max(1.4, dist * 3.5) : 4.55;
+                    eng.autoWalkSpeed = THREE.MathUtils.damp(
+                      eng.autoWalkSpeed,
+                      desiredAutoSpeed,
+                      8,
+                      dt
+                    );
+                    const step = Math.min(dist, eng.autoWalkSpeed * dt);
+                    const subSteps = Math.max(1, Math.ceil(step / 0.08));
+                    const sDx = ((tdx / dist) * step) / subSteps;
+                    const sDz = ((tdz / dist) * step) / subSteps;
+                    let curX = eng.fpPosX;
+                    let curZ = eng.fpPosZ;
+                    const liveOpenDoors = useMayaStore.getState().openDoors;
+
+                    for (let s = 0; s < subSteps; s++) {
+                      const wallRes = resolveStrictWallCollision(
+                        curX,
+                        curZ,
+                        curX + sDx,
+                        curZ + sDz,
+                        MAYA_RADIUS,
+                        flWalls,
+                        flOpenings,
+                        floorW,
+                        floorD,
+                        liveOpenDoors
+                      );
+                      const assetRes = resolveAssetCollisions(
+                        wallRes.x,
+                        wallRes.z,
+                        MAYA_RADIUS,
+                        flAssets,
+                        flWalls,
+                        flOpenings,
+                        liveOpenDoors
+                      );
+                      const strict = resolveStrictWallCollision(
+                        curX,
+                        curZ,
+                        assetRes.x,
+                        assetRes.z,
+                        MAYA_RADIUS,
+                        flWalls,
+                        flOpenings,
+                        floorW,
+                        floorD,
+                        liveOpenDoors
+                      );
+                      if (Math.hypot(strict.x - curX, strict.z - curZ) < 0.0004) break;
+                      curX = strict.x;
+                      curZ = strict.z;
+                    }
+
+                    const moved = Math.hypot(curX - eng.fpPosX, curZ - eng.fpPosZ);
+                    if (moved < 0.004) {
+                      // Safety net: check if ANY closed door is within 2.2m and open it rather than stalling
+                      const blockingDoor = findClosedDoorAhead(
+                        eng.fpPosX,
+                        eng.fpPosZ,
+                        eng.teleportTarget.x,
+                        eng.teleportTarget.z,
+                        flWalls,
+                        flOpenings,
+                        useMayaStore.getState().openDoors,
+                        2.25
+                      );
+                      if (blockingDoor) {
+                        triggerAutoDoorOpen(blockingDoor);
+                        needsAnother = true;
+                      } else if (eng.teleportQueue.length > 0) {
+                        eng.teleportTarget = eng.teleportQueue.shift() ?? null;
+                        needsAnother = true;
+                      } else {
+                        eng.teleportTarget = null;
+                        eng.teleportQueue = [];
+                        eng.autoWalkSpeed = 0;
+                        eng.teleportRing.visible = false;
+                        eng.autoNavStatus = null;
+                        setPathFinderHud((prev) =>
+                          prev ? { ...prev, autoWalking: false, statusStep: null } : null
+                        );
+                      }
+                    } else {
+                      eng.fpPosX = curX;
+                      eng.fpPosZ = curZ;
+                      movedThisFrame = true;
+                      const targetYaw = Math.atan2(-tdx, -tdz);
+                      let dyaw = targetYaw - eng.fpYaw;
+                      while (dyaw > Math.PI) dyaw -= Math.PI * 2;
+                      while (dyaw < -Math.PI) dyaw += Math.PI * 2;
+                      eng.fpYaw += dyaw * Math.min(1, dt * 8.5);
+                      if (!eng.fpLookDragging) {
+                        let dcam = eng.fpYaw - eng.fpCamYaw;
+                        while (dcam > Math.PI) dcam -= Math.PI * 2;
+                        while (dcam < -Math.PI) dcam += Math.PI * 2;
+                        eng.fpCamYaw += dcam * Math.min(1, dt * 4.2);
+                      }
+                      const finalGoal =
+                        eng.teleportQueue.length > 0
+                          ? eng.teleportQueue[eng.teleportQueue.length - 1]
+                          : eng.teleportTarget;
+                      eng.teleportRing.visible = true;
+                      eng.teleportRing.position.set(finalGoal.x, floorElev + 0.055, finalGoal.z);
+                      const pulse = 0.85 + Math.sin(now * 0.01) * 0.18;
+                      eng.teleportRing.scale.setScalar(pulse);
+                      needsAnother = true;
+                    }
+                  }
                 }
               }
             }
@@ -2142,42 +2823,68 @@ export const Viewport3D: React.FC = () => {
                 eng.pathFinderDest.z - eng.fpPosZ
               );
               if (distToDest < 1.25 && !eng.teleportTarget) {
-                const arrivedLabel = eng.pathFinderDest.label;
+                const arrivedDest = eng.pathFinderDest;
                 eng.pathFinderDest = null;
                 eng.pathFinderWaypoints = [];
+                eng.autoNavCheckpoints = [];
                 eng.pathFinderGroup.visible = false;
                 disposeObject3D(eng.pathFinderGroup);
                 eng.pathFinderGroup.clear();
                 eng.pathFinderRig = null;
                 setPathFinderHud(null);
-                storeRef.current.showToast(`Arrived at ${arrivedLabel}`, 'success');
+                storeRef.current.showToast(
+                  `Arrived at ${arrivedDest.code} · ${arrivedDest.label}`,
+                  'success'
+                );
               } else if (movedThisFrame && now - eng.lastPathRerouteAt > 260) {
                 eng.lastPathRerouteAt = now;
                 const algo = pathAlgorithmRef.current;
-                const pts = eng.navMesh
-                  ? eng.navMesh.findPath(
-                      eng.fpPosX,
-                      eng.fpPosZ,
-                      eng.pathFinderDest.x,
-                      eng.pathFinderDest.z,
-                      { algorithm: algo, noGoZones: noGoZonesRef.current }
-                    )
-                  : [
-                      { x: eng.fpPosX, z: eng.fpPosZ },
-                      { x: eng.pathFinderDest.x, z: eng.pathFinderDest.z },
-                    ];
+                let pts: { x: number; z: number }[];
+                if (eng.teleportTarget) {
+                  // Preserve active multi-leg GMP route (including PAL staging) and trim behind MAYA
+                  pts = [
+                    { x: eng.fpPosX, z: eng.fpPosZ },
+                    eng.teleportTarget,
+                    ...eng.teleportQueue,
+                  ];
+                } else {
+                  const floorRooms = storeRef.current.scene.rooms.filter(
+                    (r) => r.floorId === flId
+                  );
+                  const replan = planGmpRoute(
+                    eng.navMesh,
+                    eng.fpPosX,
+                    eng.fpPosZ,
+                    eng.pathFinderDest.x,
+                    eng.pathFinderDest.z,
+                    floorRooms,
+                    {
+                      algorithm: algo,
+                      noGoZones: noGoZonesRef.current,
+                      rooms: floorRooms,
+                      isGowned: useMayaStore.getState().isGowned,
+                    }
+                  );
+                  pts = replan.points;
+                }
                 eng.pathFinderWaypoints = pts;
                 eng.pathFinderRig = populatePathFinderVisual(
                   eng.pathFinderGroup,
                   pts,
                   floorElev,
                   disposeObject3D,
-                  algo
+                  algo,
+                  eng.autoNavCheckpoints
                 );
                 const remM = Number(computePathLengthMeters(pts).toFixed(1));
                 setPathFinderHud((prev) =>
                   prev
-                    ? { ...prev, remainingM: remM, autoWalking: Boolean(eng.teleportTarget) }
+                    ? {
+                        ...prev,
+                        remainingM: remM,
+                        autoWalking: Boolean(eng.teleportTarget),
+                        statusStep: eng.autoNavStatus,
+                      }
                     : null
                 );
               }
@@ -2285,7 +2992,7 @@ export const Viewport3D: React.FC = () => {
               if (!isSoftwareGl) needsAnother = true;
             }
 
-            // Place Camera for 1st Person vs GTA-Style 3rd Person Orbit / Follow-Behind
+            // Place Camera for 1st Person vs Smoothly Damped GTA-Style 3rd Person Follow-Behind
             if (isThirdPerson) {
               const pitchClamped = Math.max(-0.46, Math.min(0.62, eng.fpPitch));
               const desiredDist = 2.75;
@@ -2305,10 +3012,41 @@ export const Viewport3D: React.FC = () => {
                 floorD,
                 openDoorsMap
               );
-              eng.perspCamera.position.set(safeCam.x, floorElev + camH + eng.fpJumpY * 0.82, safeCam.z);
+              const targetCamY = floorElev + camH + eng.fpJumpY * 0.82;
+              if (!eng.camSmoothReady) {
+                eng.camSmoothX = safeCam.x;
+                eng.camSmoothY = targetCamY;
+                eng.camSmoothZ = safeCam.z;
+                eng.camSmoothReady = true;
+              } else {
+                const dampX = THREE.MathUtils.damp(eng.camSmoothX, safeCam.x, 12, dt);
+                const dampZ = THREE.MathUtils.damp(eng.camSmoothZ, safeCam.z, 12, dt);
+                const clampedCam = resolveStrictWallCollision(
+                  eng.fpPosX,
+                  eng.fpPosZ,
+                  dampX,
+                  dampZ,
+                  0.26,
+                  flWalls,
+                  flOpenings,
+                  floorW,
+                  floorD,
+                  openDoorsMap
+                );
+                eng.camSmoothX = clampedCam.x;
+                eng.camSmoothY = THREE.MathUtils.damp(eng.camSmoothY, targetCamY, 12, dt);
+                eng.camSmoothZ = clampedCam.z;
+              }
+              eng.perspCamera.position.set(eng.camSmoothX, eng.camSmoothY, eng.camSmoothZ);
               eng.perspCamera.lookAt(eng.fpPosX, floorElev + 1.15 + eng.fpJumpY, eng.fpPosZ);
-              if (manualWalkActive) needsAnother = true;
+              if (
+                manualWalkActive ||
+                Math.hypot(eng.camSmoothX - safeCam.x, eng.camSmoothZ - safeCam.z) > 0.015
+              ) {
+                needsAnother = true;
+              }
             } else {
+              eng.camSmoothReady = false;
               eng.perspCamera.position.set(eng.fpPosX, floorElev + 1.66 + eng.fpJumpY, eng.fpPosZ);
               eng.perspCamera.rotation.order = 'YXZ';
               eng.perspCamera.rotation.set(eng.fpPitch, eng.fpYaw, 0);
@@ -2371,7 +3109,8 @@ export const Viewport3D: React.FC = () => {
                 const d = Math.hypot(rig.worldX - eng.fpPosX, rig.worldZ - eng.fpPosZ);
                 if (d < bestDist) {
                   bestDist = d;
-                  const isOpen = Boolean(openDoorsMap[rig.openingId]);
+                  const opRecord = sceneOpeningsById.get(rig.openingId);
+                  const isOpen = Boolean(openDoorsMap[rig.openingId] ?? opRecord?.status === 'open');
                   bestItem = {
                     kind: 'door',
                     id: rig.openingId,
@@ -2415,26 +3154,49 @@ export const Viewport3D: React.FC = () => {
               });
 
               if (!bestItem || bestDist > 1.75) {
-                const flAssets = storeRef.current.scene.assets.filter(
+                const flAssetsScan = storeRef.current.scene.assets.filter(
                   (a) => a.floorId === flId && !a.hidden
                 );
-                for (const ast of flAssets) {
+                for (const ast of flAssetsScan) {
                   const d = Math.hypot(ast.x - eng.fpPosX, ast.z - eng.fpPosZ);
                   const reach = Math.max(1.8, Math.max(ast.width, ast.depth) * 0.65 + 1.05);
                   if (d < reach && d < bestDist) {
                     bestDist = d;
-                    bestItem = {
-                      kind: 'equipment',
-                      id: ast.id,
-                      code: ast.assetId,
-                      title: ast.name,
-                      actionLabel: 'Inspect & Read SOP',
-                      detail: `${ast.assetId} · ${ast.category}`,
-                      worldX: ast.x,
-                      worldY: floorElev + ast.y + Math.min(2.3, ast.height + 0.35),
-                      worldZ: ast.z,
-                      roomId: ast.roomId,
-                    };
+                    const isGownStation =
+                      /locker|bench|gown/i.test(`${ast.name} ${ast.templateId}`) &&
+                      curRm &&
+                      /gown|pal|airlock/i.test(`${curRm.name} ${curRm.spaceTypeId ?? ''}`);
+                    if (isGownStation) {
+                      const gownedNow = mayaSnapshot.isGowned;
+                      bestItem = {
+                        kind: 'gown',
+                        id: ast.id,
+                        code: curRm.code,
+                        title: `${curRm.code} · ${curRm.name}`,
+                        actionLabel: gownedNow ? 'Remove Cleanroom Gown' : 'Put On Full Cleanroom Gown',
+                        detail: gownedNow
+                          ? 'Change back to Standard Uniform'
+                          : 'EU GMP Grade A/B Bunny Suit, Hood & Gloves',
+                        worldX: ast.x,
+                        worldY: floorElev + ast.y + Math.min(2.1, ast.height + 0.35),
+                        worldZ: ast.z,
+                        roomId: curRm.id,
+                        isOnOrOpen: gownedNow,
+                      };
+                    } else {
+                      bestItem = {
+                        kind: 'equipment',
+                        id: ast.id,
+                        code: ast.assetId,
+                        title: ast.name,
+                        actionLabel: 'Inspect & Read SOP',
+                        detail: `${ast.assetId} · ${ast.category}`,
+                        worldX: ast.x,
+                        worldY: floorElev + ast.y + Math.min(2.3, ast.height + 0.35),
+                        worldZ: ast.z,
+                        roomId: ast.roomId,
+                      };
+                    }
                   }
                 }
               }
@@ -2458,6 +3220,11 @@ export const Viewport3D: React.FC = () => {
             eng.teleportRing.visible = false;
             eng.teleportTarget = null;
             eng.teleportQueue = [];
+            eng.autoNavCheckpoints = [];
+            eng.autoNavPendingDoorId = null;
+            eng.autoNavPauseUntil = 0;
+            eng.autoNavStatus = null;
+            eng.autoOpenedDoors = [];
             if (eng.pathFinderGroup.visible) {
               eng.pathFinderGroup.visible = false;
               eng.pathFinderDest = null;
@@ -3194,37 +3961,55 @@ export const Viewport3D: React.FC = () => {
             useMayaStore.getState().openDoors
           );
           if (!eng.navMesh || eng.navMesh.isWalkable(safeDest.x, safeDest.z)) {
-            const destRoom = st.scene.rooms.find(
+            const floorRooms = st.scene.rooms.filter((r) => r.floorId === st.activeFloorId);
+            const destRoom = floorRooms.find(
               (r) =>
-                r.floorId === st.activeFloorId &&
                 safeDest.x >= r.x &&
                 safeDest.x <= r.x + r.width &&
                 safeDest.z >= r.z &&
                 safeDest.z <= r.z + r.depth
             );
             const algo = pathAlgorithmRef.current;
-            const pts = eng.navMesh
-              ? eng.navMesh.findPath(eng.fpPosX, eng.fpPosZ, safeDest.x, safeDest.z, {
-                  algorithm: algo,
-                  noGoZones: noGoZonesRef.current,
-                })
-              : [
-                  { x: eng.fpPosX, z: eng.fpPosZ },
-                  { x: safeDest.x, z: safeDest.z },
-                ];
+            const plan = planGmpRoute(
+              eng.navMesh,
+              eng.fpPosX,
+              eng.fpPosZ,
+              safeDest.x,
+              safeDest.z,
+              floorRooms,
+              {
+                algorithm: algo,
+                noGoZones: noGoZonesRef.current,
+                rooms: floorRooms,
+              }
+            );
+            const pts = plan.points;
             const finalPt = pts[pts.length - 1] ?? { x: safeDest.x, z: safeDest.z };
             const distM = computePathLengthMeters(pts);
             const label = destRoom ? destRoom.name : 'Selected Floor Point';
             const code = destRoom ? destRoom.code : 'POINT';
 
-            eng.pathFinderDest = { label, code, x: finalPt.x, z: finalPt.z };
+            eng.pathFinderDest = {
+              label,
+              code,
+              x: finalPt.x,
+              z: finalPt.z,
+              roomId: destRoom?.id,
+            };
             eng.pathFinderWaypoints = pts;
+            eng.autoNavCheckpoints = [...plan.checkpoints];
+            eng.autoNavPendingDoorId = null;
+            eng.autoNavPauseUntil = 0;
+            eng.autoNavStatus = plan.passesThroughPal
+              ? 'Routing via PAL gowning & clean corridor...'
+              : 'Walking along GMP path (auto-opening doors)...';
             eng.pathFinderRig = populatePathFinderVisual(
               eng.pathFinderGroup,
               pts,
               flElev,
               disposeObject3D,
-              algo
+              algo,
+              plan.checkpoints
             );
             eng.lastPathRerouteAt = performance.now();
 
@@ -3233,11 +4018,18 @@ export const Viewport3D: React.FC = () => {
             eng.teleportRing.visible = true;
             eng.teleportRing.position.set(finalPt.x, flElev + 0.055, finalPt.z);
 
+            const roomTrail =
+              plan.roomSequence.length > 1
+                ? plan.roomSequence.map((r) => r.code).join(' → ')
+                : undefined;
             setPathFinderHud({
               label,
               code,
               remainingM: Number(distM.toFixed(1)),
               autoWalking: true,
+              protocolSummary: plan.gmpProtocolSummary,
+              roomTrail,
+              statusStep: eng.autoNavStatus,
             });
             requestRender();
           }
@@ -3672,6 +4464,11 @@ export const Viewport3D: React.FC = () => {
       pathFinderDest: null,
       pathFinderWaypoints: [],
       teleportQueue: [],
+      autoNavCheckpoints: [],
+      autoNavPendingDoorId: null,
+      autoNavPauseUntil: 0,
+      autoNavStatus: null,
+      autoOpenedDoors: [],
       lastPathRerouteAt: 0,
       teleportRing,
       teleportTarget: null,
@@ -3682,7 +4479,14 @@ export const Viewport3D: React.FC = () => {
       tracePulseInstancedMesh: null,
       tracePulseTracks: [],
       lastPulseTick: 0,
+      fpVelX: 0,
+      fpVelZ: 0,
       fpVelY: 0,
+      autoWalkSpeed: 0,
+      camSmoothX: 10,
+      camSmoothY: 2,
+      camSmoothZ: 10.8,
+      camSmoothReady: false,
       fpOnGround: true,
       fpYaw: 0,
       fpCamYaw: 0,
@@ -4063,7 +4867,11 @@ export const Viewport3D: React.FC = () => {
           eng.fpPosX = restorePose.x;
           eng.fpPosZ = restorePose.z;
           eng.fpJumpY = 0;
+          eng.fpVelX = 0;
+          eng.fpVelZ = 0;
           eng.fpVelY = 0;
+          eng.autoWalkSpeed = 0;
+          eng.camSmoothReady = false;
           eng.fpOnGround = true;
           eng.fpMoveBlend = 0;
           eng.fpYaw = restorePose.yaw;
@@ -4077,7 +4885,11 @@ export const Viewport3D: React.FC = () => {
           eng.fpPosX = spawn.x;
           eng.fpPosZ = spawn.z;
           eng.fpJumpY = 0;
+          eng.fpVelX = 0;
+          eng.fpVelZ = 0;
           eng.fpVelY = 0;
+          eng.autoWalkSpeed = 0;
+          eng.camSmoothReady = false;
           eng.fpOnGround = true;
           eng.fpMoveBlend = 0;
           eng.fpYaw = Math.atan2(-(spawn.lookX - spawn.x), -(spawn.lookZ - spawn.z));
@@ -4087,15 +4899,19 @@ export const Viewport3D: React.FC = () => {
 
         const isThird = walkCameraModeRef.current === 'third-person';
         eng.walkAvatar.root.visible = isThird;
+        eng.walkAvatar.mayaController?.setGowned(mayaState.isGowned);
         eng.walkAvatar.root.position.set(eng.fpPosX, floorElev, eng.fpPosZ);
         eng.walkAvatar.root.rotation.y = eng.fpYaw + Math.PI;
         if (isThird) {
-          eng.perspCamera.position.set(
-            eng.fpPosX + Math.sin(eng.fpCamYaw) * 2.85,
-            floorElev + 2.05,
-            eng.fpPosZ + Math.cos(eng.fpCamYaw) * 2.85
-          );
-          eng.perspCamera.lookAt(eng.fpPosX, floorElev + 1.05, eng.fpPosZ);
+          const initCamX = eng.fpPosX + Math.sin(eng.fpCamYaw) * 2.75;
+          const initCamY = floorElev + 2.02;
+          const initCamZ = eng.fpPosZ + Math.cos(eng.fpCamYaw) * 2.75;
+          eng.camSmoothX = initCamX;
+          eng.camSmoothY = initCamY;
+          eng.camSmoothZ = initCamZ;
+          eng.camSmoothReady = true;
+          eng.perspCamera.position.set(initCamX, initCamY, initCamZ);
+          eng.perspCamera.lookAt(eng.fpPosX, floorElev + 1.15, eng.fpPosZ);
         } else {
           eng.perspCamera.position.set(eng.fpPosX, floorElev + 1.52, eng.fpPosZ);
           eng.perspCamera.rotation.order = 'YXZ';
@@ -8234,22 +9050,23 @@ export const Viewport3D: React.FC = () => {
           )}
 
           {firstPersonMode && !vrSessionActive && (
-            <div className="pointer-events-auto flex items-center gap-1.5 px-3 py-1.5 rounded-2xl bg-[#111116]/95 border border-violet-500/50 text-zinc-100 text-[11px] shadow-2xl overflow-x-auto max-w-full">
-              <span className="flex items-center gap-1.5 font-semibold text-violet-300 whitespace-nowrap shrink-0">
+            <div className="pointer-events-auto flex items-center justify-between sm:justify-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1 sm:py-1.5 rounded-2xl bg-[#111116]/95 border border-violet-500/50 text-zinc-100 text-[10.5px] sm:text-[11px] shadow-2xl max-w-[calc(100vw-16px)]">
+              <span className="flex items-center gap-1 font-semibold text-violet-300 whitespace-nowrap shrink-0">
                 <Footprints className="w-3.5 h-3.5" />
-                Walk Mode
+                <span className="hidden sm:inline">Walk Mode</span>
+                <span className="sm:hidden">Walk</span>
               </span>
-              <span className="hidden md:inline text-zinc-600">|</span>
-              <span className="hidden md:inline font-mono text-[10px] text-zinc-300 whitespace-nowrap">
+              <span className="hidden lg:inline text-zinc-600">|</span>
+              <span className="hidden lg:inline font-mono text-[10px] text-zinc-300 whitespace-nowrap">
                 WASD / Joystick · Space Jump · V Camera
               </span>
-              <span className="text-zinc-600">|</span>
+              <span className="hidden sm:inline text-zinc-600">|</span>
               <button
                 type="button"
                 onClick={() =>
                   setWalkCameraMode((m) => (m === 'first-person' ? 'third-person' : 'first-person'))
                 }
-                className={`flex items-center gap-1 px-2 py-0.5 rounded-lg text-[10px] font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                className={`flex items-center gap-1 px-1.5 sm:px-2 py-0.5 rounded-lg text-[10px] font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
                   walkCameraMode === 'third-person'
                     ? 'bg-violet-600 text-white'
                     : 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700'
@@ -8257,33 +9074,68 @@ export const Viewport3D: React.FC = () => {
                 title="Toggle 1st-Person Eye View vs 3rd-Person MAYA Character (V)"
               >
                 <User className="w-3 h-3" />
-                {walkCameraMode === 'third-person' ? '3rd Person · MAYA' : '1st Person'}
+                <span className="hidden sm:inline">
+                  {walkCameraMode === 'third-person' ? '3rd Person · MAYA' : '1st Person'}
+                </span>
+                <span className="sm:hidden">{walkCameraMode === 'third-person' ? '3P' : '1P'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const next = !useMayaStore.getState().isGowned;
+                  useMayaStore.getState().setGowned(next, 'Walkthrough Quick PPE');
+                  engineRef.current?.walkAvatar.mayaController?.setGowned(next);
+                  storeRef.current.showToast(
+                    next ? 'Full Cleanroom Gown ON' : 'Standard Uniform ON',
+                    'info'
+                  );
+                }}
+                className={`flex items-center gap-1 px-1.5 sm:px-2 py-0.5 rounded-lg text-[10px] font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                  mayaIsGowned
+                    ? 'bg-cyan-500/25 border border-cyan-400/60 text-cyan-200'
+                    : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+                }`}
+                title={
+                  mayaIsGowned
+                    ? 'MAYA is wearing Full Sterile Cleanroom Gown (Click to De-Gown)'
+                    : 'MAYA is in Standard Uniform (Click or visit Gowning Room PAL to Gown)'
+                }
+              >
+                <ShieldCheck className="w-3 h-3 text-cyan-400" />
+                <span className="hidden sm:inline">{mayaIsGowned ? 'Gowned' : 'Uniform'}</span>
+                <span className="sm:hidden">{mayaIsGowned ? 'Gown' : 'PPE'}</span>
               </button>
               <button
                 type="button"
                 onClick={() => setShowNavMesh(!showNavMesh)}
-                className={`px-2 py-0.5 rounded-lg text-[10px] font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
+                className={`px-1.5 sm:px-2 py-0.5 rounded-lg text-[10px] font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors ${
                   showNavMesh
                     ? 'bg-violet-600 text-white'
                     : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
                 }`}
+                title="Toggle Walkable NavMesh Overlay"
               >
-                {showNavMesh ? 'NavMesh On' : 'NavMesh'}
+                <span className="hidden sm:inline">{showNavMesh ? 'NavMesh On' : 'NavMesh'}</span>
+                <span className="sm:hidden">Nav</span>
               </button>
               <button
                 type="button"
                 onClick={() => setFirstPersonTabletVisible(!firstPersonTabletVisible)}
-                className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-zinc-800 hover:bg-amber-500 hover:text-zinc-950 text-zinc-200 text-[10px] font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors"
+                className="flex items-center gap-1 px-1.5 sm:px-2 py-0.5 rounded-lg bg-zinc-800 hover:bg-amber-500 hover:text-zinc-950 text-zinc-200 text-[10px] font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors"
+                title={firstPersonTabletVisible ? 'Hide Walk Field Pad' : 'Show Walk Field Pad'}
               >
                 {firstPersonTabletVisible ? <EyeOff className="w-3 h-3" /> : <Tablet className="w-3 h-3" />}
-                {firstPersonTabletVisible ? 'Hide Pad' : 'Field Pad'}
+                <span className="hidden sm:inline">
+                  {firstPersonTabletVisible ? 'Hide Pad' : 'Field Pad'}
+                </span>
               </button>
               <button
                 type="button"
                 onClick={() => setFirstPersonMode(false)}
                 className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-[10px] font-semibold whitespace-nowrap shrink-0 cursor-pointer transition-colors"
               >
-                <X className="w-3 h-3" /> Exit
+                <X className="w-3 h-3" />
+                <span>Exit</span>
               </button>
             </div>
           )}
@@ -9251,16 +10103,16 @@ export const Viewport3D: React.FC = () => {
 
         return (
           <>
-            {/* Bottom-Left Tactile 360° Virtual Walk Joystick + Sprint & Jump Controls */}
-            <div className="absolute bottom-4 left-4 z-30 flex items-end gap-2.5 select-none">
+            {/* Bottom-Left Tactile 360° Virtual Walk Joystick (100% Unobstructed on Mobile & Desktop) */}
+            <div className="absolute bottom-4 left-3 sm:left-4 z-30 flex items-end gap-2.5 select-none">
               <div
                 ref={joyPadRef}
                 onPointerDown={handleJoyPointerDown}
                 onPointerMove={handleJoyPointerMove}
                 onPointerUp={handleJoyPointerUp}
                 onPointerCancel={handleJoyPointerUp}
-                className="relative w-[112px] h-[112px] rounded-full bg-[#0F1016]/90 border-2 border-zinc-700/80 shadow-[0_12px_36px_rgba(0,0,0,0.65)] touch-none cursor-grab active:cursor-grabbing flex items-center justify-center"
-                title="Drag to walk (walls & glass solid, doors passable)"
+                className="relative w-[108px] h-[108px] sm:w-[112px] sm:h-[112px] rounded-full bg-[#0F1016]/90 border-2 border-zinc-700/80 shadow-[0_12px_36px_rgba(0,0,0,0.65)] touch-none cursor-grab active:cursor-grabbing flex items-center justify-center"
+                title="Drag to walk (walls, equipment & closed doors are solid)"
               >
                 {/* Inner concentric guide ring & directional ticks */}
                 <div className="absolute inset-3 rounded-full border border-zinc-700/50 pointer-events-none" />
@@ -9286,89 +10138,92 @@ export const Viewport3D: React.FC = () => {
                   <div className="w-3.5 h-3.5 rounded-full bg-white/30" />
                 </div>
               </div>
+            </div>
 
-              {/* 1st/3rd Person Camera Toggle, Sprint & High-Jump Action Buttons */}
-              <div className="flex flex-col gap-2 pb-1">
-                <button
-                  type="button"
-                  onClick={() =>
-                    setWalkCameraMode((m) => (m === 'first-person' ? 'third-person' : 'first-person'))
-                  }
-                  className={`w-10 h-10 rounded-full border flex items-center justify-center shadow-lg transition cursor-pointer ${
-                    walkCameraMode === 'third-person'
-                      ? 'bg-violet-600 border-violet-300 text-white'
-                      : 'bg-[#12131A]/90 border-zinc-700 text-zinc-300 hover:border-violet-400'
-                  }`}
-                  title={
-                    walkCameraMode === 'third-person'
-                      ? '3rd-Person MAYA View (Click or V for 1st-Person)'
-                      : '1st-Person View (Click or V for 3rd-Person MAYA)'
-                  }
-                >
-                  <User className="w-4 h-4" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const next = !joySprint;
-                    fpSprintRef.current = next;
-                    setJoySprint(next);
-                  }}
-                  className={`w-10 h-10 rounded-full border flex items-center justify-center shadow-lg transition cursor-pointer ${
-                    joySprint
-                      ? 'bg-amber-500 border-amber-300 text-zinc-950'
-                      : 'bg-[#12131A]/90 border-zinc-700 text-zinc-300 hover:border-violet-400'
-                  }`}
-                  title={joySprint ? 'Sprint Active (Click to Walk)' : 'Toggle Sprint Speed'}
-                >
-                  <Zap className="w-4 h-4" />
-                </button>
-                {/* Mobile: swap Jump for prominent Interact button when near Door/Switch/Equipment; Desktop: show dedicated Interact + Jump */}
-                {nearbyInteractable ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => executeInteractable(nearbyInteractable)}
-                      className={`w-11 h-11 rounded-full border-2 flex items-center justify-center shadow-[0_0_22px_rgba(34,211,238,0.55)] active:scale-95 transition cursor-pointer ${
-                        nearbyInteractable.kind === 'door'
-                          ? 'bg-cyan-500 border-cyan-200 text-zinc-950'
+            {/* Bottom-Right Ergonomic Action Buttons on Mobile, Left-Adjacent on Large Desktop (Zero Overlap) */}
+            <div className="absolute bottom-4 right-3 md:right-auto md:left-[138px] z-30 flex flex-col gap-2 pb-0.5 select-none">
+              <button
+                type="button"
+                onClick={() =>
+                  setWalkCameraMode((m) => (m === 'first-person' ? 'third-person' : 'first-person'))
+                }
+                className={`w-10 h-10 rounded-full border flex items-center justify-center shadow-lg transition cursor-pointer ${
+                  walkCameraMode === 'third-person'
+                    ? 'bg-violet-600 border-violet-300 text-white'
+                    : 'bg-[#12131A]/90 border-zinc-700 text-zinc-300 hover:border-violet-400'
+                }`}
+                title={
+                  walkCameraMode === 'third-person'
+                    ? '3rd-Person MAYA View (Click or V for 1st-Person)'
+                    : '1st-Person View (Click or V for 3rd-Person MAYA)'
+                }
+              >
+                <User className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const next = !joySprint;
+                  fpSprintRef.current = next;
+                  setJoySprint(next);
+                }}
+                className={`w-10 h-10 rounded-full border flex items-center justify-center shadow-lg transition cursor-pointer ${
+                  joySprint
+                    ? 'bg-amber-500 border-amber-300 text-zinc-950'
+                    : 'bg-[#12131A]/90 border-zinc-700 text-zinc-300 hover:border-violet-400'
+                }`}
+                title={joySprint ? 'Sprint Active (Click to Walk)' : 'Toggle Sprint Speed'}
+              >
+                <Zap className="w-4 h-4" />
+              </button>
+              {nearbyInteractable ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => executeInteractable(nearbyInteractable)}
+                    className={`w-11 h-11 rounded-full border-2 flex items-center justify-center shadow-[0_0_22px_rgba(34,211,238,0.55)] active:scale-95 transition cursor-pointer ${
+                      nearbyInteractable.kind === 'door'
+                        ? 'bg-cyan-500 border-cyan-200 text-zinc-950'
+                        : nearbyInteractable.kind === 'gown'
+                          ? 'bg-sky-400 border-cyan-100 text-zinc-950'
                           : nearbyInteractable.kind === 'light'
                             ? 'bg-amber-400 border-amber-200 text-zinc-950'
                             : 'bg-violet-500 border-violet-200 text-white'
-                      }`}
-                      title={`${nearbyInteractable.actionLabel} (Enter)`}
-                    >
-                      {nearbyInteractable.kind === 'door' ? (
-                        <DoorOpen className="w-5 h-5" />
-                      ) : nearbyInteractable.kind === 'light' ? (
-                        <Lightbulb className="w-5 h-5" />
-                      ) : (
-                        <FileText className="w-5 h-5" />
-                      )}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={triggerWalkJump}
-                      className="hidden sm:flex w-10 h-10 rounded-full bg-[#12131A]/95 border border-zinc-700 hover:border-violet-400 text-zinc-200 items-center justify-center shadow-lg active:scale-95 transition cursor-pointer"
-                      title="High Jump (Space)"
-                    >
-                      <ArrowUp className="w-4 h-4" />
-                    </button>
-                  </>
-                ) : (
+                    }`}
+                    title={`${nearbyInteractable.actionLabel} (Enter)`}
+                  >
+                    {nearbyInteractable.kind === 'door' ? (
+                      <DoorOpen className="w-5 h-5" />
+                    ) : nearbyInteractable.kind === 'gown' ? (
+                      <ShieldCheck className="w-5 h-5" />
+                    ) : nearbyInteractable.kind === 'light' ? (
+                      <Lightbulb className="w-5 h-5" />
+                    ) : (
+                      <FileText className="w-5 h-5" />
+                    )}
+                  </button>
                   <button
                     type="button"
                     onClick={triggerWalkJump}
-                    className="w-10 h-10 rounded-full bg-[#12131A]/95 border border-zinc-700 hover:border-violet-400 text-zinc-200 flex items-center justify-center shadow-lg active:scale-95 transition cursor-pointer"
+                    className="hidden sm:flex w-10 h-10 rounded-full bg-[#12131A]/95 border border-zinc-700 hover:border-violet-400 text-zinc-200 items-center justify-center shadow-lg active:scale-95 transition cursor-pointer"
                     title="High Jump (Space)"
                   >
                     <ArrowUp className="w-4 h-4" />
                   </button>
-                )}
-              </div>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={triggerWalkJump}
+                  className="w-10 h-10 rounded-full bg-[#12131A]/95 border border-zinc-700 hover:border-violet-400 text-zinc-200 flex items-center justify-center shadow-lg active:scale-95 transition cursor-pointer"
+                  title="High Jump (Space)"
+                >
+                  <ArrowUp className="w-4 h-4" />
+                </button>
+              )}
             </div>
 
-            {/* Universal 3D-Anchored Floating Interaction Sign (Doors, Light Switches, Equipment — ENTER Key) */}
+            {/* Universal 3D-Anchored Floating Interaction Sign (Doors, Gowning Station, Light Switches, Equipment — ENTER Key) */}
             {nearbyInteractable && (
               <div
                 style={{
@@ -9382,9 +10237,11 @@ export const Viewport3D: React.FC = () => {
                   className={`flex items-center gap-2 px-3 py-1.5 rounded-2xl border shadow-[0_12px_32px_rgba(0,0,0,0.8)] text-left cursor-pointer transition hover:scale-[1.03] ${
                     nearbyInteractable.kind === 'door'
                       ? 'bg-[#0C1524] border-cyan-400/80 text-cyan-50'
-                      : nearbyInteractable.kind === 'light'
-                        ? 'bg-[#19160C] border-amber-400/80 text-amber-50'
-                        : 'bg-[#141122] border-violet-400/80 text-violet-50'
+                      : nearbyInteractable.kind === 'gown'
+                        ? 'bg-[#081A24] border-sky-400/85 text-sky-50'
+                        : nearbyInteractable.kind === 'light'
+                          ? 'bg-[#19160C] border-amber-400/80 text-amber-50'
+                          : 'bg-[#141122] border-violet-400/80 text-violet-50'
                   }`}
                 >
                   <span className="px-1.5 py-0.5 rounded-md bg-white text-zinc-950 font-mono text-[10px] font-extrabold tracking-wide shrink-0">
@@ -9392,6 +10249,8 @@ export const Viewport3D: React.FC = () => {
                   </span>
                   {nearbyInteractable.kind === 'door' ? (
                     <DoorOpen className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                  ) : nearbyInteractable.kind === 'gown' ? (
+                    <ShieldCheck className="w-3.5 h-3.5 text-sky-400 shrink-0" />
                   ) : nearbyInteractable.kind === 'light' ? (
                     <Lightbulb className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                   ) : (
@@ -9494,15 +10353,14 @@ export const Viewport3D: React.FC = () => {
               );
             })()}
 
-            {/* Ultra-Minimal Floating Walk Field Pad with Path Finder & Spatial Audio */}
+            {/* Ultra-Minimal Floating Walk Field Pad (Top-Docked on Mobile/Tablet so Joystick is 100% Clear; Bottom-Center on Desktop) */}
             {firstPersonTabletVisible && (
               <div
-                className="absolute bottom-3 right-3 sm:left-1/2 sm:-translate-x-1/2 sm:right-auto z-20 pointer-events-auto transition-transform duration-150 flex flex-col items-center gap-2"
-                style={{ transform: `translateY(${Math.min(14, fpState.jumpHeight * 10)}px)` }}
+                className="absolute top-[52px] left-2 right-2 md:top-auto md:bottom-3 md:left-1/2 md:-translate-x-1/2 md:right-auto z-20 pointer-events-none flex flex-col-reverse md:flex-col items-center gap-2"
               >
                 {/* Active No-Go Floor Placement Mode Indicator */}
                 {placingNoGoZone && (
-                  <div className="px-3 py-1.5 rounded-xl bg-rose-600 text-white text-[11px] font-semibold shadow-lg flex items-center gap-2">
+                  <div className="pointer-events-auto px-3 py-1.5 rounded-xl bg-rose-600 text-white text-[11px] font-semibold shadow-lg flex items-center gap-2">
                     <span>Click any spot on the 3D floor to place a {noGoRadius.toFixed(1)}m No-Go Zone</span>
                     <button
                       type="button"
@@ -9516,128 +10374,158 @@ export const Viewport3D: React.FC = () => {
 
                 {/* Spatial Audio Settings Popover (Rolloff Distance & Falloff Curves) */}
                 {spatialAudioSettingsOpen && (
-                  <SpatialAudioSettingsPopover
-                    settings={spatialAudioSettings}
-                    enabled={spatialAudioEnabled}
-                    telemetry={audioTelemetry}
-                    onToggleEnabled={() => setSpatialAudioEnabled((v) => !v)}
-                    onChange={(next) => setSpatialAudioSettings(next)}
-                    onTestChannel={(ch) => {
-                      if (!spatialAudioEnabled) setSpatialAudioEnabled(true);
-                      spatialAudioRef.current?.setEnabled(true);
-                      spatialAudioRef.current?.playTestCue(ch);
-                    }}
-                    onClose={() => setSpatialAudioSettingsOpen(false)}
-                  />
+                  <div className="pointer-events-auto w-full flex justify-center">
+                    <SpatialAudioSettingsPopover
+                      settings={spatialAudioSettings}
+                      enabled={spatialAudioEnabled}
+                      telemetry={audioTelemetry}
+                      onToggleEnabled={toggleSpatialAudio}
+                      onChange={(next) => setSpatialAudioSettings(next)}
+                      onTestChannel={(ch) => {
+                        if (!spatialAudioEnabledRef.current) {
+                          spatialAudioEnabledRef.current = true;
+                          setSpatialAudioEnabled(true);
+                        }
+                        spatialAudioRef.current?.setEnabled(true);
+                        spatialAudioRef.current?.playTestCue(ch);
+                      }}
+                      onClose={() => setSpatialAudioSettingsOpen(false)}
+                    />
+                  </div>
                 )}
 
                 {/* Path Finder Destinations, Routing Algorithm & No-Go Zones Popover */}
                 {pathFinderOpen && (
-                  <PathFinderConfigPopover
-                    activeFloorId={activeFloorId}
-                    floorRooms={sceneData.rooms.filter((r) => r.floorId === activeFloorId)}
-                    floorAssets={sceneData.assets.filter((a) => a.floorId === activeFloorId && !a.hidden)}
-                    algorithm={pathAlgorithm}
-                    noGoZones={noGoZones}
-                    placingNoGo={placingNoGoZone}
-                    noGoRadius={noGoRadius}
-                    noGoLabelDraft={noGoLabelDraft}
-                    onChangeAlgorithm={(algo) => {
-                      setPathAlgorithm(algo);
-                      storeRef.current.showToast(
-                        algo === 'least-congested'
-                          ? 'Path Finder switched to Least Congested routing'
-                          : 'Path Finder switched to Shortest Distance routing',
-                        'info'
-                      );
-                    }}
-                    onTogglePlacingNoGo={() => {
-                      setPlacingNoGoZone((v) => !v);
-                      setPathFinderOpen(false);
-                    }}
-                    onChangeNoGoRadius={setNoGoRadius}
-                    onChangeNoGoLabelDraft={setNoGoLabelDraft}
-                    onToggleRoomNoGo={(rm) => {
-                      setNoGoZones((prev) => {
-                        const exists = prev.find(
-                          (z) => z.floorId === activeFloorId && z.kind === 'room' && z.roomId === rm.id
+                  <div className="pointer-events-auto w-full flex justify-center">
+                    <PathFinderConfigPopover
+                      activeFloorId={activeFloorId}
+                      currentRoomId={curRoom?.id ?? null}
+                      floorRooms={sceneData.rooms.filter((r) => r.floorId === activeFloorId)}
+                      floorAssets={sceneData.assets.filter((a) => a.floorId === activeFloorId && !a.hidden)}
+                      algorithm={pathAlgorithm}
+                      noGoZones={noGoZones}
+                      placingNoGo={placingNoGoZone}
+                      noGoRadius={noGoRadius}
+                      noGoLabelDraft={noGoLabelDraft}
+                      onChangeAlgorithm={(algo) => {
+                        setPathAlgorithm(algo);
+                        storeRef.current.showToast(
+                          algo === 'gmp-compliant'
+                            ? 'Routing switched to EU GMP Annex 1 Compliant Path'
+                            : algo === 'least-congested'
+                              ? 'Routing switched to Least Congested'
+                              : 'Routing switched to Shortest Distance',
+                          'info'
                         );
-                        if (exists) {
-                          return prev.filter((z) => z.id !== exists.id);
-                        }
-                        return [
-                          ...prev,
-                          {
-                            id: `nogo-room-${rm.id}`,
-                            floorId: activeFloorId,
-                            label: `${rm.code} · ${rm.name}`,
-                            kind: 'room',
-                            roomId: rm.id,
-                            x: rm.x,
-                            z: rm.z,
-                            width: rm.width,
-                            depth: rm.depth,
-                          },
-                        ];
-                      });
-                    }}
-                    onRemoveNoGoZone={(id) =>
-                      setNoGoZones((prev) => prev.filter((z) => z.id !== id))
-                    }
-                    onClearNoGoZones={() =>
-                      setNoGoZones((prev) => prev.filter((z) => z.floorId !== activeFloorId))
-                    }
-                    onSelectDestination={(dest, autoWalk) => setPathFinderRoute(dest, autoWalk)}
-                    onClose={() => setPathFinderOpen(false)}
-                  />
+                      }}
+                      onTogglePlacingNoGo={() => {
+                        setPlacingNoGoZone((v) => !v);
+                        setPathFinderOpen(false);
+                      }}
+                      onChangeNoGoRadius={setNoGoRadius}
+                      onChangeNoGoLabelDraft={setNoGoLabelDraft}
+                      onToggleRoomNoGo={(rm) => {
+                        setNoGoZones((prev) => {
+                          const exists = prev.find(
+                            (z) => z.floorId === activeFloorId && z.kind === 'room' && z.roomId === rm.id
+                          );
+                          if (exists) {
+                            return prev.filter((z) => z.id !== exists.id);
+                          }
+                          return [
+                            ...prev,
+                            {
+                              id: `nogo-room-${rm.id}`,
+                              floorId: activeFloorId,
+                              label: `${rm.code} · ${rm.name}`,
+                              kind: 'room',
+                              roomId: rm.id,
+                              x: rm.x,
+                              z: rm.z,
+                              width: rm.width,
+                              depth: rm.depth,
+                            },
+                          ];
+                        });
+                      }}
+                      onRemoveNoGoZone={(id) =>
+                        setNoGoZones((prev) => prev.filter((z) => z.id !== id))
+                      }
+                      onClearNoGoZones={() =>
+                        setNoGoZones((prev) => prev.filter((z) => z.floorId !== activeFloorId))
+                      }
+                      onSelectDestination={(dest, autoWalk) => setPathFinderRoute(dest, autoWalk)}
+                      onClose={() => setPathFinderOpen(false)}
+                    />
+                  </div>
                 )}
 
-                <div className="rounded-2xl bg-[#0F1016]/95 border border-zinc-700/80 shadow-[0_12px_36px_rgba(0,0,0,0.72)] text-zinc-100 overflow-hidden min-w-[290px] max-w-[480px]">
-                  {/* Active Path Finder Route Strip */}
+                <div className="pointer-events-auto rounded-2xl bg-[#0F1016]/95 border border-zinc-700/80 shadow-[0_12px_36px_rgba(0,0,0,0.72)] text-zinc-100 overflow-hidden w-full max-w-[480px] md:min-w-[310px]">
+                  {/* Active Path Finder / Autonomous GMP Go-To Strip */}
                   {pathFinderHud && (
                     <div
-                      className={`px-3 py-1.5 border-b flex items-center justify-between gap-2 text-[10.5px] ${
-                        pathAlgorithm === 'least-congested'
-                          ? 'bg-emerald-500/12 border-emerald-500/30'
-                          : 'bg-cyan-500/12 border-cyan-500/30'
+                      className={`px-3 py-1.5 border-b space-y-1 text-[10.5px] ${
+                        pathAlgorithm === 'gmp-compliant'
+                          ? 'bg-violet-500/14 border-violet-500/35'
+                          : pathAlgorithm === 'least-congested'
+                            ? 'bg-emerald-500/12 border-emerald-500/30'
+                            : 'bg-cyan-500/12 border-cyan-500/30'
                       }`}
                     >
-                      <div className="flex items-center gap-1.5 min-w-0">
-                        <Navigation
-                          className={`w-3.5 h-3.5 shrink-0 ${
-                            pathAlgorithm === 'least-congested' ? 'text-emerald-400' : 'text-cyan-400'
-                          }`}
-                        />
-                        <span className="font-mono font-bold text-cyan-300 shrink-0">
-                          {pathFinderHud.code}
-                        </span>
-                        <span className="text-zinc-200 truncate">{pathFinderHud.label}</span>
-                        <span className="font-mono text-emerald-300 font-semibold tabular-nums shrink-0">
-                          {pathFinderHud.remainingM}m (~{Math.max(1, Math.round(pathFinderHud.remainingM / 3.4))}s)
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-1 shrink-0">
-                        {!pathFinderHud.autoWalking && engineRef.current?.pathFinderDest && (
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <Navigation
+                            className={`w-3.5 h-3.5 shrink-0 ${
+                              pathAlgorithm === 'gmp-compliant'
+                                ? 'text-violet-300'
+                                : pathAlgorithm === 'least-congested'
+                                  ? 'text-emerald-400'
+                                  : 'text-cyan-400'
+                            }`}
+                          />
+                          <span className="font-mono font-bold text-cyan-300 shrink-0">
+                            {pathFinderHud.code}
+                          </span>
+                          <span className="text-zinc-200 truncate">{pathFinderHud.label}</span>
+                          <span className="font-mono text-emerald-300 font-semibold tabular-nums shrink-0">
+                            {pathFinderHud.remainingM}m (~{Math.max(1, Math.round(pathFinderHud.remainingM / 3.8))}s)
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1 shrink-0">
+                          {!pathFinderHud.autoWalking && engineRef.current?.pathFinderDest && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const d = engineRef.current?.pathFinderDest;
+                                if (d) setPathFinderRoute(d, true);
+                              }}
+                              className="px-1.5 py-0.5 rounded-md bg-violet-600 hover:bg-violet-500 text-white font-semibold text-[9.5px] cursor-pointer"
+                            >
+                              Go To
+                            </button>
+                          )}
                           <button
                             type="button"
-                            onClick={() => {
-                              const d = engineRef.current?.pathFinderDest;
-                              if (d) setPathFinderRoute(d, true);
-                            }}
-                            className="px-1.5 py-0.5 rounded-md bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 font-semibold text-[9.5px] cursor-pointer"
+                            onClick={clearPathFinderRoute}
+                            className="p-0.5 rounded text-zinc-400 hover:text-white cursor-pointer"
+                            title="Stop & clear navigation route"
                           >
-                            Auto-Walk
+                            <X className="w-3 h-3" />
                           </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={clearPathFinderRoute}
-                          className="p-0.5 rounded text-zinc-400 hover:text-white cursor-pointer"
-                          title="Clear Path Finder route"
-                        >
-                          <X className="w-3 h-3" />
-                        </button>
+                        </div>
                       </div>
+                      {(pathFinderHud.statusStep || pathFinderHud.roomTrail) && (
+                        <div className="flex items-center justify-between gap-2 text-[9.5px] text-zinc-300">
+                          <span className="truncate text-violet-200 font-medium">
+                            {pathFinderHud.statusStep ?? pathFinderHud.protocolSummary}
+                          </span>
+                          {pathFinderHud.roomTrail && (
+                            <span className="font-mono text-zinc-400 truncate max-w-[190px] shrink-0">
+                              {pathFinderHud.roomTrail}
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -9654,7 +10542,7 @@ export const Viewport3D: React.FC = () => {
                       {/* Spatial Audio Mute Toggle */}
                       <button
                         type="button"
-                        onClick={() => setSpatialAudioEnabled((v) => !v)}
+                        onClick={toggleSpatialAudio}
                         className={`px-1.5 py-1 rounded-lg border text-[10px] font-mono flex items-center gap-1 cursor-pointer transition ${
                           spatialAudioEnabled
                             ? 'bg-emerald-500/15 border-emerald-400/45 text-emerald-300'
@@ -9696,24 +10584,26 @@ export const Viewport3D: React.FC = () => {
                         <SlidersHorizontal className="w-3 h-3" />
                       </button>
 
-                      {/* Path Finder & Routing Config Trigger */}
+                      {/* Go To Room & GMP Path Finder Trigger */}
                       <button
                         type="button"
                         onClick={() => {
                           setPathFinderOpen((v) => !v);
                           setSpatialAudioSettingsOpen(false);
                         }}
-                        className={`px-1.5 py-1 rounded-lg border text-[10px] font-semibold flex items-center gap-1 cursor-pointer transition ${
+                        className={`px-2 py-1 rounded-lg border text-[10px] font-semibold flex items-center gap-1 cursor-pointer transition ${
                           pathFinderOpen || pathFinderHud
-                            ? pathAlgorithm === 'least-congested'
-                              ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
-                              : 'bg-cyan-500/20 border-cyan-400/50 text-cyan-200'
-                            : 'bg-zinc-800 border-zinc-700 text-zinc-300 hover:border-cyan-400/40'
+                            ? pathAlgorithm === 'gmp-compliant'
+                              ? 'bg-violet-500/25 border-violet-400/60 text-violet-100'
+                              : pathAlgorithm === 'least-congested'
+                                ? 'bg-emerald-500/20 border-emerald-400/50 text-emerald-200'
+                                : 'bg-cyan-500/20 border-cyan-400/50 text-cyan-200'
+                            : 'bg-zinc-800 border-zinc-700 text-zinc-200 hover:border-violet-400/50'
                         }`}
-                        title="Open 3D Path Finder, Routing Mode & No-Go Zones"
+                        title="Go To Room via GMP Path (auto-opens doors, airlocks & PAL gowning)"
                       >
                         <Route className="w-3 h-3" />
-                        <span className="hidden sm:inline">Path</span>
+                        <span>Go To</span>
                         {noGoZones.filter((z) => z.floorId === activeFloorId).length > 0 && (
                           <span className="font-mono text-[9px] text-rose-300 tabular-nums">
                             ·{noGoZones.filter((z) => z.floorId === activeFloorId).length}
@@ -9728,7 +10618,9 @@ export const Viewport3D: React.FC = () => {
                             const nextOn = useMayaStore
                               .getState()
                               .toggleRoomLight(curRoom.id, curRoom.code, curRoom.name);
-                            spatialAudioRef.current?.playSwitchCue(nextOn);
+                            if (spatialAudioEnabledRef.current) {
+                              spatialAudioRef.current?.playSwitchCue(nextOn);
+                            }
                           }}
                           className={`p-1 rounded-lg border text-[10px] cursor-pointer transition ${
                             (roomLightsState[curRoom.id] ?? true)

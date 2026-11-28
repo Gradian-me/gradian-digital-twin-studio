@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { NoGoZone, PathRoutingAlgorithm } from './navMesh';
+import type { GmpRouteCheckpoint, NoGoZone, PathRoutingAlgorithm } from './navMesh';
 
 export interface PathFinderVisualRig {
   group: THREE.Group;
@@ -67,7 +67,8 @@ export function populatePathFinderVisual(
   points: { x: number; z: number }[],
   floorElev: number,
   disposeFn: (obj: THREE.Object3D) => void,
-  algorithm: PathRoutingAlgorithm = 'shortest'
+  algorithm: PathRoutingAlgorithm = 'gmp-compliant',
+  checkpoints?: GmpRouteCheckpoint[]
 ): PathFinderVisualRig {
   disposeFn(targetGroup);
   targetGroup.clear();
@@ -84,10 +85,11 @@ export function populatePathFinderVisual(
     };
   }
 
+  const isGmp = algorithm === 'gmp-compliant';
   const isLeastCongested = algorithm === 'least-congested';
-  const primaryColor = isLeastCongested ? '#10B981' : '#22D3EE';
-  const accentColor = isLeastCongested ? '#6EE7B7' : '#34D399';
-  const glowColor = isLeastCongested ? '#059669' : '#0891B2';
+  const primaryColor = isGmp ? '#A78BFA' : isLeastCongested ? '#10B981' : '#22D3EE';
+  const accentColor = isGmp ? '#38BDF8' : isLeastCongested ? '#6EE7B7' : '#34D399';
+  const glowColor = isGmp ? '#7C3AED' : isLeastCongested ? '#059669' : '#0891B2';
 
   // Deduplicate closely spaced points so CatmullRomCurve3 tangents stay clean
   const cleanPts: THREE.Vector3[] = [];
@@ -187,6 +189,38 @@ export function populatePathFinderVisual(
   beaconCore.position.set(dest.x, floorElev + 0.82, dest.z);
   beaconCore.renderOrder = 15;
   targetGroup.add(beaconCore);
+
+  // 5. GMP Staging Checkpoint Markers (e.g., PAL Gowning / Airlock Cascade)
+  if (checkpoints && checkpoints.length > 0) {
+    const cpRingGeo = new THREE.RingGeometry(0.42, 0.62, 32);
+    cpRingGeo.rotateX(-Math.PI / 2);
+    const cpRingMat = new THREE.MeshBasicMaterial({
+      color: '#F59E0B',
+      transparent: true,
+      opacity: 0.9,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const cpColGeo = new THREE.CylinderGeometry(0.06, 0.22, 1.15, 16, 1, true);
+    const cpColMat = new THREE.MeshBasicMaterial({
+      color: '#FBBF24',
+      transparent: true,
+      opacity: 0.24,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    for (const cp of checkpoints) {
+      const cpRing = new THREE.Mesh(cpRingGeo, cpRingMat);
+      cpRing.position.set(cp.x, floorElev + 0.065, cp.z);
+      cpRing.renderOrder = 15;
+      targetGroup.add(cpRing);
+
+      const cpCol = new THREE.Mesh(cpColGeo, cpColMat);
+      cpCol.position.set(cp.x, floorElev + 0.62, cp.z);
+      cpCol.renderOrder = 15;
+      targetGroup.add(cpCol);
+    }
+  }
 
   targetGroup.visible = true;
   const rig: PathFinderVisualRig = {

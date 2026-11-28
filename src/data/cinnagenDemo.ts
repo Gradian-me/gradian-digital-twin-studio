@@ -825,7 +825,7 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
       utilizationPct: 76,
       activeFromDate: '2024-06-15',
     }),
-    makeRoom('rm-a0-pal', 'fl-a0', 'dept-mfg', 'Personnel Airlock & Gowning (PAL)', 'A0-106', 'st-pal', 11, 13.5, 6, 7.5, {
+    makeRoom('rm-a0-pal', 'fl-a0', 'dept-mfg', 'Cleanroom Gowning Room (PAL)', 'A0-106', 'st-pal', 11, 13.5, 6, 7.5, {
       utilizationPct: 62,
       activeFromDate: '2024-05-15',
     }),
@@ -912,7 +912,11 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
       utilizationPct: 92,
       activeFromDate: '2024-08-10',
     }),
-    makeRoom('rm-b1-rd', 'fl-b1', 'dept-qc', 'Bioprocess R&D Lab', 'B1-205', 'st-rd-lab', 14, 11.5, 17, 7.5, {
+    makeRoom('rm-b1-pal', 'fl-b1', 'dept-qc', 'Cleanroom Gowning Room (PAL)', 'B1-206', 'st-pal', 14, 11.5, 6, 7.5, {
+      utilizationPct: 64,
+      activeFromDate: '2024-07-01',
+    }),
+    makeRoom('rm-b1-rd', 'fl-b1', 'dept-qc', 'Bioprocess R&D Lab', 'B1-205', 'st-rd-lab', 20, 11.5, 11, 7.5, {
       utilizationPct: 77,
       activeFromDate: '2024-09-01',
     }),
@@ -983,7 +987,8 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
     { id: 'op-29', floorId: 'fl-b1', wallId: 'rm-b1-micro-w3', kind: 'door', subtype: 'airlock-door', name: 'QC Microbiology Sterility Airlock Door', offsetRatio: 0.45, width: 1.3, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-cleanroom-panel', frameColor: '#0D9488', lockType: 'Interlock', accessControl: 'interlock', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
     { id: 'op-30', floorId: 'fl-b1', wallId: 'rm-b1-sample-w3', kind: 'door', subtype: 'single-door', name: 'Sample Receiving Entry Door', offsetRatio: 0.5, width: 1.25, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-cleanroom-panel', frameColor: '#334155', lockType: 'Badge', accessControl: 'badge', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
     { id: 'op-31', floorId: 'fl-b1', wallId: 'rm-b1-stability-w1', kind: 'door', subtype: 'cleanroom-door', name: 'ICH Stability Chamber Room Entry', offsetRatio: 0.48, width: 1.35, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-cleanroom-panel', frameColor: '#2563EB', lockType: 'Badge', accessControl: 'badge', fireRating: '60 min', status: 'closed', layerId: 'layer-openings' },
-    { id: 'op-32', floorId: 'fl-b1', wallId: 'rm-b1-rd-w1', kind: 'door', subtype: 'glass-door', name: 'Bioprocess R&D Lab Glass Entry', offsetRatio: 0.32, width: 1.35, height: 2.3, sillHeight: 0, thickness: 0.08, swingDirection: 'right', swingAngle: 90, materialId: 'mat-glass-cleanroom', frameColor: '#1E293B', lockType: 'Badge', accessControl: 'badge', fireRating: 'None', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-32', floorId: 'fl-b1', wallId: 'rm-b1-rd-w1', kind: 'door', subtype: 'glass-door', name: 'Bioprocess R&D Lab Glass Entry', offsetRatio: 0.45, width: 1.35, height: 2.3, sillHeight: 0, thickness: 0.08, swingDirection: 'right', swingAngle: 90, materialId: 'mat-glass-cleanroom', frameColor: '#1E293B', lockType: 'Badge', accessControl: 'badge', fireRating: 'None', status: 'closed', layerId: 'layer-openings' },
+    { id: 'op-33', floorId: 'fl-b1', wallId: 'rm-b1-pal-w1', kind: 'door', subtype: 'airlock-door', name: 'QC Gowning Room PAL Door', offsetRatio: 0.5, width: 1.25, height: 2.25, sillHeight: 0, thickness: 0.14, swingDirection: 'right', swingAngle: 90, materialId: 'mat-cleanroom-panel', frameColor: '#2563EB', lockType: 'Biometric Interlock', accessControl: 'biometric', fireRating: '60 min', status: 'interlocked', layerId: 'layer-openings' },
   ];
 
   // Guarantee zero isolated rooms even if custom rooms are later appended
@@ -1011,9 +1016,9 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
     makeAsset('ast-med-2', 'fl-a0', 'rm-a0-media', 'eq-buffer-tank', 'Buffer Prep Tank BP-102', 'BP-102', 6.4, 16.5, 0),
     makeAsset('ast-med-3', 'fl-a0', 'rm-a0-media', 'eq-cip-skid', 'Central CIP/SIP Skid', 'CIP-103', 8.8, 18.8, 0),
 
-    makeAsset('ast-pal-1', 'fl-a0', 'rm-a0-pal', 'eq-locker', 'Cleanroom Gowning Lockers', 'PAL-L01', 12.6, 15.2, 0),
-    makeAsset('ast-pal-2', 'fl-a0', 'rm-a0-pal', 'eq-bench', 'Step-Over Demarcation Bench', 'PAL-B01', 14.0, 17.4, 0),
-    makeAsset('ast-pal-3', 'fl-a0', 'rm-a0-pal', 'eq-wash-station', 'Hands-Free Cleanroom Sink', 'PAL-S01', 15.4, 19.6, Math.PI),
+    makeAsset('ast-pal-1', 'fl-a0', 'rm-a0-pal', 'eq-locker', 'Cleanroom Gowning Lockers', 'PAL-L01', 11.9, 15.6, 0),
+    makeAsset('ast-pal-2', 'fl-a0', 'rm-a0-pal', 'eq-bench', 'Step-Over Demarcation Bench', 'PAL-B01', 15.8, 17.5, Math.PI / 2),
+    makeAsset('ast-pal-3', 'fl-a0', 'rm-a0-pal', 'eq-wash-station', 'Hands-Free Cleanroom Sink', 'PAL-S01', 12.1, 19.6, Math.PI),
 
     makeAsset('ast-mal-1', 'fl-a0', 'rm-a0-mal', 'eq-autoclave', 'Pass-Through Steam Autoclave', 'AUT-201', 19.8, 16.4, 0),
     makeAsset('ast-mal-2', 'fl-a0', 'rm-a0-mal', 'eq-pallet', 'Sanitized Material Pallet', 'PLT-202', 20.4, 19.4, 0),
@@ -1467,8 +1472,11 @@ export function createCinnaGenCampusScene(): DigitalTwinScene {
     makeAsset('ast-qc-10', 'fl-b1', 'rm-b1-stability', 'eq-stability-chamber', 'ICH Stability Chamber 25°C/60%RH', 'STB-01', 4.2, 14.8, 0),
     makeAsset('ast-qc-11', 'fl-b1', 'rm-b1-stability', 'eq-stability-chamber', 'ICH Accelerated Chamber 40°C/75%RH', 'STB-02', 8.2, 14.8, 0),
     makeAsset('ast-qc-12', 'fl-b1', 'rm-b1-stability', 'eq-ul-freezer', 'Master Cell Bank -80°C Freezer', 'ULT-01', 11.8, 15.0, 0),
-    makeAsset('ast-qc-13', 'fl-b1', 'rm-b1-rd', 'eq-lab-bench', 'Bioprocess R&D Bench A', 'RD-B01', 19.0, 15.0, 0),
-    makeAsset('ast-qc-14', 'fl-b1', 'rm-b1-rd', 'eq-pcr', 'qPCR Residual DNA Analyzer', 'PCR-01', 25.5, 14.8, 0),
+    makeAsset('ast-b1-pal-1', 'fl-b1', 'rm-b1-pal', 'eq-locker', 'QC Cleanroom Gowning Lockers', 'PAL-B1-L01', 15.0, 13.6, 0),
+    makeAsset('ast-b1-pal-2', 'fl-b1', 'rm-b1-pal', 'eq-bench', 'QC Step-Over Demarcation Bench', 'PAL-B1-B01', 18.7, 15.4, Math.PI / 2),
+    makeAsset('ast-b1-pal-3', 'fl-b1', 'rm-b1-pal', 'eq-wash-station', 'QC Hands-Free Sterile Sink', 'PAL-B1-S01', 15.2, 17.6, Math.PI),
+    makeAsset('ast-qc-13', 'fl-b1', 'rm-b1-rd', 'eq-lab-bench', 'Bioprocess R&D Bench A', 'RD-B01', 22.4, 15.0, 0),
+    makeAsset('ast-qc-14', 'fl-b1', 'rm-b1-rd', 'eq-pcr', 'qPCR Residual DNA Analyzer', 'PCR-01', 27.2, 14.8, 0),
     makeAsset('ast-qc-fex', 'fl-b1', 'rm-b1-analytical', 'eq-fire-extinguisher', 'Analytical Lab CO2 Extinguisher FE-B11', 'FE-B11', 1.7, 9.8, 0),
     // Additional models ensuring every room across all floors has rich 3D equipment
     makeAsset('ast-cnf-2', 'fl-a1', 'rm-a1-conf', 'eq-scada-console', 'Audit Review Presentation Console', 'CNF-02', 25.6, 19.2, Math.PI / 2),

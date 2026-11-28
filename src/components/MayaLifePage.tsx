@@ -95,14 +95,132 @@ const QUICK_EXPRESSIONS: MayaExpressionName[] = [
   'wink',
 ];
 
+interface SopSampleSummary {
+  sopId: string;
+  docNumber: string;
+  title: string;
+  executiveOverview: string;
+  requiredGowning: string[];
+  requiresFullGown: boolean;
+  estimatedMinutes: number;
+  cpps: { parameter: string; target: string; actionLimit: string }[];
+  checklist: string[];
+  qaNote: string;
+}
+
+function buildSopSampleSummary(sop: {
+  id: string;
+  docNumber: string;
+  title: string;
+  version: string;
+  status: string;
+  equipmentCategory: string;
+  actionType: string;
+  markdown: string;
+}): SopSampleSummary {
+  const hay = `${sop.docNumber} ${sop.title} ${sop.equipmentCategory} ${sop.actionType} ${sop.markdown}`.toLowerCase();
+  const isCleanroomSterile =
+    /aseptic|grade a|grade b|grade c|bioreactor|steril|filling|lyophil|microbiolog|cleanroom|gown|pal|upstream|downstream|chrom|tff|isolator/.test(
+      hay
+    );
+
+  // Extract real numbered/bulleted steps from the SOP markdown when present
+  const extractedSteps: string[] = [];
+  for (const rawLine of sop.markdown.split('\n')) {
+    const line = rawLine.trim();
+    const match = line.match(/^(?:\d+[.)]|[-*])\s+(.+)$/);
+    if (match) {
+      const cleaned = match[1].replace(/\*\*/g, '').replace(/`/g, '').trim();
+      if (cleaned.length >= 16 && cleaned.length <= 135 && extractedSteps.length < 5) {
+        extractedSteps.push(cleaned);
+      }
+    }
+  }
+
+  // Domain-authentic Critical Process Parameters tailored to equipment category
+  let cpps: { parameter: string; target: string; actionLimit: string }[];
+  if (/bioreactor|cell culture|upstream|ferment/.test(hay)) {
+    cpps = [
+      { parameter: 'Vessel Temperature', target: '37.0 °C', actionLimit: '± 0.3 °C' },
+      { parameter: 'Dissolved Oxygen (DO)', target: '40.0 %', actionLimit: '30 – 50 %' },
+      { parameter: 'Culture pH', target: '7.10', actionLimit: '6.95 – 7.25' },
+      { parameter: 'SIP Hold Temp / Time', target: '121.5 °C / 30m', actionLimit: '≥ 121.0 °C' },
+    ];
+  } else if (/filling|aseptic|lyophil|isolator|vial/.test(hay)) {
+    cpps = [
+      { parameter: 'Grade A Laminar Flow', target: '0.45 m/s', actionLimit: '0.36 – 0.54 m/s' },
+      { parameter: 'Viable Particles (≥0.5µm)', target: '0 CFU / <3,520', actionLimit: 'ISO 5 Zero-Alert' },
+      { parameter: 'Room Cascade ΔP', target: '+30 Pa', actionLimit: '≥ +15 Pa vs Grade C' },
+      { parameter: 'Fill Weight Accuracy', target: '± 1.0 %', actionLimit: '± 2.0 % Reject' },
+    ];
+  } else if (/hvac|ahu|cleanroom|pressure|airlock|gown/.test(hay)) {
+    cpps = [
+      { parameter: 'Room Pressure Differential', target: '+15 to +30 Pa', actionLimit: '< +10 Pa Alarm' },
+      { parameter: 'Air Changes / Hour (ACH)', target: '≥ 20 ACH', actionLimit: '< 15 ACH Alert' },
+      { parameter: 'Room Temp / RH', target: '20 °C / 45 %RH', actionLimit: '18–22 °C / 35–55%' },
+      { parameter: 'HEPA H14 Filter ΔP', target: '140 Pa', actionLimit: '> 250 Pa Replace' },
+    ];
+  } else if (/chrom|tff|purif|filtration|buffer|media/.test(hay)) {
+    cpps = [
+      { parameter: 'Transmembrane Pressure', target: '1.2 bar', actionLimit: '≤ 2.0 bar Max' },
+      { parameter: 'Buffer Conductivity', target: '14.2 mS/cm', actionLimit: '± 0.8 mS/cm' },
+      { parameter: 'UV280 Elution Peak', target: '≥ 150 mAU', actionLimit: 'Collect 100–250 mAU' },
+      { parameter: 'Bioburden Hold Time', target: '≤ 24 h', actionLimit: '2–8 °C Verified' },
+    ];
+  } else if (/cold|warehouse|storage|stability|chamber/.test(hay)) {
+    cpps = [
+      { parameter: 'Storage Temperature', target: '5.0 °C', actionLimit: '2.0 – 8.0 °C' },
+      { parameter: 'Relative Humidity', target: '45 %RH', actionLimit: '35 – 60 %RH' },
+      { parameter: 'Door-Open Excursion', target: '< 2 min', actionLimit: '> 5 min QA Deviation' },
+    ];
+  } else {
+    cpps = [
+      { parameter: 'Calibration Status', target: 'Current Valid', actionLimit: 'Lockout if Overdue' },
+      { parameter: 'Pre-Use Integrity Check', target: 'Pass 100%', actionLimit: 'Hold & Notify QA' },
+      { parameter: 'Room Environmental Spec', target: 'In-Spec BMS', actionLimit: 'Active Alarm = Pause' },
+    ];
+  }
+
+  const checklist =
+    extractedSteps.length >= 3
+      ? extractedSteps
+      : [
+          `Verify calibration seal, room differential pressure, and clean-hold expiry before starting ${sop.docNumber}.`,
+          isCleanroomSterile
+            ? 'Complete full EU GMP Annex 1 sterile gowning (bunny suit, hood, anti-fog goggles, mask, nitrile gloves & over-boots) in PAL.'
+            : 'Confirm required facility PPE, badge authorization, and active batch record sign-off.',
+          `Execute ${sop.actionType.toLowerCase()} sequence for ${sop.equipmentCategory} while monitoring CPPs inside acceptance limits.`,
+          'Verify post-operation line clearance, log electronic signature (21 CFR Part 11), and confirm zero active alarms.',
+        ];
+
+  const requiredGowning = isCleanroomSterile
+    ? ['Full Sterile Coverall', 'Cleanroom Hood', 'Anti-Fog Goggles', 'Sterile Mask', 'Double Nitrile Gloves', 'Over-Boots']
+    : ['Facility Coat / Polo', 'Safety Glasses', 'ESD / Clean Footwear', 'Access Badge'];
+
+  return {
+    sopId: sop.id,
+    docNumber: sop.docNumber,
+    title: sop.title,
+    executiveOverview: `Standardized GMP ${sop.actionType.toLowerCase()} procedure for ${sop.equipmentCategory} (${sop.docNumber}, v${sop.version}). Ensures reproducible parameter control, environmental compliance, and documented 21 CFR Part 11 verification across every execution cycle.`,
+    requiredGowning,
+    requiresFullGown: isCleanroomSterile,
+    estimatedMinutes: isCleanroomSterile ? 25 : 15,
+    cpps,
+    checklist,
+    qaNote: `Status: ${sop.status.toUpperCase()} · EU GMP Annex 1 & ALCOA+ Data Integrity compliant. Escalate any limit excursion immediately to QA.`,
+  };
+}
+
 /** Interactive 3D WebGL Studio Stage for MAYA */
 const MayaStage3D: React.FC<{
   stateName: MayaStateName;
   expression: MayaExpressionName;
   isThinking: boolean;
   isReadingSop: boolean;
+  isGowned: boolean;
+  onToggleGown: () => void;
   statusNote: string;
-}> = ({ stateName, expression, isThinking, isReadingSop, statusNote }) => {
+}> = ({ stateName, expression, isThinking, isReadingSop, isGowned, onToggleGown, statusNote }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const controllerRef = useRef<MayaController | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
@@ -212,6 +330,7 @@ const MayaStage3D: React.FC<{
         });
         scene.add(mayaRoot);
         const st = useMayaStore.getState();
+        ctrl.setGowned(st.isGowned);
         ctrl.setState(st.isThinking ? 'thinking' : st.currentState, {
           expression: st.currentExpression,
           fade: 0.2,
@@ -282,7 +401,7 @@ const MayaStage3D: React.FC<{
     };
   }, []);
 
-  // Sync MAYA state & expression smoothly
+  // Sync MAYA state, expression & sterile cleanroom gown smoothly
   useEffect(() => {
     const ctrl = controllerRef.current;
     if (!ctrl) return;
@@ -290,6 +409,10 @@ const MayaStage3D: React.FC<{
     const targetExpr: MayaExpressionName = isThinking ? 'thinking' : expression;
     ctrl.setState(targetState, { expression: targetExpr, fade: 0.28, restart: false });
   }, [stateName, expression, isThinking]);
+
+  useEffect(() => {
+    controllerRef.current?.setGowned(isGowned);
+  }, [isGowned]);
 
   const handleResetView = () => {
     if (!cameraRef.current || !controlsRef.current) return;
@@ -335,11 +458,24 @@ const MayaStage3D: React.FC<{
         </button>
       </div>
 
-      {/* Bottom Orbit Helper */}
-      <div className="absolute bottom-2.5 left-3 right-3 flex items-center justify-between text-[10px] text-zinc-400 pointer-events-none">
+      {/* Bottom Orbit Helper + Cleanroom Gown Outfit Switcher */}
+      <div className="absolute bottom-2.5 left-3 right-3 flex items-center justify-between gap-2 text-[10px] text-zinc-400 pointer-events-none">
         <span className="px-2 py-0.5 rounded-md bg-zinc-950/70 border border-zinc-800">
           Drag to orbit 360° · Scroll to zoom
         </span>
+        <button
+          type="button"
+          onClick={onToggleGown}
+          className={`pointer-events-auto flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[10px] font-semibold transition-colors cursor-pointer ${
+            isGowned
+              ? 'bg-cyan-500/20 border-cyan-400/60 text-cyan-200 hover:bg-cyan-500/30'
+              : 'bg-zinc-950/80 border-zinc-700 text-zinc-200 hover:border-cyan-400/60 hover:text-cyan-200'
+          }`}
+          title="Toggle MAYA between Standard Polo Uniform and Full Grade A/B Cleanroom Gown"
+        >
+          <ShieldCheck className="w-3 h-3 text-cyan-400" />
+          <span>{isGowned ? 'Full Cleanroom Gown ON' : 'Wear Cleanroom Gown'}</span>
+        </button>
       </div>
     </div>
   );
@@ -367,6 +503,7 @@ export const MayaLifePage: React.FC = () => {
   const statusNote = useMayaStore((s) => s.statusNote);
   const isThinking = useMayaStore((s) => s.isThinking);
   const isReadingSop = useMayaStore((s) => s.isReadingSop);
+  const isGowned = useMayaStore((s) => s.isGowned);
   const activeRoomCode = useMayaStore((s) => s.activeRoomCode);
   const activeRoomName = useMayaStore((s) => s.activeRoomName);
   const activeSopId = useMayaStore((s) => s.activeSopId);
@@ -380,6 +517,7 @@ export const MayaLifePage: React.FC = () => {
   const lifeChatMessages = useMayaStore((s) => s.lifeChatMessages);
 
   const setMood = useMayaStore((s) => s.setMood);
+  const setGowned = useMayaStore((s) => s.setGowned);
   const setThinking = useMayaStore((s) => s.setThinking);
   const startReadingSop = useMayaStore((s) => s.startReadingSop);
   const stopReadingSop = useMayaStore((s) => s.stopReadingSop);
@@ -400,6 +538,15 @@ export const MayaLifePage: React.FC = () => {
   const [nowTick, setNowTick] = useState(() => Date.now());
   const [sopQuery, setSopQuery] = useState('');
   const [selectedSopId, setSelectedSopId] = useState<string | null>(activeSopId ?? sops[0]?.id ?? null);
+  const [sopReadingState, setSopReadingState] = useState<{
+    sopId: string;
+    progress: number;
+    phase: string;
+  } | null>(null);
+  const [sopSummaries, setSopSummaries] = useState<Record<string, SopSampleSummary>>({});
+  const [checkedSopSteps, setCheckedSopSteps] = useState<Record<string, boolean>>({});
+  const [acknowledgedSops, setAcknowledgedSops] = useState<Record<string, boolean>>({});
+  const sopReadTimersRef = useRef<number[]>([]);
   const [facilityQuery, setFacilityQuery] = useState('');
   const [chatInput, setChatInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -408,6 +555,58 @@ export const MayaLifePage: React.FC = () => {
   const activeLifeThread = useMemo(
     () => lifeThreads.find((t) => t.id === activeLifeThreadId) ?? lifeThreads[0],
     [lifeThreads, activeLifeThreadId]
+  );
+
+  // Clean up any active SOP reading animation timers on unmount
+  useEffect(() => {
+    return () => {
+      sopReadTimersRef.current.forEach((id) => window.clearTimeout(id));
+      sopReadTimersRef.current = [];
+    };
+  }, []);
+
+  const triggerSopSampleRead = useCallback(
+    (sop: (typeof sops)[number]) => {
+      sopReadTimersRef.current.forEach((id) => window.clearTimeout(id));
+      sopReadTimersRef.current = [];
+
+      setSelectedSopId(sop.id);
+      setCenterTab('sops');
+      startReadingSop(sop.id, sop.title, null, sop.docNumber);
+
+      setSopReadingState({
+        sopId: sop.id,
+        progress: 28,
+        phase: `Scanning ${sop.docNumber} sections & scope...`,
+      });
+
+      const t1 = window.setTimeout(() => {
+        setSopReadingState({
+          sopId: sop.id,
+          progress: 68,
+          phase: 'Extracting Critical Process Parameters & GMP limits...',
+        });
+      }, 650);
+
+      const t2 = window.setTimeout(() => {
+        setSopReadingState({
+          sopId: sop.id,
+          progress: 94,
+          phase: 'Compiling executive sample summary & checklist...',
+        });
+      }, 1350);
+
+      const t3 = window.setTimeout(() => {
+        const summary = buildSopSampleSummary(sop);
+        setSopSummaries((prev) => ({ ...prev, [sop.id]: summary }));
+        setSopReadingState(null);
+        stopReadingSop(`Generated sample summary for ${sop.docNumber} · ${sop.title}`);
+        showToast(`MAYA finished reading ${sop.docNumber} — Sample Summary ready`, 'success');
+      }, 1950);
+
+      sopReadTimersRef.current = [t1, t2, t3];
+    },
+    [startReadingSop, stopReadingSop, showToast]
   );
 
   // Live 1s duration ticker while any workflow event is still running
@@ -440,7 +639,12 @@ export const MayaLifePage: React.FC = () => {
     if (activeSopId) {
       setSelectedSopId(activeSopId);
       setCenterTab('sops');
+      const matched = sops.find((s) => s.id === activeSopId);
+      if (matched && !sopSummaries[matched.id]) {
+        triggerSopSampleRead(matched);
+      }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSopId]);
 
   useEffect(() => {
@@ -918,6 +1122,8 @@ export const MayaLifePage: React.FC = () => {
               expression={currentExpression}
               isThinking={isThinking}
               isReadingSop={isReadingSop}
+              isGowned={isGowned}
+              onToggleGown={() => setGowned(!isGowned, 'MAYA Life Studio')}
               statusNote={statusNote}
             />
           </div>
@@ -1160,10 +1366,7 @@ export const MayaLifePage: React.FC = () => {
                     <button
                       key={sop.id}
                       type="button"
-                      onClick={() => {
-                        setSelectedSopId(sop.id);
-                        startReadingSop(sop.id, sop.title, null, sop.docNumber);
-                      }}
+                      onClick={() => triggerSopSampleRead(sop)}
                       className={`w-full text-left px-3 py-2 flex items-center justify-between gap-2 transition-colors cursor-pointer ${
                         active
                           ? 'bg-violet-500/12 border-l-2 border-l-violet-500'
@@ -1178,6 +1381,11 @@ export const MayaLifePage: React.FC = () => {
                           <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-200/70 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 truncate">
                             {sop.actionType}
                           </span>
+                          {sopSummaries[sop.id] && (
+                            <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-semibold">
+                              Summary
+                            </span>
+                          )}
                         </div>
                         <div className="text-xs font-medium text-zinc-900 dark:text-white truncate">
                           {sop.title}
@@ -1189,11 +1397,11 @@ export const MayaLifePage: React.FC = () => {
                 })}
               </div>
 
-              {/* Active SOP Full Reader */}
+              {/* Active SOP Full Reader + Sample Summary Panel */}
               {selectedSop ? (
                 <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
-                  <div className="px-3.5 py-2.5 bg-zinc-50 dark:bg-[#16161F] border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-2 shrink-0">
-                    <div className="min-w-0">
+                  <div className="px-3 py-2 bg-zinc-50 dark:bg-[#16161F] border-b border-zinc-200 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-2 shrink-0">
+                    <div className="min-w-0 flex-1">
                       <div className="text-[10px] font-mono text-violet-500 font-semibold">
                         {selectedSop.docNumber} · v{selectedSop.version} · {selectedSop.status.toUpperCase()}
                       </div>
@@ -1201,24 +1409,247 @@ export const MayaLifePage: React.FC = () => {
                         {selectedSop.title}
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      disabled={sending}
-                      onClick={() => {
-                        startReadingSop(selectedSop.id, selectedSop.title, null, selectedSop.docNumber);
-                        sendMessage(
-                          `Read and explain ${selectedSop.docNumber} (${selectedSop.title}): highlight critical safety precautions, key operating parameters, alarm response, and preventive maintenance steps.`,
-                          selectedSop.id
-                        );
-                      }}
-                      className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl gradian-violet-amber text-white text-[11px] font-semibold shadow-sm hover:opacity-95 transition-opacity shrink-0 cursor-pointer disabled:opacity-50"
-                    >
-                      <Sparkles className="w-3.5 h-3.5" />
-                      <span>Explain with MAYA</span>
-                    </button>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => triggerSopSampleRead(selectedSop)}
+                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-[11px] font-semibold shadow-xs transition-colors cursor-pointer"
+                        title="Have MAYA read this SOP and generate a live sample summary"
+                      >
+                        <BookOpen className="w-3.5 h-3.5" />
+                        <span>Read SOP</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={sending}
+                        onClick={() => {
+                          startReadingSop(selectedSop.id, selectedSop.title, null, selectedSop.docNumber);
+                          sendMessage(
+                            `Read and explain ${selectedSop.docNumber} (${selectedSop.title}): highlight critical safety precautions, key operating parameters, alarm response, and preventive maintenance steps.`,
+                            selectedSop.id
+                          );
+                        }}
+                        className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl gradian-violet-amber text-white text-[11px] font-semibold shadow-xs hover:opacity-95 transition-opacity cursor-pointer disabled:opacity-50"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>Explain AI</span>
+                      </button>
+                    </div>
                   </div>
 
-                  <div className="flex-1 overflow-y-auto p-3.5">
+                  <div className="flex-1 overflow-y-auto p-3 space-y-3">
+                    {/* Live SOP Reading Progress Banner */}
+                    {sopReadingState && sopReadingState.sopId === selectedSop.id && (
+                      <div className="rounded-xl border border-cyan-500/45 bg-cyan-500/10 p-3 space-y-2">
+                        <div className="flex items-center justify-between gap-2 text-xs font-semibold text-cyan-700 dark:text-cyan-300">
+                          <span className="flex items-center gap-1.5">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            MAYA Reading {selectedSop.docNumber}
+                          </span>
+                          <span className="font-mono text-[11px] tabular-nums">{sopReadingState.progress}%</span>
+                        </div>
+                        <div className="h-1.5 w-full rounded-full bg-cyan-950/30 dark:bg-zinc-800 overflow-hidden">
+                          <div
+                            className="h-full rounded-full bg-gradient-to-r from-cyan-500 to-violet-500 transition-all duration-500"
+                            style={{ width: `${sopReadingState.progress}%` }}
+                          />
+                        </div>
+                        <div className="text-[11px] text-zinc-600 dark:text-zinc-300">{sopReadingState.phase}</div>
+                      </div>
+                    )}
+
+                    {/* Structured Sample Summary Card */}
+                    {(() => {
+                      const summary = sopSummaries[selectedSop.id];
+                      if (!summary) {
+                        return (
+                          <div className="rounded-xl border border-dashed border-violet-500/35 bg-violet-500/5 px-3 py-2 flex items-center justify-between gap-2 text-[11px]">
+                            <span className="text-zinc-600 dark:text-zinc-300">
+                              Click <strong>Read SOP</strong> for MAYA&apos;s quick executive summary, CPP limits &amp; checklist.
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => triggerSopSampleRead(selectedSop)}
+                              className="px-2 py-1 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-[10px] font-semibold shrink-0 cursor-pointer"
+                            >
+                              Summarize
+                            </button>
+                          </div>
+                        );
+                      }
+
+                      const isAck = Boolean(acknowledgedSops[selectedSop.id]);
+                      return (
+                        <div className="rounded-xl border border-violet-500/40 bg-violet-500/[0.06] dark:bg-[#171625] p-3 space-y-2.5 text-xs">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-1.5 text-[11px] font-bold text-violet-700 dark:text-violet-300">
+                              <Sparkles className="w-3.5 h-3.5" />
+                              <span>MAYA Sample SOP Summary</span>
+                            </div>
+                            <span className="font-mono text-[10px] text-zinc-500 dark:text-zinc-400">
+                              ~{summary.estimatedMinutes} min · {summary.docNumber}
+                            </span>
+                          </div>
+
+                          <p className="text-[11.5px] leading-relaxed text-zinc-700 dark:text-zinc-200">
+                            {summary.executiveOverview}
+                          </p>
+
+                          {/* Gowning & PPE Requirement Strip */}
+                          <div className="space-y-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                                Required Gowning &amp; PPE
+                              </span>
+                              {summary.requiresFullGown && !isGowned && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setGowned(true, `${summary.docNumber} Pre-Entry Gowning`);
+                                    showToast('MAYA changed into Full Sterile Cleanroom Gown', 'success');
+                                  }}
+                                  className="px-2 py-0.5 rounded-md bg-cyan-600 hover:bg-cyan-500 text-white text-[10px] font-semibold cursor-pointer"
+                                >
+                                  Put On Full Gown
+                                </button>
+                              )}
+                            </div>
+                            <div className="flex flex-wrap gap-1">
+                              {summary.requiredGowning.map((ppe) => (
+                                <span
+                                  key={ppe}
+                                  className="px-1.5 py-0.5 rounded-md bg-cyan-500/15 border border-cyan-500/30 text-[10px] font-medium text-cyan-800 dark:text-cyan-200"
+                                >
+                                  {ppe}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+
+                          {/* Critical Process Parameters & Limits Table */}
+                          <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 overflow-hidden bg-white dark:bg-[#111118]">
+                            <table className="w-full text-left text-[10.5px] border-collapse">
+                              <thead className="bg-zinc-100 dark:bg-[#191924] text-[9.5px] font-mono uppercase text-zinc-500">
+                                <tr>
+                                  <th className="py-1 px-2">Critical Parameter</th>
+                                  <th className="py-1 px-2">Target</th>
+                                  <th className="py-1 px-2">Action Limit</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-zinc-200/70 dark:divide-zinc-800/70 font-mono">
+                                {summary.cpps.map((row) => (
+                                  <tr key={row.parameter}>
+                                    <td className="py-1 px-2 font-sans font-medium text-zinc-800 dark:text-zinc-200">
+                                      {row.parameter}
+                                    </td>
+                                    <td className="py-1 px-2 text-emerald-600 dark:text-emerald-400 font-semibold">
+                                      {row.target}
+                                    </td>
+                                    <td className="py-1 px-2 text-amber-600 dark:text-amber-300">
+                                      {row.actionLimit}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+
+                          {/* Interactive Verification Checklist */}
+                          <div className="space-y-1">
+                            <div className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                              Key Execution Checklist
+                            </div>
+                            <div className="space-y-1">
+                              {summary.checklist.map((step, idx) => {
+                                const stepKey = `${selectedSop.id}-${idx}`;
+                                const checked = Boolean(checkedSopSteps[stepKey]);
+                                return (
+                                  <label
+                                    key={stepKey}
+                                    className="flex items-start gap-2 text-[11px] text-zinc-700 dark:text-zinc-300 cursor-pointer"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={() =>
+                                        setCheckedSopSteps((prev) => ({
+                                          ...prev,
+                                          [stepKey]: !prev[stepKey],
+                                        }))
+                                      }
+                                      className="mt-0.5 accent-violet-600 rounded"
+                                    />
+                                    <span className={checked ? 'line-through opacity-60' : ''}>{step}</span>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          </div>
+
+                          <div className="text-[10px] text-zinc-500 dark:text-zinc-400 border-t border-zinc-200/70 dark:border-zinc-800 pt-2 flex flex-wrap items-center justify-between gap-2">
+                            <span className="flex-1 min-w-[160px]">{summary.qaNote}</span>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const md = [
+                                    `### Sample Summary — ${summary.docNumber}: ${summary.title}`,
+                                    summary.executiveOverview,
+                                    '',
+                                    `**Required PPE:** ${summary.requiredGowning.join(', ')}`,
+                                    '',
+                                    '| Parameter | Target | Action Limit |',
+                                    '| --- | --- | --- |',
+                                    ...summary.cpps.map((c) => `| ${c.parameter} | ${c.target} | ${c.actionLimit} |`),
+                                    '',
+                                    '**Key Steps:**',
+                                    ...summary.checklist.map((s, i) => `${i + 1}. ${s}`),
+                                  ].join('\n');
+                                  addLifeMessage({
+                                    role: 'assistant',
+                                    content: md,
+                                    mayaState: 'teach',
+                                    mayaExpression: 'confident',
+                                    statusNote: `Posted sample summary for ${summary.docNumber}`,
+                                    citedSopCodes: [summary.docNumber],
+                                  });
+                                  setMood('teach', 'confident', `Shared ${summary.docNumber} summary in chat`, 3500);
+                                  showToast(`Sent ${summary.docNumber} summary to MAYA Chat`, 'info');
+                                }}
+                                className="px-2 py-1 rounded-lg bg-zinc-200 dark:bg-zinc-800 hover:bg-violet-600 hover:text-white text-zinc-800 dark:text-zinc-200 text-[10px] font-semibold transition-colors cursor-pointer"
+                              >
+                                Send to Chat
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setAcknowledgedSops((prev) => ({ ...prev, [selectedSop.id]: true }));
+                                  setMood('celebrate', 'joyful', `QA acknowledged ${summary.docNumber}`, 3200);
+                                  logInteraction({
+                                    kind: 'sop',
+                                    targetId: selectedSop.id,
+                                    targetCode: selectedSop.docNumber,
+                                    targetName: selectedSop.title,
+                                    summary: `Acknowledged SOP sample summary & checklist (${selectedSop.docNumber})`,
+                                    mayaState: 'approval',
+                                    sopId: selectedSop.id,
+                                  });
+                                  showToast(`Acknowledged ${summary.docNumber}`, 'success');
+                                }}
+                                className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition-colors cursor-pointer ${
+                                  isAck
+                                    ? 'bg-emerald-600 text-white'
+                                    : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/35 hover:bg-emerald-600 hover:text-white'
+                                }`}
+                              >
+                                {isAck ? '✓ Acknowledged' : 'Acknowledge'}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })()}
+
                     <RichMarkdownRenderer
                       markdown={selectedSop.markdown}
                       isDark={theme === 'dark'}

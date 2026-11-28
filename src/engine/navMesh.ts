@@ -1,8 +1,8 @@
 import * as THREE from 'three';
-import type { Floor, Opening, SpatialAsset, Wall } from '../types/twin';
+import type { Floor, Opening, Room, SpatialAsset, Wall } from '../types/twin';
 import { getAssetBounds } from '../utils/spatial';
 
-export type PathRoutingAlgorithm = 'shortest' | 'least-congested';
+export type PathRoutingAlgorithm = 'gmp-compliant' | 'shortest' | 'least-congested';
 
 export interface NoGoZone {
   id: string;
@@ -17,9 +17,75 @@ export interface NoGoZone {
   radius?: number;
 }
 
+export interface GmpRouteCheckpoint {
+  x: number;
+  z: number;
+  kind: 'gowning' | 'degowning' | 'airlock-purge';
+  roomId: string;
+  roomCode: string;
+  roomName: string;
+  durationMs: number;
+  label: string;
+}
+
+export interface GmpRoutePlan {
+  points: { x: number; z: number }[];
+  checkpoints: GmpRouteCheckpoint[];
+  roomSequence: { id: string; code: string; name: string; grade: string }[];
+  gmpProtocolSummary: string;
+  passesThroughPal: boolean;
+}
+
 export interface PathFindOptions {
   algorithm?: PathRoutingAlgorithm;
   noGoZones?: NoGoZone[];
+  rooms?: Room[];
+  extraNoGoRoomIds?: string[];
+  isGowned?: boolean;
+}
+
+export function getCleanroomGradeRank(room: Room): number {
+  const g = (room.environmental?.cleanroomGrade || '').toLowerCase();
+  if (g.includes('grade a') || g.includes('iso 5')) return 5;
+  if (g.includes('grade b') || g.includes('iso 6')) return 4;
+  if (g.includes('grade c') || g.includes('iso 7')) return 3;
+  if (g.includes('grade d') || g.includes('iso 8')) return 2;
+  if (g.includes('cnc') || g.includes('controlled')) return 1;
+  return 0;
+}
+
+export function isRoomCorridor(room: Room): boolean {
+  const txt = `${room.name} ${room.spaceTypeId ?? ''}`.toLowerCase();
+  return txt.includes('corridor') || txt.includes('hallway') || txt.includes('lobby');
+}
+
+export function isRoomPersonnelAirlock(room: Room): boolean {
+  const txt = `${room.name} ${room.code} ${room.spaceTypeId ?? ''}`.toLowerCase();
+  return (
+    txt.includes('personnel airlock') ||
+    txt.includes('gowning') ||
+    txt.includes('st-pal') ||
+    /\bpal\b/.test(txt)
+  );
+}
+
+export function isRoomMaterialAirlock(room: Room): boolean {
+  const txt = `${room.name} ${room.code} ${room.spaceTypeId ?? ''}`.toLowerCase();
+  return (
+    txt.includes('material airlock') ||
+    txt.includes('st-mal') ||
+    /\bmal\b/.test(txt)
+  );
+}
+
+export function findRoomAtPoint(rooms: Room[], x: number, z: number): Room | null {
+  for (let i = 0; i < rooms.length; i++) {
+    const r = rooms[i];
+    if (x >= r.x && x <= r.x + r.width && z >= r.z && z <= r.z + r.depth) {
+      return r;
+    }
+  }
+  return null;
 }
 
 export interface FloorNavMesh {
@@ -147,8 +213,8 @@ export function buildFloorNavMesh(
       uz,
       nx,
       nz,
-      halfWidth: Math.max(0.42, d.width * 0.5 - 0.04),
-      halfDepth: Math.max(0.75, host.thickness + agentRadius + 0.38),
+      halfWidth: Math.max(0.52, d.width * 0.5 + 0.06),
+      halfDepth: Math.max(0.95, host.thickness + agentRadius + 0.48),
     });
   });
 
@@ -422,10 +488,12 @@ export function buildFloorNavMesh(
   ): { x: number; z: number }[] => {
     const algorithm: PathRoutingAlgorithm = options?.algorithm ?? 'shortest';
     const floorNoGo = (options?.noGoZones ?? []).filter((z) => z.floorId === floor.id);
+    const floorRooms = (options?.rooms ?? []).filter((r) => r.floorId === floor.id);
+    const extraNoGoSet = new Set(options?.extraNoGoRoomIds ?? []);
 
     // Pre-rasterize No-Go cells for fast O(1) lookup during A*
     let noGoMask: Uint8Array | null = null;
-    if (floorNoGo.length > 0) {
+    if (floorNoGo.length > 0 || extraNoGoSet.size > 0) {
       noGoMask = new Uint8Array(total);
       for (let r = 0; r < rows; r++) {
         const wz = (r + 0.5) * cellSize;
@@ -433,6 +501,13 @@ export function buildFloorNavMesh(
           const wx = (c + 0.5) * cellSize;
           if (isPointInsideNoGoZones(wx, wz, floorNoGo, 0.22)) {
             noGoMask[r * cols + c] = 1;
+            continue;
+          }
+          if (extraNoGoSet.size > 0) {
+            const rm = findRoomAtPoint(floorRooms, wx, wz);
+            if (rm && extraNoGoSet.has(rm.id)) {
+              noGoMask[r * cols + c] = 1;
+            }
           }
         }
       }
@@ -450,12 +525,62 @@ export function buildFloorNavMesh(
       return [startPt, goalPt];
     }
 
+    // Build GMP Annex 1 personnel flow cost field:
+    // - Corridors, PALs, origin room, and destination room have 0 penalty
+    // - Material Airlocks (MAL) are hard-blocked for personnel (unless origin or dest)
+    // - Unrelated production/cleanrooms/labs receive high transit penalties so personnel
+    //   always route through Clean Corridors rather than cutting across active GMP suites
+    let gmpPenalty: Float32Array | null = null;
+    if (algorithm === 'gmp-compliant' && floorRooms.length > 0) {
+      const originRoom = findRoomAtPoint(floorRooms, startPt.x, startPt.z);
+      const destRoom = findRoomAtPoint(floorRooms, goalPt.x, goalPt.z);
+      gmpPenalty = new Float32Array(total);
+      if (!noGoMask) noGoMask = new Uint8Array(total);
+
+      for (let r = 0; r < rows; r++) {
+        const wz = (r + 0.5) * cellSize;
+        for (let c = 0; c < cols; c++) {
+          const idx = r * cols + c;
+          if (grid[idx] !== 1) continue;
+          const rm = findRoomAtPoint(floorRooms, (c + 0.5) * cellSize, wz);
+          if (!rm) continue;
+          if (rm.id === originRoom?.id || rm.id === destRoom?.id) continue;
+          if (isRoomCorridor(rm) || isRoomPersonnelAirlock(rm)) continue;
+
+          if (isRoomMaterialAirlock(rm)) {
+            // Personnel must not transit through Material Airlocks
+            noGoMask[idx] = 1;
+            gmpPenalty[idx] = 40;
+            continue;
+          }
+
+          const rank = getCleanroomGradeRank(rm);
+          const nameLc = rm.name.toLowerCase();
+          if (
+            nameLc.includes('quarantine') ||
+            nameLc.includes('dangerous') ||
+            nameLc.includes('electrical') ||
+            nameLc.includes('wastewater')
+          ) {
+            gmpPenalty[idx] = 28;
+          } else if (rank >= 4) {
+            gmpPenalty[idx] = 32; // Never cut through Grade A/B aseptic suites
+          } else if (rank >= 3) {
+            gmpPenalty[idx] = 22; // Never cut through unrelated Grade C suites
+          } else {
+            gmpPenalty[idx] = 14; // Prefer corridors over cutting through any other room
+          }
+        }
+      }
+    }
+
     const hasCleanLineOfSight = (
       ax: number,
       az: number,
       bx: number,
       bz: number,
-      checkCongestion: boolean
+      checkCongestion: boolean,
+      checkGmp: boolean
     ) => {
       const dist = Math.hypot(bx - ax, bz - az);
       const steps = Math.max(2, Math.ceil(dist / (cellSize * 0.42)));
@@ -485,6 +610,7 @@ export function buildFloorNavMesh(
         if (grid[idx] !== 1) return false;
         if (noGoMask && noGoMask[idx] === 1) return false;
         if (checkCongestion && congestionCost[idx] > maxAllowedCongestion) return false;
+        if (checkGmp && gmpPenalty && gmpPenalty[idx] > 0.5) return false;
       }
       return true;
     };
@@ -492,7 +618,7 @@ export function buildFloorNavMesh(
     // Fast path for shortest mode when completely unobstructed and outside No-Go zones
     if (
       algorithm === 'shortest' &&
-      hasCleanLineOfSight(startPt.x, startPt.z, goalPt.x, goalPt.z, false)
+      hasCleanLineOfSight(startPt.x, startPt.z, goalPt.x, goalPt.z, false, false)
     ) {
       return [startPt, goalPt];
     }
@@ -621,6 +747,7 @@ export function buildFloorNavMesh(
         const stepMultiplier =
           1 +
           congestionCost[nIdx] * congestionWeight +
+          (gmpPenalty ? gmpPenalty[nIdx] : 0) +
           (nextInNoGo ? 12.0 : 0);
         const tentative = gScore[cur] + baseCost * stepMultiplier;
         if (tentative < gScore[nIdx]) {
@@ -647,8 +774,9 @@ export function buildFloorNavMesh(
     rawPts[0] = startPt;
     if (found) rawPts[rawPts.length - 1] = goalPt;
 
-    // Greedy line-of-sight string-pull smoothing (preserving least-congested detours!)
+    // Greedy line-of-sight string-pull smoothing (preserving least-congested & GMP corridor detours!)
     const checkCongestion = algorithm === 'least-congested';
+    const checkGmp = algorithm === 'gmp-compliant';
     const smoothed: { x: number; z: number }[] = [rawPts[0]];
     let anchor = 0;
     while (anchor < rawPts.length - 1) {
@@ -660,7 +788,8 @@ export function buildFloorNavMesh(
             rawPts[anchor].z,
             rawPts[probe].x,
             rawPts[probe].z,
-            checkCongestion
+            checkCongestion,
+            checkGmp
           )
         ) {
           furthest = probe;
@@ -747,3 +876,185 @@ export function buildNavMeshVisualGroup(navMesh: FloorNavMesh, yOffset = 0.09): 
 
   return group;
 }
+
+/**
+ * Plans a full GMP Annex 1 personnel route between two points on a floor:
+ * - In 'gmp-compliant' mode, enforces Clean Corridor flow, excludes Material Airlocks (MAL),
+ *   prevents cross-contamination shortcuts through unrelated production suites, and automatically
+ *   stages through a Personnel Airlock & Gowning (PAL) room whenever transitioning into or out of
+ *   a higher cleanroom classification (e.g., Grade D → Grade C / Grade A/B).
+ */
+export function planGmpRoute(
+  navMesh: FloorNavMesh | null,
+  fromX: number,
+  fromZ: number,
+  toX: number,
+  toZ: number,
+  floorRooms: Room[],
+  options?: PathFindOptions
+): GmpRoutePlan {
+  const algorithm: PathRoutingAlgorithm = options?.algorithm ?? 'gmp-compliant';
+  const noGoZones = options?.noGoZones ?? [];
+
+  if (!navMesh) {
+    return {
+      points: [
+        { x: fromX, z: fromZ },
+        { x: toX, z: toZ },
+      ],
+      checkpoints: [],
+      roomSequence: [],
+      gmpProtocolSummary: algorithm === 'gmp-compliant' ? 'Direct GMP Route' : 'Direct Route',
+      passesThroughPal: false,
+    };
+  }
+
+  const originRoom = findRoomAtPoint(floorRooms, fromX, fromZ);
+  const destRoom = findRoomAtPoint(floorRooms, toX, toZ);
+  const checkpoints: GmpRouteCheckpoint[] = [];
+  let points: { x: number; z: number }[] = [];
+  let passesThroughPal = false;
+  let gmpProtocolSummary =
+    algorithm === 'gmp-compliant'
+      ? 'EU GMP Clean Corridor Flow'
+      : algorithm === 'least-congested'
+        ? 'Least Congested Corridor'
+        : 'Shortest Distance';
+
+  if (algorithm === 'gmp-compliant' && destRoom && originRoom?.id !== destRoom.id) {
+    const originRank = originRoom ? getCleanroomGradeRank(originRoom) : 2;
+    const destRank = getCleanroomGradeRank(destRoom);
+    const currentlyGowned = Boolean(options?.isGowned);
+    const floorNoGo = noGoZones.filter((z) => z.floorId === navMesh.floorId);
+
+    // Check if an unblocked Personnel Airlock & Gowning (PAL) exists on this floor
+    const palRoom = floorRooms.find(
+      (r) =>
+        isRoomPersonnelAirlock(r) &&
+        r.id !== destRoom.id &&
+        !floorNoGo.some((z) => z.kind === 'room' && z.roomId === r.id)
+    );
+
+    const destIsCleanroom =
+      destRank >= 3 && !isRoomCorridor(destRoom) && !isRoomPersonnelAirlock(destRoom);
+    const needsGowningEntry = Boolean(palRoom) && destIsCleanroom && !currentlyGowned;
+    const needsDegowningExit =
+      Boolean(palRoom) &&
+      !isRoomCorridor(destRoom) &&
+      !isRoomPersonnelAirlock(destRoom) &&
+      destRank <= 2 &&
+      (currentlyGowned || (originRoom != null && originRank >= 4));
+
+    if ((needsGowningEntry || needsDegowningExit) && palRoom) {
+      const palPt = navMesh.findNearestWalkable(
+        palRoom.x + palRoom.width * 0.5,
+        palRoom.z + palRoom.depth * 0.5,
+        floorNoGo
+      );
+
+      // Already inside the Gowning Room (PAL) -> gown/de-gown right here then head to destination
+      if (originRoom?.id === palRoom.id) {
+        const directLeg = navMesh.findPath(fromX, fromZ, toX, toZ, {
+          algorithm: 'gmp-compliant',
+          noGoZones,
+          rooms: floorRooms,
+        });
+        if (directLeg.length >= 2) {
+          points = directLeg;
+          passesThroughPal = true;
+          checkpoints.push({
+            x: fromX,
+            z: fromZ,
+            kind: needsGowningEntry ? 'gowning' : 'degowning',
+            roomId: palRoom.id,
+            roomCode: palRoom.code,
+            roomName: palRoom.name,
+            durationMs: 1450,
+            label: needsGowningEntry
+              ? `Donning Full Cleanroom Gown (${palRoom.code})`
+              : `De-Gowning Cleanroom Suit (${palRoom.code})`,
+          });
+          gmpProtocolSummary = needsGowningEntry
+            ? `EU GMP Annex 1 · Gowning in ${palRoom.code} → ${destRoom.code}`
+            : `EU GMP Annex 1 · De-Gowning in ${palRoom.code} → ${destRoom.code}`;
+        }
+      } else {
+        const leg1 = navMesh.findPath(fromX, fromZ, palPt.x, palPt.z, {
+          algorithm: 'gmp-compliant',
+          noGoZones,
+          rooms: floorRooms,
+        });
+        const leg2 = navMesh.findPath(palPt.x, palPt.z, toX, toZ, {
+          algorithm: 'gmp-compliant',
+          noGoZones,
+          rooms: floorRooms,
+        });
+
+        const leg1ReachedPal =
+          leg1.length >= 2 &&
+          Math.hypot(leg1[leg1.length - 1].x - palPt.x, leg1[leg1.length - 1].z - palPt.z) < 2.4;
+        const leg2ReachedDest =
+          leg2.length >= 2 &&
+          Math.hypot(leg2[leg2.length - 1].x - toX, leg2[leg2.length - 1].z - toZ) < 2.6;
+
+        if (leg1ReachedPal && leg2ReachedDest) {
+          points = [...leg1, ...leg2.slice(1)];
+          passesThroughPal = true;
+          checkpoints.push({
+            x: palPt.x,
+            z: palPt.z,
+            kind: needsGowningEntry ? 'gowning' : 'degowning',
+            roomId: palRoom.id,
+            roomCode: palRoom.code,
+            roomName: palRoom.name,
+            durationMs: 1650,
+            label: needsGowningEntry
+              ? `Donning Full Cleanroom Gown (${palRoom.code})`
+              : `De-Gowning Cleanroom Suit (${palRoom.code})`,
+          });
+          gmpProtocolSummary = needsGowningEntry
+            ? `EU GMP Annex 1 · Gowning via ${palRoom.code} (PAL)`
+            : `EU GMP Annex 1 · De-Gowning via ${palRoom.code} (PAL)`;
+        }
+      }
+    }
+  }
+
+  if (points.length === 0) {
+    points = navMesh.findPath(fromX, fromZ, toX, toZ, {
+      algorithm,
+      noGoZones,
+      rooms: floorRooms,
+    });
+  }
+
+  // Extract ordered sequence of distinct rooms traversed along the planned route
+  const roomSequence: { id: string; code: string; name: string; grade: string }[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i];
+    const b = i + 1 < points.length ? points[i + 1] : a;
+    const segLen = Math.hypot(b.x - a.x, b.z - a.z);
+    const samples = Math.max(1, Math.ceil(segLen / 0.65));
+    for (let s = 0; s <= samples; s++) {
+      const t = samples > 0 ? s / samples : 0;
+      const rm = findRoomAtPoint(floorRooms, a.x + (b.x - a.x) * t, a.z + (b.z - a.z) * t);
+      if (rm && roomSequence[roomSequence.length - 1]?.id !== rm.id) {
+        roomSequence.push({
+          id: rm.id,
+          code: rm.code,
+          name: rm.name,
+          grade: rm.environmental?.cleanroomGrade || 'Unclassified',
+        });
+      }
+    }
+  }
+
+  return {
+    points,
+    checkpoints,
+    roomSequence,
+    gmpProtocolSummary,
+    passesThroughPal,
+  };
+}
+

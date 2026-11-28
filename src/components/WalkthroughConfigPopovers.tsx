@@ -16,9 +16,11 @@ import {
   RotateCcw,
   Route,
   Search,
+  ShieldCheck,
   SlidersHorizontal,
   Trash2,
   Volume2,
+  VolumeX,
   Wind,
   Wrench,
   X,
@@ -331,7 +333,7 @@ export const SpatialAudioSettingsPopover: React.FC<SpatialAudioSettingsPopoverPr
         </div>
       </div>
 
-      <div className="p-3 space-y-2.5 max-h-[68vh] overflow-y-auto">
+      <div className="p-3 space-y-2.5 max-h-[48vh] md:max-h-[68vh] overflow-y-auto">
         {/* Master Row + Acoustic Live Summary */}
         <div className="flex items-center justify-between gap-3 text-[10.5px]">
           <button
@@ -343,7 +345,7 @@ export const SpatialAudioSettingsPopover: React.FC<SpatialAudioSettingsPopoverPr
                 : 'bg-zinc-800 border-zinc-700 text-zinc-400'
             }`}
           >
-            <Volume2 className="w-3 h-3" />
+            {enabled ? <Volume2 className="w-3 h-3" /> : <VolumeX className="w-3 h-3" />}
             <span>{enabled ? 'HRTF Active' : 'Muted'}</span>
           </button>
 
@@ -414,6 +416,7 @@ export const SpatialAudioSettingsPopover: React.FC<SpatialAudioSettingsPopoverPr
 
 export interface PathFinderConfigPopoverProps {
   activeFloorId: string;
+  currentRoomId?: string | null;
   floorRooms: Room[];
   floorAssets: SpatialAsset[];
   algorithm: PathRoutingAlgorithm;
@@ -429,7 +432,7 @@ export interface PathFinderConfigPopoverProps {
   onRemoveNoGoZone: (id: string) => void;
   onClearNoGoZones: () => void;
   onSelectDestination: (
-    dest: { label: string; code: string; x: number; z: number },
+    dest: { label: string; code: string; x: number; z: number; roomId?: string },
     autoWalk: boolean
   ) => void;
   onClose: () => void;
@@ -437,6 +440,7 @@ export interface PathFinderConfigPopoverProps {
 
 export const PathFinderConfigPopover: React.FC<PathFinderConfigPopoverProps> = ({
   activeFloorId,
+  currentRoomId,
   floorRooms,
   floorAssets,
   algorithm,
@@ -474,18 +478,24 @@ export const PathFinderConfigPopover: React.FC<PathFinderConfigPopoverProps> = (
     const q = search.trim().toLowerCase();
     const roomItems = floorRooms.map((r) => ({
       id: `rm-${r.id}`,
+      roomId: r.id,
       kind: 'Room' as const,
       code: r.code,
       label: r.name,
+      grade: r.environmental?.cleanroomGrade || '',
+      isCurrent: currentRoomId === r.id,
       x: r.x + r.width * 0.5,
       z: r.z + r.depth * 0.5,
       restricted: restrictedRoomIds.has(r.id),
     }));
     const assetItems = floorAssets.map((a) => ({
       id: `as-${a.id}`,
+      roomId: a.roomId,
       kind: 'Asset' as const,
       code: a.assetId,
       label: a.name,
+      grade: '',
+      isCurrent: false,
       x: a.x,
       z: a.z,
       restricted: false,
@@ -495,21 +505,27 @@ export const PathFinderConfigPopover: React.FC<PathFinderConfigPopoverProps> = (
         (it) =>
           !q ||
           it.code.toLowerCase().includes(q) ||
-          it.label.toLowerCase().includes(q)
+          it.label.toLowerCase().includes(q) ||
+          it.grade.toLowerCase().includes(q)
       )
-      .slice(0, 28);
-  }, [floorRooms, floorAssets, search, restrictedRoomIds]);
+      .slice(0, 32);
+  }, [floorRooms, floorAssets, search, restrictedRoomIds, currentRoomId]);
+
+  const algoBadgeLabel =
+    algorithm === 'gmp-compliant'
+      ? 'GMP Path'
+      : algorithm === 'least-congested'
+        ? 'Least Congested'
+        : 'Shortest';
 
   return (
-    <div className="w-[340px] max-w-[92vw] rounded-2xl bg-[#0F1016] border border-cyan-500/45 shadow-[0_14px_40px_rgba(0,0,0,0.78)] text-zinc-100 overflow-hidden">
+    <div className="w-[356px] max-w-[94vw] rounded-2xl bg-[#0F1016] border border-violet-500/45 shadow-[0_14px_40px_rgba(0,0,0,0.78)] text-zinc-100 overflow-hidden">
       {/* Header + Mode Tabs */}
       <div className="px-3 py-2 border-b border-zinc-800 flex items-center justify-between gap-2">
-        <div className="flex items-center gap-1.5 text-[11px] font-semibold text-cyan-200">
-          <Route className="w-3.5 h-3.5 text-cyan-400" />
-          <span>Path Finder</span>
-          <span className="text-[10px] font-mono text-zinc-400">
-            · {algorithm === 'least-congested' ? 'Least Congested' : 'Shortest'}
-          </span>
+        <div className="flex items-center gap-1.5 text-[11px] font-semibold text-violet-200">
+          <Route className="w-3.5 h-3.5 text-violet-400" />
+          <span>Go To &amp; Path Finder</span>
+          <span className="text-[10px] font-mono text-zinc-400">· {algoBadgeLabel}</span>
         </div>
         <button
           type="button"
@@ -551,29 +567,62 @@ export const PathFinderConfigPopover: React.FC<PathFinderConfigPopoverProps> = (
 
       {tab === 'navigate' ? (
         <div>
-          <div className="p-2 border-b border-zinc-800/80">
+          {/* Quick Routing Protocol Selector */}
+          <div className="px-2.5 pt-2 pb-1.5 border-b border-zinc-800/80 space-y-1.5">
+            <div className="grid grid-cols-3 gap-1">
+              {(
+                [
+                  { id: 'gmp-compliant', label: 'GMP Path', activeCls: 'bg-violet-500/20 border-violet-400/60 text-violet-100' },
+                  { id: 'shortest', label: 'Shortest', activeCls: 'bg-cyan-500/20 border-cyan-400/60 text-cyan-100' },
+                  { id: 'least-congested', label: 'Uncongested', activeCls: 'bg-emerald-500/20 border-emerald-400/60 text-emerald-100' },
+                ] as const
+              ).map((mode) => (
+                <button
+                  key={mode.id}
+                  type="button"
+                  onClick={() => onChangeAlgorithm(mode.id)}
+                  className={`px-1.5 py-1 rounded-lg border text-[10px] font-semibold flex items-center justify-center gap-1 cursor-pointer transition-colors ${
+                    algorithm === mode.id
+                      ? mode.activeCls
+                      : 'bg-[#141520] border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  {mode.id === 'gmp-compliant' && <ShieldCheck className="w-3 h-3 shrink-0" />}
+                  <span>{mode.label}</span>
+                </button>
+              ))}
+            </div>
+
             <div className="relative">
               <Search className="w-3.5 h-3.5 text-zinc-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search floor room or equipment..."
-                className="w-full pl-8 pr-2.5 py-1.5 rounded-lg bg-[#181924] border border-zinc-700/80 text-[11px] text-white placeholder:text-zinc-500 focus:outline-none focus:border-cyan-400"
+                placeholder="Search room, cleanroom grade, or equipment..."
+                className="w-full pl-8 pr-2.5 py-1.5 rounded-lg bg-[#181924] border border-zinc-700/80 text-[11px] text-white placeholder:text-zinc-500 focus:outline-none focus:border-violet-400"
               />
             </div>
           </div>
 
-          <div className="max-h-56 overflow-y-auto divide-y divide-zinc-800/70">
+          <div className="max-h-[38vh] md:max-h-56 overflow-y-auto divide-y divide-zinc-800/70">
             {navItems.map((item) => (
               <div
                 key={item.id}
                 className="px-2.5 py-2 flex items-center justify-between gap-2 hover:bg-white/[0.03]"
               >
                 <div className="min-w-0">
-                  <div className="flex items-center gap-1.5 text-[10px]">
+                  <div className="flex items-center gap-1.5 text-[10px] flex-wrap">
                     <span className="font-mono font-bold text-cyan-300">{item.code}</span>
-                    <span className="text-zinc-500">· {item.kind}</span>
+                    {item.grade && (
+                      <span className="text-[9.5px] font-mono text-violet-300">
+                        · {item.grade}
+                      </span>
+                    )}
+                    {!item.grade && <span className="text-zinc-500">· {item.kind}</span>}
+                    {item.isCurrent && (
+                      <span className="text-emerald-400 font-semibold">· Here</span>
+                    )}
                     {item.restricted && (
                       <span className="text-rose-400 font-semibold">· No-Go</span>
                     )}
@@ -587,27 +636,44 @@ export const PathFinderConfigPopover: React.FC<PathFinderConfigPopoverProps> = (
                     type="button"
                     onClick={() =>
                       onSelectDestination(
-                        { label: item.label, code: item.code, x: item.x, z: item.z },
+                        {
+                          label: item.label,
+                          code: item.code,
+                          x: item.x,
+                          z: item.z,
+                          roomId: item.roomId,
+                        },
                         false
                       )
                     }
                     className="px-2 py-1 rounded-lg bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/40 text-cyan-200 text-[10px] font-semibold cursor-pointer"
-                    title="Highlight walking route for WASD movement"
+                    title="Highlight GMP walking path on the 3D floor"
                   >
                     Guide
                   </button>
                   <button
                     type="button"
+                    disabled={item.isCurrent}
                     onClick={() =>
                       onSelectDestination(
-                        { label: item.label, code: item.code, x: item.x, z: item.z },
+                        {
+                          label: item.label,
+                          code: item.code,
+                          x: item.x,
+                          z: item.z,
+                          roomId: item.roomId,
+                        },
                         true
                       )
                     }
-                    className="px-2 py-1 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-[10px] font-semibold cursor-pointer"
-                    title="Auto-walk / teleport along optimal route"
+                    className={`px-2.5 py-1 rounded-lg text-[10px] font-semibold transition-colors ${
+                      item.isCurrent
+                        ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed'
+                        : 'bg-violet-600 hover:bg-violet-500 text-white cursor-pointer'
+                    }`}
+                    title="Auto-walk via GMP path, opening & closing doors, airlocks & PAL gowning"
                   >
-                    Go
+                    Go To
                   </button>
                 </div>
               </div>
@@ -620,42 +686,62 @@ export const PathFinderConfigPopover: React.FC<PathFinderConfigPopoverProps> = (
           </div>
         </div>
       ) : (
-        <div className="p-3 space-y-3 max-h-[64vh] overflow-y-auto">
+        <div className="p-3 space-y-3 max-h-[48vh] md:max-h-[64vh] overflow-y-auto">
           {/* 1. Routing Algorithm Toggle */}
           <div className="space-y-1.5">
             <div className="text-[10.5px] font-semibold text-zinc-300">
               AI Routing Algorithm
             </div>
-            <div className="grid grid-cols-2 gap-1.5">
+            <div className="space-y-1.5">
               <button
                 type="button"
-                onClick={() => onChangeAlgorithm('shortest')}
-                className={`p-2 rounded-xl border text-left transition-colors cursor-pointer ${
-                  algorithm === 'shortest'
-                    ? 'bg-cyan-500/15 border-cyan-400/60 text-white'
+                onClick={() => onChangeAlgorithm('gmp-compliant')}
+                className={`w-full p-2 rounded-xl border text-left transition-colors cursor-pointer ${
+                  algorithm === 'gmp-compliant'
+                    ? 'bg-violet-500/18 border-violet-400/65 text-white'
                     : 'bg-[#141520] border-zinc-800 text-zinc-400 hover:text-zinc-200'
                 }`}
               >
-                <div className="text-[11px] font-semibold">Shortest Distance</div>
-                <div className="text-[9.5px] opacity-75 mt-0.5 leading-snug">
-                  Minimum meters via direct corridors
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold">
+                  <ShieldCheck className="w-3.5 h-3.5 text-violet-300" />
+                  <span>EU GMP Annex 1 Compliant Path</span>
+                </div>
+                <div className="text-[9.5px] opacity-80 mt-0.5 leading-snug">
+                  Uses clean corridors, stages via PAL gowning on grade changes, avoids MALs &amp; auto-opens/closes doors
                 </div>
               </button>
 
-              <button
-                type="button"
-                onClick={() => onChangeAlgorithm('least-congested')}
-                className={`p-2 rounded-xl border text-left transition-colors cursor-pointer ${
-                  algorithm === 'least-congested'
-                    ? 'bg-emerald-500/15 border-emerald-400/60 text-white'
-                    : 'bg-[#141520] border-zinc-800 text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                <div className="text-[11px] font-semibold">Least Congested</div>
-                <div className="text-[9.5px] opacity-75 mt-0.5 leading-snug">
-                  Avoids bottlenecks &amp; dense machinery
-                </div>
-              </button>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => onChangeAlgorithm('shortest')}
+                  className={`p-2 rounded-xl border text-left transition-colors cursor-pointer ${
+                    algorithm === 'shortest'
+                      ? 'bg-cyan-500/15 border-cyan-400/60 text-white'
+                      : 'bg-[#141520] border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <div className="text-[11px] font-semibold">Shortest Distance</div>
+                  <div className="text-[9.5px] opacity-75 mt-0.5 leading-snug">
+                    Minimum meters via direct doors
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => onChangeAlgorithm('least-congested')}
+                  className={`p-2 rounded-xl border text-left transition-colors cursor-pointer ${
+                    algorithm === 'least-congested'
+                      ? 'bg-emerald-500/15 border-emerald-400/60 text-white'
+                      : 'bg-[#141520] border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <div className="text-[11px] font-semibold">Least Congested</div>
+                  <div className="text-[9.5px] opacity-75 mt-0.5 leading-snug">
+                    Avoids bottlenecks &amp; dense machinery
+                  </div>
+                </button>
+              </div>
             </div>
           </div>
 

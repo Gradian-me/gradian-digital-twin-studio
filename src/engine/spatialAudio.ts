@@ -266,7 +266,7 @@ export class FacilitySpatialAudioEngine {
       this.ctx = ctx;
 
       const master = ctx.createGain();
-      master.gain.value = 0.0001;
+      master.gain.value = 0;
       master.connect(ctx.destination);
       this.masterGain = master;
 
@@ -284,7 +284,7 @@ export class FacilitySpatialAudioEngine {
         panner.coneOuterAngle = 360;
 
         const gain = ctx.createGain();
-        gain.gain.value = 0.0001;
+        gain.gain.value = 0;
 
         const osc1 = ctx.createOscillator();
         osc1.type = 'sine';
@@ -375,11 +375,13 @@ export class FacilitySpatialAudioEngine {
     }
 
     if (this.enabled && this.ctx && this.masterGain) {
-      this.masterGain.gain.setTargetAtTime(
-        Math.max(0.0001, this.settings.masterVolume),
-        this.ctx.currentTime,
-        0.06
-      );
+      const now = this.ctx.currentTime;
+      this.masterGain.gain.cancelScheduledValues(now);
+      if (this.settings.masterVolume <= 0.001) {
+        this.masterGain.gain.setValueAtTime(0, now);
+      } else {
+        this.masterGain.gain.setTargetAtTime(this.settings.masterVolume, now, 0.06);
+      }
       // Immediately recompute voice panners & attenuation from last listener pose
       this.updateListener(
         this.lastListenerX,
@@ -399,14 +401,36 @@ export class FacilitySpatialAudioEngine {
         this.ctx.resume().catch(() => {});
       }
       const now = this.ctx.currentTime;
-      this.masterGain.gain.setTargetAtTime(Math.max(0.001, this.settings.masterVolume), now, 0.12);
-    } else if (this.ctx && this.masterGain) {
-      const now = this.ctx.currentTime;
-      this.masterGain.gain.setTargetAtTime(0.0001, now, 0.08);
+      this.masterGain.gain.cancelScheduledValues(now);
+      this.masterGain.gain.setValueAtTime(Math.max(0, this.masterGain.gain.value), now);
+      this.masterGain.gain.linearRampToValueAtTime(
+        Math.max(0, this.settings.masterVolume),
+        now + 0.12
+      );
+    } else {
       this.lastTelemetry = {
-        ...this.lastTelemetry,
         active: false,
+        dominantLabel: '',
+        dominantCategory: null,
+        dominantDistanceM: null,
+        estimatedDb: 36,
+        activeSources: 0,
+        machinerySources: 0,
+        ventilationSources: 0,
       };
+      if (this.ctx && this.masterGain) {
+        const now = this.ctx.currentTime;
+        this.masterGain.gain.cancelScheduledValues(now);
+        this.masterGain.gain.setValueAtTime(0, now);
+        for (const v of this.voices) {
+          v.assignedId = null;
+          v.gain.gain.cancelScheduledValues(now);
+          v.gain.gain.setValueAtTime(0, now);
+        }
+        if (this.ctx.state === 'running') {
+          this.ctx.suspend().catch(() => {});
+        }
+      }
     }
   }
 
@@ -647,6 +671,7 @@ export class FacilitySpatialAudioEngine {
 
   /** Audition a brief stereo spatialized test sound for Machinery or Ventilation in the Settings menu */
   public playTestCue(channel: 'machinery' | 'ventilation'): void {
+    if (!this.enabled) return;
     if (!this.ensureContext() || !this.ctx || !this.masterGain) return;
     if (this.ctx.state === 'suspended') {
       this.ctx.resume().catch(() => {});
